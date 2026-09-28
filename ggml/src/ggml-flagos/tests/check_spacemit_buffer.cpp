@@ -298,7 +298,7 @@ static void test_shared_session(ggml_backend_dev_t dev) {
     std::puts("two concurrent SpaceMiT backend handles share a serialized native session");
 }
 
-static void test_batched_weight_fallback(ggml_backend_t backend) {
+static void test_batched_weight_canonical(ggml_backend_t backend) {
     auto weights_ctx = ggml_init({ 1024 * 1024, nullptr, true });
     CHECK(weights_ctx);
     auto weight = ggml_new_tensor_4d(weights_ctx, GGML_TYPE_Q4_0, 256, 32, 4, 2);
@@ -326,7 +326,7 @@ static void test_batched_weight_fallback(ggml_backend_t backend) {
     auto result = ggml_mul_mat(graph_ctx, weight, input);
     auto graph = ggml_new_graph(graph_ctx);
     ggml_build_forward_expand(graph, result);
-    CHECK(!ggml_backend_supports_op(backend, result));
+    CHECK(ggml_backend_supports_op(backend, result));
     auto cpu = ggml_backend_cpu_init();
     auto reference_ctx = ggml_init({ 1024 * 1024, nullptr, true });
     CHECK(reference_ctx);
@@ -344,12 +344,19 @@ static void test_batched_weight_fallback(ggml_backend_t backend) {
     auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
     CHECK(sched);
     CHECK(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
-    CHECK(ggml_backend_sched_get_tensor_backend(sched, result) == cpu);
+    CHECK(ggml_backend_sched_get_tensor_backend(sched, result) == backend);
     std::vector<float> actual(ggml_nelements(result)), expected(actual.size());
     ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
     ggml_backend_tensor_get(reference_result, expected.data(), 0, ggml_nbytes(reference_result));
-    CHECK(actual == expected);
-    std::puts("batched Q4_0 weight falls back to CPU with canonical values");
+    double error = 0.0;
+    double scale = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        CHECK(std::isfinite(actual[i]) && std::isfinite(expected[i]));
+        error += double(actual[i] - expected[i]) * (actual[i] - expected[i]);
+        scale += double(expected[i]) * expected[i];
+    }
+    CHECK(error / std::max(scale, 1e-20) < 5e-4);
+    std::puts("batched Q4_0 weight uses canonical scalar MUL_MAT on SpaceMiT");
 
     ggml_backend_sched_free(sched);
     ggml_backend_buffer_free(reference_buffer);
@@ -386,6 +393,6 @@ int main() {
     test_type(backend, GGML_TYPE_Q6_K, 256, 17);
     test_type(backend, GGML_TYPE_Q8_0, 256, 17);
     test_shared_session(device);
-    test_batched_weight_fallback(backend);
+    test_batched_weight_canonical(backend);
     ggml_backend_free(backend);
 }

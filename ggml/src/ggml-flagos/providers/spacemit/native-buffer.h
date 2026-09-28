@@ -14,11 +14,12 @@ struct spacemit_buffer_context {
 };
 
 static bool spacemit_needs_pack(const ggml_tensor * t) {
-    // No native kernel can consume these formats while their repack is lossy
-    // or its selected trait lacks an execution branch.
-    // Keep only the canonical bytes needed by the CPU split.
+    // The native packed MUL_MAT trait only handles 2D weights, while 3D
+    // MUL_MAT_ID has its own packed trait. 4D MUL_MAT uses the native scalar
+    // fallback, which reads GGML's canonical layout directly.
+    // Also keep only canonical bytes for formats without a usable trait.
     return !flagos_spacemit_cpu_only_weight(t, global_spine_env_info.use_ime2) &&
-           !t->view_src && !ggml_is_empty(t) &&
+           !t->view_src && !ggml_is_empty(t) && ggml_n_dims(t) != 4 &&
            ggml_is_contiguous(t) && ggml_spacemit_get_optimal_repack_type(t);
 }
 

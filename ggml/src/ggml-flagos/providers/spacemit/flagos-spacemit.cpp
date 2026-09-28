@@ -22,11 +22,12 @@ bool disabled_by_environment() {
 }
 
 bool supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    // The native quantized MUL_MAT flattens src1's batch dimensions but uses
-    // only the first packed src0 matrix. Expert selection is a separate
-    // MUL_MAT_ID implementation and remains eligible.
+    // A 3D weight can be packed for MUL_MAT_ID. The native MUL_MAT trait
+    // instead falls through to a scalar kernel that expects canonical bytes,
+    // so it cannot safely read that packed 3D weight. 4D weights stay
+    // canonical and use the scalar kernel; 2D weights use the packed kernel.
     if (op->op == GGML_OP_MUL_MAT && op->src[0] && ggml_is_quantized(op->src[0]->type) &&
-        (op->src[0]->ne[2] != 1 || op->src[0]->ne[3] != 1)) {
+        ggml_n_dims(op->src[0]) == 3) {
         return false;
     }
     // The native F16 GEMM path fails almost all selected GGML CPU numerical

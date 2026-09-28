@@ -174,10 +174,12 @@ int main(int argc, char ** argv) {
         weight.ne[3] = 2;
         weight.nb[2] = weight.nb[1] * weight.ne[1];
         weight.nb[3] = weight.nb[2] * weight.ne[2];
-        CHECK(!ggml_backend_dev_supports_op(&native_device, &op));
+        CHECK(ggml_backend_dev_supports_op(&native_device, &op));
         op.op = GGML_OP_MUL_MAT_ID;
         CHECK(ggml_backend_dev_supports_op(&native_device, &op));
         op.op = GGML_OP_MUL_MAT;
+        weight.ne[3] = 1;
+        CHECK(!ggml_backend_dev_supports_op(&native_device, &op));
         weight.ne[2] = 1;
         weight.ne[3] = 1;
         weight.type = GGML_TYPE_F16;
