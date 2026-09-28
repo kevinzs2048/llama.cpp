@@ -39,7 +39,11 @@ if (GGML_FLAGOS_AMD)
     include(providers/amd/provider.cmake)
 endif()
 
-if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD)
+if (GGML_FLAGOS_SPACEMIT)
+    include(providers/spacemit/provider.cmake)
+endif()
+
+if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD AND NOT GGML_FLAGOS_SPACEMIT)
     message(STATUS "FlagOS: building provider-neutral core with no device provider")
 endif()
 
@@ -47,6 +51,9 @@ ggml_add_backend_library(ggml-flagos ${FLAGOS_SOURCES})
 target_include_directories(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_INCLUDE_DIRS})
 target_link_libraries(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_LIBRARIES})
 target_compile_definitions(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS})
+if (GGML_FLAGOS_SPACEMIT)
+    target_link_options(ggml-flagos INTERFACE "$<BUILD_INTERFACE:LINKER:-rpath-link,${SPERT_DIR}/lib>")
+endif()
 
 # In static mode ggml-backend-reg.cpp includes the backend's public registry
 # header while compiling the core ggml target.  Keep that include path private
@@ -89,6 +96,22 @@ add_executable(flagos-check-registry EXCLUDE_FROM_ALL
 target_include_directories(flagos-check-registry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_compile_definitions(flagos-check-registry PRIVATE GGML_FLAGOS_HAVE_DENGLIN GGML_FLAGOS_HAVE_AMD)
 target_link_libraries(flagos-check-registry PRIVATE ggml)
+
+add_executable(flagos-check-spacemit-adapter EXCLUDE_FROM_ALL
+    flagos-provider.cpp
+    flagos-target.cpp
+    flagos-registry.cpp
+    providers/spacemit/flagos-spacemit.cpp
+    tests/check_spacemit_adapter.cpp)
+target_include_directories(flagos-check-spacemit-adapter PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_compile_definitions(flagos-check-spacemit-adapter PRIVATE GGML_FLAGOS_HAVE_SPACEMIT)
+target_link_libraries(flagos-check-spacemit-adapter PRIVATE ggml)
+
+if (GGML_FLAGOS_SPACEMIT)
+    add_executable(flagos-check-spacemit-buffer EXCLUDE_FROM_ALL tests/check_spacemit_buffer.cpp)
+    target_include_directories(flagos-check-spacemit-buffer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+    target_link_libraries(flagos-check-spacemit-buffer PRIVATE ggml)
+endif()
 
 if (GGML_FLAGOS_AMD)
     add_executable(flagos-check-amd EXCLUDE_FROM_ALL
