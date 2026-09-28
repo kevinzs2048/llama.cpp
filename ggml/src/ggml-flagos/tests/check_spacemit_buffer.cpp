@@ -298,11 +298,11 @@ static void test_shared_session(ggml_backend_dev_t dev) {
     std::puts("two concurrent SpaceMiT backend handles share a serialized native session");
 }
 
-static void test_batched_weight_canonical(ggml_backend_t backend) {
+static void test_batched_weight_canonical(ggml_backend_t backend, int64_t outer_batches) {
     auto weights_ctx = ggml_init({ 1024 * 1024, nullptr, true });
     CHECK(weights_ctx);
-    auto weight = ggml_new_tensor_4d(weights_ctx, GGML_TYPE_Q4_0, 256, 32, 4, 2);
-    auto input = ggml_new_tensor_4d(weights_ctx, GGML_TYPE_F32, 256, 1, 4, 2);
+    auto weight = ggml_new_tensor_4d(weights_ctx, GGML_TYPE_Q4_0, 256, 32, 4, outer_batches);
+    auto input = ggml_new_tensor_4d(weights_ctx, GGML_TYPE_F32, 256, 1, 4, outer_batches);
     auto buffer = ggml_backend_alloc_ctx_tensors_from_buft(
         weights_ctx, ggml_backend_get_default_buffer_type(backend));
     CHECK(buffer);
@@ -316,7 +316,8 @@ static void test_batched_weight_canonical(ggml_backend_t backend) {
         activations[i] = std::cos(float(i) * 0.017f);
     }
     std::vector<uint8_t> quantized(ggml_nbytes(weight));
-    CHECK(ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), quantized.data(), 0, 256, 256, nullptr) == quantized.size());
+    const int64_t rows = ggml_nelements(weight) / weight->ne[0];
+    CHECK(ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), quantized.data(), 0, rows, 256, nullptr) == quantized.size());
     ggml_backend_tensor_set(weight, quantized.data(), 0, quantized.size());
     ggml_backend_tensor_set(input, activations.data(), 0, ggml_nbytes(input));
     equal_bytes(weight, quantized);
@@ -326,12 +327,13 @@ static void test_batched_weight_canonical(ggml_backend_t backend) {
     auto result = ggml_mul_mat(graph_ctx, weight, input);
     auto graph = ggml_new_graph(graph_ctx);
     ggml_build_forward_expand(graph, result);
-    CHECK(ggml_backend_supports_op(backend, result));
+    const bool expect_device = outer_batches > 1;
+    CHECK(ggml_backend_supports_op(backend, result) == expect_device);
     auto cpu = ggml_backend_cpu_init();
     auto reference_ctx = ggml_init({ 1024 * 1024, nullptr, true });
     CHECK(reference_ctx);
-    auto reference_weight = ggml_new_tensor_4d(reference_ctx, GGML_TYPE_Q4_0, 256, 32, 4, 2);
-    auto reference_input = ggml_new_tensor_4d(reference_ctx, GGML_TYPE_F32, 256, 1, 4, 2);
+    auto reference_weight = ggml_new_tensor_4d(reference_ctx, GGML_TYPE_Q4_0, 256, 32, 4, outer_batches);
+    auto reference_input = ggml_new_tensor_4d(reference_ctx, GGML_TYPE_F32, 256, 1, 4, outer_batches);
     auto reference_result = ggml_mul_mat(reference_ctx, reference_weight, reference_input);
     auto reference_graph = ggml_new_graph(reference_ctx);
     ggml_build_forward_expand(reference_graph, reference_result);
@@ -344,7 +346,7 @@ static void test_batched_weight_canonical(ggml_backend_t backend) {
     auto sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
     CHECK(sched);
     CHECK(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
-    CHECK(ggml_backend_sched_get_tensor_backend(sched, result) == backend);
+    CHECK(ggml_backend_sched_get_tensor_backend(sched, result) == (expect_device ? backend : cpu));
     std::vector<float> actual(ggml_nelements(result)), expected(actual.size());
     ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
     ggml_backend_tensor_get(reference_result, expected.data(), 0, ggml_nbytes(reference_result));
@@ -356,7 +358,8 @@ static void test_batched_weight_canonical(ggml_backend_t backend) {
         scale += double(expected[i]) * expected[i];
     }
     CHECK(error / std::max(scale, 1e-20) < 5e-4);
-    std::puts("batched Q4_0 weight uses canonical scalar MUL_MAT on SpaceMiT");
+    std::puts(expect_device ? "4D Q4_0 weight uses canonical scalar MUL_MAT on SpaceMiT" :
+                              "3D packed Q4_0 weight falls back to CPU with canonical values");
 
     ggml_backend_sched_free(sched);
     ggml_backend_buffer_free(reference_buffer);
@@ -393,6 +396,7 @@ int main() {
     test_type(backend, GGML_TYPE_Q6_K, 256, 17);
     test_type(backend, GGML_TYPE_Q8_0, 256, 17);
     test_shared_session(device);
-    test_batched_weight_canonical(backend);
+    test_batched_weight_canonical(backend, 2);
+    test_batched_weight_canonical(backend, 1);
     ggml_backend_free(backend);
 }
