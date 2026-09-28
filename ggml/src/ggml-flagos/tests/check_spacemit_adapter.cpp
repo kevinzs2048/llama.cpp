@@ -37,7 +37,8 @@ static bool supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
            op->op == GGML_OP_SCALE || op->op == GGML_OP_NORM ||
            op->op == GGML_OP_CONT || op->op == GGML_OP_L2_NORM ||
            op->op == GGML_OP_PAD || op->op == GGML_OP_DIAG ||
-           op->op == GGML_OP_CPY || op->op == GGML_OP_SOLVE_TRI;
+           op->op == GGML_OP_CPY || op->op == GGML_OP_SOLVE_TRI ||
+           op->op == GGML_OP_SET_ROWS;
 }
 static bool supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) { return buft == &native_buft; }
 static void free_backend(ggml_backend_t backend) { delete backend; }
@@ -295,6 +296,31 @@ int main(int argc, char ** argv) {
         CHECK(!ggml_backend_dev_supports_op(&native_device, &op));
         CHECK(ggml_backend_dev_supports_buft(&native_device, &native_buft));
         CHECK(!ggml_backend_dev_supports_buft(&native_device, nullptr));
+        // The optional mixed-graph policy rejects light operations before
+        // placement but retains the KV-cache state update on the device.
+#ifdef _WIN32
+        CHECK(_putenv_s("GGML_FLAGOS_SPACEMIT_HEAVY_ONLY", "1") == 0);
+#else
+        CHECK(setenv("GGML_FLAGOS_SPACEMIT_HEAVY_ONLY", "1", 1) == 0);
+#endif
+        ggml_tensor policy_op {};
+        policy_op.op = GGML_OP_ADD;
+        CHECK(!ggml_backend_dev_supports_op(&native_device, &policy_op));
+        policy_op.op = GGML_OP_RMS_NORM;
+        CHECK(!ggml_backend_dev_supports_op(&native_device, &policy_op));
+        policy_op.op = GGML_OP_MUL_MAT;
+        CHECK(ggml_backend_dev_supports_op(&native_device, &policy_op));
+        policy_op.op = GGML_OP_SET_ROWS;
+        CHECK(ggml_backend_dev_supports_op(&native_device, &policy_op));
+        policy_op.op = GGML_OP_FLASH_ATTN_EXT;
+        ggml_tensor policy_mask {};
+        policy_op.src[3] = &policy_mask;
+        CHECK(ggml_backend_dev_supports_op(&native_device, &policy_op));
+#ifdef _WIN32
+        CHECK(_putenv_s("GGML_FLAGOS_SPACEMIT_HEAVY_ONLY", "") == 0);
+#else
+        CHECK(unsetenv("GGML_FLAGOS_SPACEMIT_HEAVY_ONLY") == 0);
+#endif
         auto backend = ggml_backend_flagos_init(0);
         CHECK(backend && backend->device == &native_device);
         CHECK(ggml_backend_is_flagos(backend));

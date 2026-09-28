@@ -21,7 +21,20 @@ bool disabled_by_environment() {
     return value && std::strcmp(value, "1") == 0;
 }
 
+bool heavy_only_by_environment() {
+    const char * value = std::getenv("GGML_FLAGOS_SPACEMIT_HEAVY_ONLY");
+    return value && std::strcmp(value, "1") == 0;
+}
+
 bool supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // An opt-in placement policy for models with many CPU-only weights.
+    // SET_ROWS stays on this device because KV-cache storage may already be
+    // bound to its buffer before the scheduler places the update node.
+    if (heavy_only_by_environment() && !ggml_op_is_empty(op->op) &&
+        op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID &&
+        op->op != GGML_OP_FLASH_ATTN_EXT && op->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
     // A 3D weight can be packed for MUL_MAT_ID. The native MUL_MAT trait
     // instead falls through to a scalar kernel that expects canonical bytes,
     // so it cannot safely read that packed 3D weight. 4D weights stay
