@@ -15,6 +15,34 @@ if (NOT EXISTS "${spacemit_source}/ggml-spacemit.cpp")
     message(FATAL_ERROR "Set FLAGOS_SPACEMIT_SOURCE_DIR to the pinned SpaceMiT llama.cpp checkout")
 endif()
 include("${CMAKE_CURRENT_LIST_DIR}/source-lock.cmake")
+option(GGML_FLAGOS_SPACEMIT_Q40_BLOCK32
+    "Use SpaceMiT's existing 32-value IME2 Q4_0 GEMM trait for more accurate K3 inference" OFF)
+set(spacemit_ime_source "${spacemit_source}/ime.cpp")
+if (GGML_FLAGOS_SPACEMIT_Q40_BLOCK32)
+    # The upstream trait selector prefers the 256-value HP kernel when both
+    # dimensions allow it. Select its existing 32-value kernel instead while
+    # keeping the pinned vendor checkout untouched and SHA-checked above.
+    file(READ "${spacemit_ime_source}" spacemit_ime_text)
+    set(q40_fast_trait "return &ggml::cpu::riscv64_spacemit::q4_0_32x256_q8_0;")
+    set(q40_block32_trait "return &ggml::cpu::riscv64_spacemit::q4_0_32x32_q8_0;")
+    string(FIND "${spacemit_ime_text}" "${q40_fast_trait}" q40_trait_position)
+    if (q40_trait_position EQUAL -1)
+        message(FATAL_ERROR "The pinned SpaceMiT Q4_0 IME2 selector changed; review the block32 option")
+    endif()
+    string(REPLACE "${q40_fast_trait}" "${q40_block32_trait}" spacemit_ime_text "${spacemit_ime_text}")
+    set(spacemit_ime_source "${CMAKE_CURRENT_BINARY_DIR}/spacemit-ime-q40-block32.cpp")
+    # Keep the generated source's timestamp stable across unrelated CMake
+    # reconfigures so the native IME object is rebuilt only when it changes.
+    string(SHA256 spacemit_ime_wanted_sha "${spacemit_ime_text}")
+    set(spacemit_ime_existing_sha "")
+    if (EXISTS "${spacemit_ime_source}")
+        file(SHA256 "${spacemit_ime_source}" spacemit_ime_existing_sha)
+    endif()
+    if (NOT spacemit_ime_existing_sha STREQUAL spacemit_ime_wanted_sha)
+        file(WRITE "${spacemit_ime_source}" "${spacemit_ime_text}")
+    endif()
+    message(STATUS "FlagOS SpaceMiT: using the existing IME2 Q4_0 32-value trait")
+endif()
 if (NOT EXISTS "${SPERT_DIR}/include/spert.hpp")
     message(FATAL_ERROR "Set SPERT_DIR to an extracted spine-runtime SDK")
 endif()
@@ -46,7 +74,7 @@ endif()
 
 add_library(flagos-spacemit-native OBJECT
     "${CMAKE_CURRENT_LIST_DIR}/native-backend.cpp"
-    "${spacemit_source}/ime.cpp"
+    "${spacemit_ime_source}"
     "${spacemit_source}/ime1_kernels.cpp"
     "${spacemit_source}/ime2_kernels.cpp"
     "${spacemit_source}/rvv_kernels.cpp"
@@ -57,8 +85,9 @@ set_target_properties(flagos-spacemit-native PROPERTIES POSITION_INDEPENDENT_COD
 target_link_libraries(flagos-spacemit-native PRIVATE ggml-base ggml-cpu)
 target_include_directories(flagos-spacemit-native PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    "${spacemit_source}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cpu"
-    "${spacemit_headers}" "${spacemit_source}" "${SPERT_DIR}/include")
+    "${spacemit_headers}" "${SPERT_DIR}/include")
 target_compile_options(flagos-spacemit-native PRIVATE "${spacemit_march}")
 if (BUILD_SHARED_LIBS)
     target_compile_definitions(flagos-spacemit-native PRIVATE GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
