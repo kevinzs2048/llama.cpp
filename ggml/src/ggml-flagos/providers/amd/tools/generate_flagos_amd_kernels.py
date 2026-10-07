@@ -2097,6 +2097,37 @@ def compile_aligned_gemm_package_without_launch(output_dir: Path, arch: str) -> 
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_tiled_ffn_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the checked tiled FFN export without GPU initialization."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("tiled-ffn requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_ffn_swiglu_f16_f32_batched_tiled"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="transformer.ffn_f16_round_activation_f16_acc_f32_swiglu.ptr16_k_rows_multiple16.v1",
+        runtime_arguments=("gate_weights", "up_weights", "x", "output", "k", "rows", "columns"),
+        constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+    divisibility = tuple((argument, 16) for argument in ("gate_weights", "up_weights", "x", "output", "k", "rows"))
+    if export.aot_divisibility != divisibility:
+        raise RuntimeError("incompatible tiled FFN divisibility contract")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {"gate_weights": "*fp16", "up_weights": "*fp16", "x": "*fp32", "output": "*fp32",
+        "k": "i32", "rows": "i32", "columns": "i32", "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"}
+    constants = {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}
+    compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 4})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("tiled FFN requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 128, "tile_m": 32, "tile_n": 128, "tile_k": 32,
+        "argument_count": 7, "global_scratch_size": 0, "global_scratch_align": getattr(m, "global_scratch_align", 1),
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align, "aot_divisibility": divisibility}])
+
+
 def compile_scale_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the common SCALE kernel for an AMD package without a device launch."""
     if not arch:
@@ -2946,7 +2977,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn"),
                         help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
     if args.extension and (not args.compile_only or not args.arch):
@@ -2979,8 +3010,10 @@ def main() -> None:
     if args.extension:
         if args.extension == "dense-gather":
             compile_dense_gather_package_without_launch(args.output_dir, args.arch)
-        else:
+        elif args.extension == "aligned-gemm":
             compile_aligned_gemm_package_without_launch(args.output_dir, args.arch)
+        else:
+            compile_tiled_ffn_package_without_launch(args.output_dir, args.arch)
         commit_output()
         print(f"wrote {args.extension} extension for {args.arch} to {final_output_dir}")
         return
