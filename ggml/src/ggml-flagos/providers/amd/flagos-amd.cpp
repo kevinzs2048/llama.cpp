@@ -484,6 +484,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_PREFILL_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_GROUPED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_ALIGNED_F16_GEMM"));
+    add(std::getenv("FLAGOS_AMD_QUANT_TILED_GEMM"));
     add(std::getenv("FLAGOS_AMD_TILED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
