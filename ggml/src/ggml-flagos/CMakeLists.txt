@@ -114,6 +114,10 @@ if (GGML_FLAGOS_AMD)
         ${FLAGOS_AMD_PRIVATE_DEFINITIONS})
     target_link_libraries(flagos-check-amd PRIVATE ggml hip::host ${CMAKE_DL_LIBS})
 
+    add_executable(flagos-check-amd-precision EXCLUDE_FROM_ALL
+        tests/check_amd_matmul_precision.cpp)
+    target_link_libraries(flagos-check-amd-precision PRIVATE ggml)
+
     add_executable(flagos-check-amd-aot EXCLUDE_FROM_ALL
         providers/amd/flagos-amd-hsaco.cpp
         providers/amd/flagos-amd-aot.cpp

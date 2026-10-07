@@ -926,6 +926,11 @@ static bool amd_prefill_f16_gemm_enabled(const amd_device_context * device) {
     return amd_profile_switch(device, "FLAGOS_AMD_PREFILL_F16_GEMM");
 }
 
+static bool amd_allows_f16_matmul(const ggml_tensor * op) {
+    return op != nullptr && op->op == GGML_OP_MUL_MAT &&
+        ggml_get_op_params_i32(op, 0) == GGML_PREC_DEFAULT;
+}
+
 static bool amd_ffn_down_f16_enabled(const amd_device_context * device) {
     return amd_profile_switch(device, "FLAGOS_AMD_FFN_DOWN_F16");
 }
@@ -1403,7 +1408,7 @@ static bool amd_f16_graph_cache_ready(
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node == nullptr || node->op != GGML_OP_MUL_MAT ||
+        if (!amd_allows_f16_matmul(node) ||
             node->src[0] == nullptr || node->src[1] == nullptr ||
             node->src[1]->ne[1] <= 1 || node->src[0]->ne[1] < 64 ||
             node->src[0]->ne[0] < 1024) {
@@ -1529,7 +1534,7 @@ static void amd_prepare_dequant_cache(
     requests.reserve(static_cast<size_t>(cgraph->n_nodes));
     for (int index = 0; index < cgraph->n_nodes; ++index) {
         const ggml_tensor * node = cgraph->nodes[index];
-        if (node == nullptr || node->op != GGML_OP_MUL_MAT ||
+        if (!amd_allows_f16_matmul(node) ||
             node->src[0] == nullptr || node->src[1] == nullptr ||
             node->src[1]->ne[1] <= 1 || node->src[0]->ne[1] < 64 ||
             node->src[0]->ne[0] < 1024) {
@@ -2749,7 +2754,11 @@ static bool amd_i32_matrix_offsets_fit(
 }
 
 static bool amd_supports_quantized_mul_mat(const amd_device_context * device, const ggml_tensor * op) {
-    if (device == nullptr || device->aot == nullptr || op == nullptr) {
+    if (device == nullptr || device->aot == nullptr || op == nullptr || op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const int32_t precision = ggml_get_op_params_i32(op, 0);
+    if (precision != GGML_PREC_DEFAULT && precision != GGML_PREC_F32) {
         return false;
     }
     flagos_quantized_matmul_signature signature;
@@ -2944,7 +2953,7 @@ static bool amd_supports_ffn_swiglu_f16_layout(const amd_device_context * device
                                                const ggml_tensor * up,
                                                const ggml_tensor * glu) {
     if (device == nullptr || device->aot == nullptr || gate == nullptr || up == nullptr || glu == nullptr ||
-        gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        !amd_allows_f16_matmul(gate) || !amd_allows_f16_matmul(up) ||
         glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
         glu->src[0] == nullptr || glu->src[1] == nullptr ||
         !((glu->src[0] == gate && glu->src[1] == up) ||
@@ -3028,7 +3037,7 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
         !amd_fusion_enabled(device, "ffn_swiglu_down") || !amd_prefill_f16_gemm_enabled(device) ||
         !amd_ffn_down_f16_enabled(device) ||
         !amd_supports_ffn_swiglu_f16_layout(device, gate, up, glu) ||
-        down->op != GGML_OP_MUL_MAT || down->src[1] != glu) {
+        !amd_allows_f16_matmul(down) || down->src[1] != glu) {
         return false;
     }
 
@@ -3135,7 +3144,7 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
                                               const ggml_tensor * glu) {
     if (device == nullptr || device->aot == nullptr || gate == nullptr || up == nullptr || glu == nullptr ||
         !amd_fusion_enabled(device, "ffn_swiglu") ||
-        gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        !amd_allows_f16_matmul(gate) || !amd_allows_f16_matmul(up) ||
         glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
         glu->src[0] == nullptr || glu->src[1] == nullptr ||
         !((glu->src[0] == gate && glu->src[1] == up) ||
@@ -5140,7 +5149,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             // tensor objects with different random payloads across cases;
             // keeping those shapes on the reference AOT path avoids making a
             // cache entry depend on test-only mutation semantics.
-            if (columns > 1 && rows >= 64 && k >= 1024 &&
+            if (columns > 1 && rows >= 64 && k >= 1024 && amd_allows_f16_matmul(node) &&
                 amd_prefill_f16_gemm_enabled(backend_context->device)) {
                 flagos_quantized_matmul_signature signature;
                 const bool described = flagos_describe_quantized_matmul(node, &signature);
