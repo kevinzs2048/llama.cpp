@@ -2200,6 +2200,40 @@ def compile_q6_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
         "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
 
 
+def compile_gdn_value_tile_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the GDN value-axis tile with the legacy packed output contract."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("gdn-value-tile requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_gated_delta_net_scalar_f32_value_tiled"
+    arguments = ("q", "k", "v", "gate", "beta", "current_state", "output",
+        "state_size", "n_heads", "n_tokens", "n_seqs", "sq1", "sq2", "sq3",
+        "sv1", "sv2", "sv3", "sb1", "sb2", "sb3", "q_heads", "q_seq_ratio",
+        "snapshot_count", "scale")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.gated_delta_net_scalar_f32.value_tiles.legacy_math.v1",
+        runtime_arguments=arguments, constexpr_arguments=("BLOCK", "COLS"))
+    if export.aot_divisibility:
+        raise RuntimeError("generic GDN value tile must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "*fp32" if i < 7 else "fp32" if argument == "scale" else "i32"
+        for i, argument in enumerate(arguments)}
+    signature.update(BLOCK="constexpr", COLS="constexpr")
+    compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 128, "COLS": 16},
+        attrs=export.aot_attributes), target=GPUTarget("hip", arch, 32), options={"num_warps": 4})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("GDN value tile requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 128, "tile_m": 0, "tile_n": 16, "tile_k": 0,
+        "argument_count": 24, "global_scratch_size": 0,
+        "global_scratch_align": getattr(m, "global_scratch_align", 1),
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
 def compile_strided_rms_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the GGML outer-stride RMS export with its tested arithmetic."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3078,7 +3112,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gdn-value-tile"),
                         help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
     if args.extension and (not args.compile_only or not args.arch):
@@ -3119,6 +3153,8 @@ def main() -> None:
             compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "q6-gemv":
             compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "gdn-value-tile":
+            compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
         else:
             compile_strided_rms_package_without_launch(args.output_dir, args.arch)
         commit_output()
