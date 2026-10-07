@@ -1467,6 +1467,57 @@ int main() {
     CHECK(flagos_pattern_scope(flagos_pattern_id::ffn_swiglu_down) == flagos_fusion_scope::graph);
     CHECK(flagos_pattern_scope(flagos_pattern_id::flash_attn_prefill) == flagos_fusion_scope::single_operator);
 
+    // Split views retain whole-graph use counts, including later backends.
+    ggml_init_params params { 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1536);
+    ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1536);
+    ggml_tensor * norm = ggml_rms_norm(ctx, input, 1e-6f);
+    ggml_tensor * mul = ggml_mul(ctx, norm, weight);
+    ggml_cgraph * full = ggml_new_graph(ctx);
+    ggml_build_forward_expand(full, mul);
+    CHECK(full->n_nodes == 2);
+    ggml_cgraph split = ggml_graph_view(full, 0, 2);
+    supported = flagos_pattern_id::rms_norm_mul;
+    CHECK(flagos_graph_exposes_all_consumers(&split, norm));
+    CHECK(!flagos_graph_exposes_all_consumers(&graph.graph, &graph.norm));
+    flagos_graph_plan_cache split_cache(2);
+    bool split_created = false;
+    split_cache.get_or_create(&split, query_pattern_terminal_only, &supported, &split_created);
+    CHECK(split_created);
+    auto before_fanout = flagos_build_graph_plan(&split, query_pattern_terminal_only, &supported);
+    CHECK(before_fanout->steps.size() == 1);
+    ggml_tensor * later = ggml_add(ctx, norm, norm);
+    ggml_build_forward_expand(full, later);
+    split = ggml_graph_view(full, 0, 2);
+    plan = flagos_build_graph_plan(&split, query_pattern_terminal_only, &supported);
+    CHECK(plan->steps.size() == 2);
+    CHECK(plan->steps[0].kind == flagos_execution_kind::direct);
+    CHECK(!flagos_graph_exposes_all_consumers(&split, norm));
+    CHECK(flagos_graph_exposes_all_consumers(full, norm));
+    const auto & refreshed = split_cache.get_or_create(
+        &split, query_pattern_terminal_only, &supported, &split_created);
+    CHECK(split_created);
+    CHECK(refreshed.steps.size() == 2);
+    CHECK(!before_fanout->matches(&split));
+    CHECK(before_fanout->structural_fingerprint != plan->structural_fingerprint);
+    auto multi_output = flagos_build_graph_plan(&split, query_pattern, &supported);
+    CHECK(multi_output->steps.size() == 1);
+    CHECK(multi_output->steps[0].candidate.required_output_node_indices.size() == 2);
+    // A covered alias can itself escape even when its backing tensor's
+    // direct consumers are all visible in the split.
+    ggml_tensor * alias = ggml_view_1d(ctx, norm, 512, 0);
+    ggml_tensor * alias_consumer = ggml_add(ctx, alias, alias);
+    ggml_cgraph * alias_full = ggml_new_graph(ctx);
+    ggml_build_forward_expand(alias_full, alias_consumer);
+    CHECK(alias_full->n_nodes == 3);
+    ggml_cgraph alias_split = ggml_graph_view(alias_full, 0, 2);
+    CHECK(flagos_graph_exposes_all_consumers(&alias_split, norm));
+    CHECK(!flagos_graph_exposes_all_consumers(&alias_split, alias));
+    CHECK(flagos_graph_exposes_all_consumers(alias_full, alias));
+    ggml_free(ctx);
+
     std::printf("FlagOS graph plan checks passed\n");
     return 0;
 }

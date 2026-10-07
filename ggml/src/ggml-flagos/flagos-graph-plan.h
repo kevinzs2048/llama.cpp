@@ -74,6 +74,9 @@ enum class flagos_fusion_scope : uint32_t {
 
 flagos_fusion_scope flagos_pattern_scope(flagos_pattern_id id);
 
+// Prove that the split exposes all operand consumers; absent metadata fails closed.
+bool flagos_graph_exposes_all_consumers(const ggml_cgraph * graph, const ggml_tensor * tensor);
+
 struct flagos_pattern_candidate {
     flagos_pattern_id id = flagos_pattern_id::none;
     flagos_fusion_scope scope = flagos_fusion_scope::graph;
@@ -179,6 +182,7 @@ struct flagos_canonical_tensor {
 };
 
 struct flagos_canonical_node {
+    int32_t use_count = -1;
     flagos_canonical_tensor output;
     std::array<flagos_canonical_tensor, 10> sources;
 

@@ -131,7 +131,7 @@ bool flagos_canonical_tensor::operator==(const flagos_canonical_tensor & other) 
 }
 
 bool flagos_canonical_node::operator==(const flagos_canonical_node & other) const {
-    return output == other.output && sources == other.sources;
+    return use_count == other.use_count && output == other.output && sources == other.sources;
 }
 
 static void flagos_hash_bytes(uint64_t & hash, const void * data, size_t size) {
@@ -253,6 +253,42 @@ static void flagos_prepare_producers(
     }
 }
 
+// Graph views retain global counts; handmade graphs may omit this metadata.
+static int32_t flagos_global_use_count(const ggml_cgraph * graph, const ggml_tensor * tensor) {
+    const auto & set = graph->visited_hash_set;
+    if (graph->use_counts == nullptr || set.size == 0 || set.keys == nullptr || set.used == nullptr) {
+        return -1;
+    }
+    const size_t slot = ggml_hash_find(&set, tensor);
+    if (slot == GGML_HASHSET_FULL || !ggml_bitset_get(set.used, slot)) {
+        return -1;
+    }
+    return graph->use_counts[slot];
+}
+
+static int32_t flagos_operand_uses(const ggml_tensor * consumer, const ggml_tensor * producer) {
+    int32_t count = 0;
+    for (const auto * source : consumer->src) {
+        count += source == producer;
+    }
+    return count;
+}
+
+bool flagos_graph_exposes_all_consumers(const ggml_cgraph * graph, const ggml_tensor * tensor) {
+    if (graph == nullptr || tensor == nullptr) {
+        return false;
+    }
+    const int32_t global_uses = flagos_global_use_count(graph, tensor);
+    if (global_uses < 0) {
+        return false;
+    }
+    int32_t visible_uses = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        visible_uses += flagos_operand_uses(graph->nodes[i], tensor);
+    }
+    return global_uses == visible_uses;
+}
+
 static void flagos_canonicalize_graph(
         const ggml_cgraph * cgraph,
         flagos_producer_map & producers,
@@ -265,6 +301,7 @@ static void flagos_canonicalize_graph(
     result.resize(cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
+        result[i].use_count = flagos_global_use_count(cgraph, node);
         result[i].output = flagos_canonicalize_tensor(node, producers, identities);
         for (int src = 0; src < GGML_MAX_SRC; ++src) {
             result[i].sources[src] = flagos_canonicalize_tensor(node->src[src], producers, identities);
@@ -306,7 +343,8 @@ static bool flagos_graph_matches_canonical(
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         const flagos_canonical_node & canonical = canonical_nodes[static_cast<size_t>(i)];
-        if (!flagos_tensor_matches_canonical(node, producers, identities, canonical.output)) {
+        if (canonical.use_count != flagos_global_use_count(cgraph, node) ||
+            !flagos_tensor_matches_canonical(node, producers, identities, canonical.output)) {
             return false;
         }
         for (int src = 0; src < GGML_MAX_SRC; ++src) {
@@ -347,6 +385,7 @@ static uint64_t flagos_fingerprint(const std::vector<flagos_canonical_node> & no
             flagos_hash_bytes(hash, tensor.nb.data(), tensor.nb.size() * sizeof(tensor.nb[0]));
             flagos_hash_bytes(hash, tensor.op_params.data(), tensor.op_params.size());
         };
+        flagos_hash_value(hash, node.use_count);
         hash_tensor(node.output);
         for (const auto & source : node.sources) {
             hash_tensor(source);
@@ -533,6 +572,11 @@ static bool flagos_tensor_is_private_to_consumer(
         (producer->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
         return false;
     }
+    const int32_t global_uses = flagos_global_use_count(cgraph, producer);
+    if (global_uses >= 0 && global_uses !=
+        flagos_operand_uses(cgraph->nodes[expected_consumer_index], producer)) {
+        return false;
+    }
     bool found_expected = false;
     for (int consumer_index = 0; consumer_index < cgraph->n_nodes; ++consumer_index) {
         const ggml_tensor * consumer = cgraph->nodes[consumer_index];
@@ -570,6 +614,14 @@ static bool flagos_populate_required_outputs(
         const ggml_tensor * producer = cgraph->nodes[producer_index];
         bool required = position + 1 == candidate.node_indices.size() ||
             (producer->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+        const int32_t global_uses = flagos_global_use_count(cgraph, producer);
+        if (global_uses >= 0) {
+            int32_t internal_uses = 0;
+            for (const int index : candidate.node_indices) {
+                internal_uses += flagos_operand_uses(cgraph->nodes[index], producer);
+            }
+            required = required || global_uses != internal_uses;
+        }
         for (int consumer_index = 0; consumer_index < cgraph->n_nodes; ++consumer_index) {
             if (required || consumer_index == producer_index || covered[static_cast<size_t>(consumer_index)]) {
                 continue;
