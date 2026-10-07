@@ -192,3 +192,8 @@ if (GGML_FLAGOS_AMD)
     add_executable(flagos-check-amd-tiled-ffn EXCLUDE_FROM_ALL tests/check_amd_tiled_ffn.cpp)
     target_link_libraries(flagos-check-amd-tiled-ffn PRIVATE ggml)
 endif()
+
+if (GGML_FLAGOS_AMD)
+    add_executable(flagos-check-amd-packed-ffn EXCLUDE_FROM_ALL tests/check_amd_packed_ffn.cpp)
+    target_link_libraries(flagos-check-amd-packed-ffn PRIVATE ggml)
+endif()
