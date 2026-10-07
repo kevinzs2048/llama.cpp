@@ -22,6 +22,13 @@ inline bool supports_aligned_f16_gemm_launch(
 }
 
 
+inline bool supports_tiled_f16_ffn_launch(
+        const void * gate_weights, const void * up_weights,
+        const void * x, const void * output, int k, int rows) {
+    return supports_aligned_f16_gemm_launch(gate_weights, x, output, k, rows) &&
+        up_weights != nullptr && reinterpret_cast<uintptr_t>(up_weights) % 16 == 0;
+}
+
 inline constexpr int dense_gather_block_size = 256;
 
 struct dense_gather_signature {

@@ -483,6 +483,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_PREFILL_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_GROUPED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_ALIGNED_F16_GEMM"));
+    add(std::getenv("FLAGOS_AMD_TILED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW"));
@@ -4223,8 +4224,17 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
         const bool grouped = amd_grouped_f16_ffn_enabled(context->device,
                 static_cast<int>(first_signature.columns)) &&
             context->device->aot->find("flagos_ffn_swiglu_f16_f32_grouped") != nullptr;
-        const char * kernel_name = grouped
-            ? "flagos_ffn_swiglu_f16_f32_grouped" : "flagos_ffn_swiglu_f16_f32_batched";
+        const auto * tiled_metadata = context->device->aot->find("flagos_ffn_swiglu_f16_f32_batched_tiled");
+        const bool tiled = !grouped && amd_env_enabled("FLAGOS_AMD_TILED_F16_FFN") &&
+            tiled_metadata != nullptr && tiled_metadata->argument_count == 7 &&
+            tiled_metadata->tile_m == 32 && tiled_metadata->tile_n == 128 &&
+            tiled_metadata->tile_k == 32 && tiled_metadata->block_size == 128 &&
+            tiled_metadata->num_warps == 4 && tiled_metadata->warp_size == 32 &&
+            flagos_amd::supports_tiled_f16_ffn_launch(
+                first_weights, second_weights, gate_projection->src[1]->data, glu->data,
+                static_cast<int>(first_signature.k), static_cast<int>(first_signature.rows));
+        const char * kernel_name = grouped ? "flagos_ffn_swiglu_f16_f32_grouped" :
+            tiled ? "flagos_ffn_swiglu_f16_f32_batched_tiled" : "flagos_ffn_swiglu_f16_f32_batched";
         const auto * metadata = context->device->aot->find(kernel_name);
         if (metadata == nullptr) {
             return false;
@@ -4257,7 +4267,7 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_ffn_swiglu.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(context, glu,
-                grouped ? "ffn_swiglu_f16_grouped" : "ffn_swiglu_f16");
+                grouped ? "ffn_swiglu_f16_grouped" : tiled ? "ffn_swiglu_f16_tiled" : "ffn_swiglu_f16");
         }
         return launched;
     }

@@ -187,3 +187,8 @@ if (GGML_FLAGOS_AMD)
         tests/check_amd_aligned_gemm.cpp)
     target_link_libraries(flagos-check-amd-aligned-gemm PRIVATE ggml)
 endif()
+
+if (GGML_FLAGOS_AMD)
+    add_executable(flagos-check-amd-tiled-ffn EXCLUDE_FROM_ALL tests/check_amd_tiled_ffn.cpp)
+    target_link_libraries(flagos-check-amd-tiled-ffn PRIVATE ggml)
+endif()
