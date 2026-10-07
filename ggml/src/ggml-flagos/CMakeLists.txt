@@ -200,7 +200,7 @@ endif()
 
 if (GGML_FLAGOS_AMD AND GGML_CPU)
     add_executable(flagos-check-amd-strided-rms EXCLUDE_FROM_ALL tests/check_amd_strided_rms.cpp)
-    target_link_libraries(flagos-check-amd-strided-rms PRIVATE ggml ggml-cpu)
+    target_link_libraries(flagos-check-amd-strided-rms PRIVATE ggml)
 endif()
 
 if (GGML_FLAGOS_AMD)

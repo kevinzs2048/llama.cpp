@@ -4,7 +4,7 @@
 #define CHECK(condition) do { if (!(condition)) { std::fprintf(stderr, "CHECK_FAILED line=%d %s\n", __LINE__, #condition); std::exit(2); } } while (false)
 
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "ggml-backend.h"
 #include <cstring>
 #include <algorithm>
 
@@ -23,7 +23,16 @@ extern "C" int reference_rms_norm(const float * input, float * output,
     ggml_tensor * y = ggml_rms_norm(ctx, x, eps);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, y);
-    const int status = ggml_graph_compute_with_ctx(ctx, graph, 1);
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!backend) { ggml_free(ctx); return -3; }
+    ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_set_n_threads"));
+    if (!set_threads) { ggml_backend_free(backend); ggml_free(ctx); return -4; }
+    set_threads(backend, 1);
+    const int status = ggml_backend_graph_compute(backend, graph);
+    ggml_backend_synchronize(backend);
+    ggml_backend_free(backend);
     if (status == GGML_STATUS_SUCCESS) std::memcpy(output, y->data, ggml_nbytes(y));
     ggml_free(ctx);
     return status;

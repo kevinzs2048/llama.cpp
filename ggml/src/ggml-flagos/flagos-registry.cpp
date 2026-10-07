@@ -381,12 +381,6 @@ int ggml_backend_flagos_get_device() {
     return -1;
 }
 
-void ggml_backend_flagos_reg_devices() {
-#ifndef GGML_BACKEND_DL
-    ggml_backend_register(ggml_backend_flagos_reg());
-#endif
-}
-
 static int ggml_backend_flagos_score() {
     int score = 0;
     for (const flagos_provider_v1 * provider : flagos_all_providers()) {

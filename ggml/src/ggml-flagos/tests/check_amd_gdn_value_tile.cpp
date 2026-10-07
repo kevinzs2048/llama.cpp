@@ -1,6 +1,5 @@
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-flagos.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,7 +18,7 @@ int main(int argc, char ** argv) {
     auto reference = reinterpret_cast<reference_fn>(dlsym(library, "reference_gdn"));
     CHECK(reference != nullptr);
     ggml_backend_load_all();
-    auto registry = ggml_backend_flagos_reg();
+    auto registry = ggml_backend_reg_by_name("FlagOS");
     CHECK(registry != nullptr && ggml_backend_reg_dev_count(registry) > 0);
     auto device = ggml_backend_reg_dev_get(registry, 0);
     auto backend = ggml_backend_dev_init(device, nullptr);
