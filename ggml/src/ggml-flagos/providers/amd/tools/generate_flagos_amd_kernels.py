@@ -2060,6 +2060,43 @@ def compile_dense_gather_package_without_launch(output_dir: Path, arch: str) -> 
     }])
 
 
+def compile_aligned_gemm_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile generic and aligned GEMM from explicit FlagGems contracts."""
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("aligned-gemm requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    global FLAGGEMS_AOT_EXPORTS
+    kernels = []
+    for aligned in (False, True):
+        name = "flagos_mul_mat_f16_f32_batched" + ("_aligned" if aligned else "")
+        semantic = "ggml.gemm_f16_round_activation_f16_acc_f32" + (".ptr16_k_rows_multiple16" if aligned else "") + ".v1"
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=("weights", "x", "output", "k", "rows", "columns"),
+            constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+        divisibility = tuple((argument, 16) for argument in ("weights", "x", "output", "k", "rows")) if aligned else ()
+        if export.aot_divisibility != divisibility:
+            raise RuntimeError(f"incompatible GEMM divisibility contract: {name}")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {"weights": "*fp16", "x": "*fp32", "output": "*fp32",
+                     "k": "i32", "rows": "i32", "columns": "i32",
+                     "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"}
+        constants = {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}
+        compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+            target=GPUTarget("hip", arch, 32), options={"num_warps": NUM_WARPS})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError(f"{name} requires unsupported Triton scratch storage")
+        artifact = output_dir / f"{name}.hsaco"
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 128, "tile_m": 64, "tile_n": 128, "tile_k": 32,
+            "argument_count": 6, "global_scratch_size": 0,
+            "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align,
+            "aot_divisibility": divisibility})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_scale_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the common SCALE kernel for an AMD package without a device launch."""
     if not arch:
@@ -2909,7 +2946,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather",),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm"),
                         help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
     if args.extension and (not args.compile_only or not args.arch):
@@ -2940,7 +2977,10 @@ def main() -> None:
         staging_output_dir.rename(final_output_dir)
         temporary_output.cleanup()
     if args.extension:
-        compile_dense_gather_package_without_launch(args.output_dir, args.arch)
+        if args.extension == "dense-gather":
+            compile_dense_gather_package_without_launch(args.output_dir, args.arch)
+        else:
+            compile_aligned_gemm_package_without_launch(args.output_dir, args.arch)
         commit_output()
         print(f"wrote {args.extension} extension for {args.arch} to {final_output_dir}")
         return
