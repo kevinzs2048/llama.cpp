@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <vector>
 #include <cstdint>
+#include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace flagos_amd {
@@ -27,6 +29,50 @@ inline bool supports_tiled_f16_ffn_launch(
         const void * x, const void * output, int k, int rows) {
     return supports_aligned_f16_gemm_launch(gate_weights, x, output, k, rows) &&
         up_weights != nullptr && reinterpret_cast<uintptr_t>(up_weights) % 16 == 0;
+}
+
+inline bool supports_strided_rms_norm_layout(const ggml_tensor * op, int block_cols) {
+    if (op == nullptr || op->op != GGML_OP_RMS_NORM || op->src[0] == nullptr ||
+        op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(op, op->src[0]) || !ggml_is_contiguous(op) ||
+        op->src[0]->nb[0] != sizeof(float) || op->ne[0] <= 0 || op->ne[0] > block_cols) {
+        return false;
+    }
+    int64_t elements = 1;
+    int64_t maximum_offset = 0;
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        const int64_t extent = op->ne[dim];
+        if (extent <= 0 || extent > INT32_MAX / elements ||
+            op->src[0]->nb[dim] % sizeof(float) != 0 ||
+            op->src[0]->nb[dim] / sizeof(float) > INT32_MAX) {
+            return false;
+        }
+        const int64_t stride = op->src[0]->nb[dim] / sizeof(float);
+        if (extent > 1 && stride > (INT32_MAX - maximum_offset) / (extent - 1)) {
+            return false;
+        }
+        maximum_offset += (extent - 1) * stride;
+        elements *= extent;
+    }
+    float eps = 0.0f;
+    std::memcpy(&eps, op->op_params, sizeof(eps));
+    if (!std::isfinite(eps) || eps <= 0.0f) {
+        return false;
+    }
+    const uintptr_t output = reinterpret_cast<uintptr_t>(op->data);
+    const uintptr_t input = reinterpret_cast<uintptr_t>(op->src[0]->data);
+    if (output % sizeof(float) != 0 || input % sizeof(float) != 0) {
+        return false;
+    }
+    if (output != 0 && input != 0) {
+        const size_t output_size = static_cast<size_t>(elements) * sizeof(float);
+        const size_t input_size = static_cast<size_t>(maximum_offset + 1) * sizeof(float);
+        if (output > UINTPTR_MAX - output_size || input > UINTPTR_MAX - input_size ||
+            (output < input + input_size && input < output + output_size)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline constexpr int dense_gather_block_size = 256;

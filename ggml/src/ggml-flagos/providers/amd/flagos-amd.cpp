@@ -485,6 +485,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_GROUPED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_ALIGNED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_TILED_F16_FFN"));
+    add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
@@ -4654,7 +4655,25 @@ static bool amd_supports_scale(const amd_device_context * device, const ggml_ten
         amd_tensor_output_can_reuse_input(op, op->src[0]);
 }
 
+static bool amd_supports_strided_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
+    const char * configured = std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM");
+    if (configured != nullptr && std::strcmp(configured, "0") == 0) {
+        return false;
+    }
+    if (device == nullptr || device->aot == nullptr || op == nullptr || op->src[0] == nullptr ||
+        ggml_is_contiguous(op->src[0])) {
+        return false;
+    }
+    const auto * metadata = device->aot->find("flagos_rms_norm_ggml_strided_f32");
+    return metadata != nullptr && metadata->argument_count == 9 &&
+        metadata->block_size == 256 && metadata->num_warps == 4 && metadata->warp_size == 32 &&
+        flagos_amd::supports_strided_rms_norm_layout(op, metadata->block_size);
+}
+
 static bool amd_supports_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
+    if (amd_supports_strided_rms_norm(device, op)) {
+        return true;
+    }
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_RMS_NORM || op->src[0] == nullptr ||
         device->aot->find("flagos_rms_norm_f32") == nullptr ||
@@ -5420,6 +5439,25 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             int n_cols = static_cast<int>(node->ne[0]);
             float eps = 0.0f;
             std::memcpy(&eps, node->op_params, sizeof(eps));
+            if (amd_supports_strided_rms_norm(backend_context->device, node)) {
+                int ne1 = static_cast<int>(node->ne[1]);
+                int ne2 = static_cast<int>(node->ne[2]);
+                int stride_x1 = static_cast<int>(node->src[0]->nb[1] / sizeof(float));
+                int stride_x2 = static_cast<int>(node->src[0]->nb[2] / sizeof(float));
+                int stride_x3 = static_cast<int>(node->src[0]->nb[3] / sizeof(float));
+                flagos_amd::kernel_arguments arguments = {
+                    &node->data, &node->src[0]->data, &n_cols, &ne1, &ne2,
+                    &stride_x1, &stride_x2, &stride_x3, &eps,
+                };
+                if (!backend_context->device->aot->launch("flagos_rms_norm_ggml_strided_f32",
+                        backend_context->stream, rows, 1, 1, arguments)) {
+                    return GGML_STATUS_FAILED;
+                }
+                backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+                amd_trace_op(backend_context, node, "rms_norm_strided");
+                continue;
+            }
             flagos_amd::kernel_arguments arguments = {
                 &node->data,
                 &node->src[0]->data,
