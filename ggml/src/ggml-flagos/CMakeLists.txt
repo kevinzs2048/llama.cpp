@@ -202,3 +202,8 @@ if (GGML_FLAGOS_AMD AND GGML_CPU)
     add_executable(flagos-check-amd-strided-rms EXCLUDE_FROM_ALL tests/check_amd_strided_rms.cpp)
     target_link_libraries(flagos-check-amd-strided-rms PRIVATE ggml ggml-cpu)
 endif()
+
+if (GGML_FLAGOS_AMD)
+    add_executable(flagos-check-amd-gdn-value-tile EXCLUDE_FROM_ALL tests/check_amd_gdn_value_tile.cpp)
+    target_link_libraries(flagos-check-amd-gdn-value-tile PRIVATE ggml ${CMAKE_DL_LIBS})
+endif()

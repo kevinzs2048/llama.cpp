@@ -487,6 +487,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_TILED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
+    add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW"));
@@ -2393,6 +2394,22 @@ static bool amd_supports_gated_delta_net(
     return amd_tensor_data_is_aligned(op, 16) &&
         amd_tensor_element_strides_are_aligned(q, sizeof(float), 16, 1) &&
         amd_tensor_element_strides_are_aligned(v, sizeof(float), 16, 1);
+}
+
+// Called only after the complete legacy GDN tensor/stride/alias contract passes.
+static const char * amd_gated_delta_net_kernel_name(
+        const amd_device_context * device, const ggml_tensor * op) {
+    static constexpr const char * baseline = "flagos_gated_delta_net_scalar_f32";
+    static constexpr const char * tiled = "flagos_gated_delta_net_scalar_f32_value_tiled";
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * v = op->src[2];
+    if (!amd_env_enabled("FLAGOS_AMD_TILED_GDN_PREFILL") ||
+        v->ne[0] != 128 || v->ne[1] != 32 || v->ne[2] < 32 || v->ne[3] != 1 ||
+        q->ne[1] != 16 || q->ne[3] != 1) return baseline;
+    const auto * m = device->aot->find(tiled);
+    if (m == nullptr || m->argument_count != 24 || m->block_size != 128 ||
+        m->tile_n != 16 || m->num_warps != 4 || m->warp_size != 32) return baseline;
+    return tiled;
 }
 
 static bool amd_supports_gated_delta_net_cache(
@@ -5012,8 +5029,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             const ggml_tensor * q = node->src[0];
             const ggml_tensor * v = node->src[2];
             const ggml_tensor * beta = node->src[4];
-            const auto * metadata = backend_context->device->aot->find(
-                "flagos_gated_delta_net_scalar_f32");
+            const char * kernel_name = amd_gated_delta_net_kernel_name(backend_context->device, node);
+            const auto * metadata = backend_context->device->aot->find(kernel_name);
             int state_size = static_cast<int>(v->ne[0]);
             int n_heads = static_cast<int>(v->ne[1]);
             int n_tokens = static_cast<int>(v->ne[2]);
@@ -5048,14 +5065,14 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 (static_cast<uint64_t>(state_size) + metadata->tile_n - 1) /
                 metadata->tile_n);
             if (!backend_context->device->aot->launch(
-                    "flagos_gated_delta_net_scalar_f32", backend_context->stream,
+                    kernel_name, backend_context->stream,
                     static_cast<unsigned int>(n_heads),
                     static_cast<unsigned int>(n_seqs), grid_z, arguments)) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
-            amd_trace_op(backend_context, node, "gated_delta_net_scalar");
+            amd_trace_op(backend_context, node, std::strcmp(kernel_name, "flagos_gated_delta_net_scalar_f32_value_tiled") == 0 ? "gated_delta_net_value_tiled" : "gated_delta_net_scalar");
             continue;
         }
         if (node->op == GGML_OP_GET_ROWS && amd_supports_dense_get_rows(backend_context->device, node)) {
