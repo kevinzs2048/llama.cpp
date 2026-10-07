@@ -122,6 +122,7 @@ struct interface_state {
     int execute_count = 0;
     const ggml_tensor * resolved_tensor = nullptr;
     const void * resolved_data = nullptr;
+    int resolve_count = 0;
 };
 
 static flagos_lowering_choice query_pattern_interface(
@@ -146,7 +147,8 @@ static bool execute_probe(void * user_data, ggml_cgraph *, const flagos_plan_ste
 }
 
 static const void * resolve_interface_binding(void * user_data, const ggml_tensor * tensor) {
-    const auto * state = static_cast<const interface_state *>(user_data);
+    auto * state = static_cast<interface_state *>(user_data);
+    ++state->resolve_count;
     return state->resolved_tensor == tensor ? state->resolved_data : tensor->data;
 }
 
@@ -437,11 +439,28 @@ int main() {
     flagos_graph_plan_cache direct_cache(2);
     direct_cache.get_or_create(&direct_graph, direct_interface, &created);
     CHECK(created);
+    CHECK(direct_state.resolve_count == 0);
     direct_node.data = &direct_data_b;
     direct_cache.get_or_create(&direct_graph, direct_interface, &created);
     CHECK(!created);
     CHECK(direct_cache.hits() == 1);
     CHECK(direct_cache.misses() == 1);
+    CHECK(direct_state.resolve_count == 0);
+    direct_node.data = nullptr;
+    const auto & unbound_direct_plan = direct_cache.get_or_create(&direct_graph, direct_interface, &created);
+    CHECK(!created);
+    CHECK(!unbound_direct_plan.binding_sensitive);
+    CHECK(direct_state.resolve_count == 0);
+    // Capture snapshots still need real bindings even for a direct-only plan.
+    flagos_graph_binding_snapshot direct_bindings;
+    CHECK(!flagos_graph_binding_snapshot_create(
+        &direct_graph, unbound_direct_plan, &direct_bindings, resolve_interface_binding, &direct_state));
+    direct_node.data = &direct_data_b;
+    CHECK(flagos_graph_binding_snapshot_create(
+        &direct_graph, unbound_direct_plan, &direct_bindings, resolve_interface_binding, &direct_state));
+    direct_node.data = &direct_data_a;
+    CHECK(!flagos_graph_binding_snapshot_matches(
+        &direct_graph, unbound_direct_plan, direct_bindings, resolve_interface_binding, &direct_state));
 
     flagos_graph_plan_cache policy_cache(4);
     const auto & capture_safe_plan = policy_cache.get_or_create(

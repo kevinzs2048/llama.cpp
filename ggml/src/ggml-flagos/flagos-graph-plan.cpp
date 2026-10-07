@@ -1585,16 +1585,16 @@ struct flagos_graph_plan_cache::entry {
 };
 
 bool flagos_graph_plan_cache::plan_is_valid(entry & entry, const ggml_cgraph * cgraph) {
-    if (entry.bindings_captured && flagos_graph_binding_snapshot_matches(
-            cgraph, *entry.plan, entry.validated_bindings,
-            entry.resolve_tensor_data, entry.user_data)) {
-        return true;
-    }
     // A graph with no recognized fusion candidate cannot change its plan when
     // scheduler buffers rotate. Direct steps consume the current tensor
     // bindings at execution time, so rebuilding the canonical plan adds no
     // safety and can thrash on multi-buffer decode schedules.
     if (!entry.plan->binding_sensitive) {
+        return true;
+    }
+    if (entry.bindings_captured && flagos_graph_binding_snapshot_matches(
+            cgraph, *entry.plan, entry.validated_bindings,
+            entry.resolve_tensor_data, entry.user_data)) {
         return true;
     }
     if (entry.validate_lowering == nullptr) {
@@ -1735,7 +1735,7 @@ const flagos_graph_plan & flagos_graph_plan_cache::get_or_create(
     item->user_data = user_data;
     item->configuration_id = configuration_id;
     item->resolve_tensor_data = resolve_tensor_data;
-    item->bindings_captured = flagos_graph_binding_snapshot_create(
+    item->bindings_captured = item->plan->binding_sensitive && flagos_graph_binding_snapshot_create(
         cgraph, *item->plan, &item->validated_bindings,
         resolve_tensor_data, user_data);
     item->last_used = tick_;
