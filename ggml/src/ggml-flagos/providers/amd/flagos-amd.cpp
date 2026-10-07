@@ -4656,8 +4656,7 @@ static bool amd_supports_scale(const amd_device_context * device, const ggml_ten
 }
 
 static bool amd_supports_strided_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
-    const char * configured = std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM");
-    if (configured != nullptr && std::strcmp(configured, "0") == 0) {
+    if (!amd_env_enabled("FLAGOS_AMD_STRIDED_RMS_NORM")) {
         return false;
     }
     if (device == nullptr || device->aot == nullptr || op == nullptr || op->src[0] == nullptr ||
