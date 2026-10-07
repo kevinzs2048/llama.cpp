@@ -114,6 +114,11 @@ if (GGML_FLAGOS_AMD)
         ${FLAGOS_AMD_PRIVATE_DEFINITIONS})
     target_link_libraries(flagos-check-amd PRIVATE ggml hip::host ${CMAKE_DL_LIBS})
 
+    add_executable(flagos-check-amd-gdn-contract EXCLUDE_FROM_ALL
+        flagos-graph-plan.cpp tests/check_amd_gdn_contract.cpp)
+    target_include_directories(flagos-check-amd-gdn-contract PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+    target_link_libraries(flagos-check-amd-gdn-contract PRIVATE ggml-base)
+
     add_executable(flagos-check-amd-dense-gather EXCLUDE_FROM_ALL
         tests/check_amd_dense_gather.cpp)
     target_link_libraries(flagos-check-amd-dense-gather PRIVATE ggml)
