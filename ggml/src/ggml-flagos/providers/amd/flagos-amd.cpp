@@ -3213,12 +3213,41 @@ static bool amd_supports_swiglu(const amd_device_context * device, const ggml_te
         amd_tensor_output_can_reuse_input(op, op->src[1]);
 }
 
+static bool amd_flash_attn_tensor_is_aligned(const ggml_tensor * tensor, size_t element_size) {
+    return amd_tensor_data_is_aligned(tensor, element_size) &&
+        (tensor->view_src == nullptr || tensor->view_offs % element_size == 0);
+}
+
+static const flagos_amd::kernel_metadata * amd_flash_attn_kernel(
+        const amd_device_context * device, const ggml_tensor * op, bool prefill) {
+    if (device == nullptr || device->aot == nullptr || op == nullptr ||
+        (op->ne[0] != 128 && op->ne[0] != 256)) {
+        return nullptr;
+    }
+    const char * name = prefill
+        ? (op->ne[0] == 256 ? "flagos_flash_attn_prefill_f32_f16_generic_h256" : "flagos_flash_attn_prefill_f32_f16_generic_h128")
+        : (op->ne[0] == 256 ? "flagos_flash_attn_decode_f32_f16_generic_h256" : "flagos_flash_attn_decode_f32_f16_generic_h128");
+    const auto * metadata = device->aot->find(name);
+    if (metadata != nullptr) {
+        if (metadata->argument_count != (prefill ? 19 : 16) || metadata->tile_k != op->ne[0] ||
+            metadata->tile_m != 16 || metadata->tile_n < 16 || metadata->tile_n > 64 ||
+            (metadata->tile_n & (metadata->tile_n - 1)) != 0 ||
+            metadata->block_size != (prefill ? metadata->tile_m : metadata->tile_n)) {
+            return nullptr;
+        }
+        return metadata;
+    }
+    // Old h256 symbols do not promise zero outputs for fully masked rows.
+    return op->ne[0] == 128 ? device->aot->find(prefill
+        ? "flagos_flash_attn_prefill_f32_f16" : "flagos_flash_attn_decode_f32_f16") : nullptr;
+}
+
 static bool amd_supports_flash_attn_decode(const amd_device_context * device, const ggml_tensor * op) {
     float scale = 0.0f;
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
     if (!amd_fusion_enabled(device, "flash_attn_decode") || device == nullptr || device->aot == nullptr || op == nullptr ||
-        op->op != GGML_OP_FLASH_ATTN_EXT || device->aot->find("flagos_flash_attn_decode_f32_f16") == nullptr) {
+        op->op != GGML_OP_FLASH_ATTN_EXT || amd_flash_attn_kernel(device, op, false) == nullptr) {
         return false;
     }
     const auto * op_params_bytes = reinterpret_cast<const uint8_t *>(op->op_params);
@@ -3230,21 +3259,27 @@ static bool amd_supports_flash_attn_decode(const amd_device_context * device, co
     const ggml_tensor * v = op->src[2];
     const ggml_tensor * mask = op->src[3];
     return q && k && v && mask && op->src[4] == nullptr &&
-        op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
+        op->view_src == nullptr && op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
         k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && mask->type == GGML_TYPE_F16 &&
-        op->ne[0] == 128 && op->ne[1] > 0 && op->ne[1] <= INT32_MAX && op->ne[2] == 1 && op->ne[3] == 1 &&
-        q->ne[0] == 128 && q->ne[1] == 1 && q->ne[2] == op->ne[1] && q->ne[3] == 1 &&
-        k->ne[0] == 128 && k->ne[1] > 0 && k->ne[1] <= INT32_MAX && k->ne[2] > 0 && k->ne[2] <= INT32_MAX && k->ne[3] == 1 &&
+        (op->ne[0] == 128 || op->ne[0] == 256) && op->ne[1] > 0 && op->ne[1] <= INT32_MAX && op->ne[2] == 1 && op->ne[3] == 1 &&
+        q->ne[0] == op->ne[0] && q->ne[1] == 1 && q->ne[2] == op->ne[1] && q->ne[3] == 1 &&
+        k->ne[0] == op->ne[0] && k->ne[1] > 0 && k->ne[1] <= INT32_MAX && k->ne[2] > 0 && k->ne[2] <= INT32_MAX && k->ne[3] == 1 &&
         q->ne[2] % k->ne[2] == 0 && ggml_are_same_shape(k, v) &&
         mask->ne[0] == k->ne[1] && mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
         q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
-        k->nb[1] >= 256 * sizeof(ggml_fp16_t) && k->nb[2] == 128 * sizeof(ggml_fp16_t) &&
+        k->nb[1] >= static_cast<size_t>(op->ne[0]) * sizeof(ggml_fp16_t) &&
+        k->nb[2] == static_cast<size_t>(op->ne[0]) * sizeof(ggml_fp16_t) &&
         v->nb[1] == k->nb[1] && v->nb[2] == k->nb[2] &&
         amd_tensor_element_offsets_fit_i32(q, sizeof(float)) &&
         amd_tensor_element_offsets_fit_i32(k, sizeof(ggml_fp16_t)) &&
         amd_tensor_element_offsets_fit_i32(v, sizeof(ggml_fp16_t)) &&
         amd_tensor_element_offsets_fit_i32(mask, sizeof(ggml_fp16_t)) &&
         amd_tensor_element_offsets_fit_i32(op, sizeof(float)) &&
+        amd_flash_attn_tensor_is_aligned(q, sizeof(float)) &&
+        amd_flash_attn_tensor_is_aligned(k, sizeof(ggml_fp16_t)) &&
+        amd_flash_attn_tensor_is_aligned(v, sizeof(ggml_fp16_t)) &&
+        amd_flash_attn_tensor_is_aligned(mask, sizeof(ggml_fp16_t)) &&
+        amd_flash_attn_tensor_is_aligned(op, sizeof(float)) &&
         q->nb[1] / sizeof(float) <= INT32_MAX && q->nb[2] / sizeof(float) <= INT32_MAX &&
         k->nb[1] / sizeof(ggml_fp16_t) <= INT32_MAX && k->nb[2] / sizeof(ggml_fp16_t) <= INT32_MAX &&
         v->nb[1] / sizeof(ggml_fp16_t) <= INT32_MAX && v->nb[2] / sizeof(ggml_fp16_t) <= INT32_MAX &&
@@ -3261,7 +3296,7 @@ static bool amd_supports_flash_attn_prefill(const amd_device_context * device, c
     float logit_softcap = 0.0f;
     if (!amd_fusion_enabled(device, "flash_attn_prefill") || device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_FLASH_ATTN_EXT ||
-        device->aot->find("flagos_flash_attn_prefill_f32_f16") == nullptr) {
+        amd_flash_attn_kernel(device, op, true) == nullptr) {
         return false;
     }
     const auto * op_params_bytes = reinterpret_cast<const uint8_t *>(op->op_params);
@@ -3277,10 +3312,10 @@ static bool amd_supports_flash_attn_prefill(const amd_device_context * device, c
     // ALiBi variants remain provider capabilities that can be added later
     // without changing the common pattern ABI.
     return q && k && v && mask && op->src[4] == nullptr &&
-        op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
+        op->view_src == nullptr && op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
         k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
         mask->type == GGML_TYPE_F16 && q->ne[1] > 1 && q->ne[1] <= INT32_MAX &&
-        op->ne[0] == 128 && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
+        (op->ne[0] == 128 || op->ne[0] == 256) && q->ne[0] == op->ne[0] && k->ne[0] == op->ne[0] && v->ne[0] == op->ne[0] &&
         op->ne[1] == q->ne[2] && op->ne[2] == q->ne[1] && op->ne[3] == q->ne[3] &&
         q->ne[2] > 0 && q->ne[2] <= INT32_MAX && q->ne[3] == 1 &&
         k->ne[1] > 0 && k->ne[1] <= INT32_MAX && k->ne[2] > 0 && k->ne[2] <= INT32_MAX &&
@@ -3300,11 +3335,65 @@ static bool amd_supports_flash_attn_prefill(const amd_device_context * device, c
         amd_tensor_element_offsets_fit_i32(v, sizeof(ggml_fp16_t)) &&
         amd_tensor_element_offsets_fit_i32(mask, sizeof(ggml_fp16_t)) &&
         amd_tensor_element_offsets_fit_i32(op, sizeof(float)) &&
+        amd_flash_attn_tensor_is_aligned(q, sizeof(float)) &&
+        amd_flash_attn_tensor_is_aligned(k, sizeof(ggml_fp16_t)) &&
+        amd_flash_attn_tensor_is_aligned(v, sizeof(ggml_fp16_t)) &&
+        amd_flash_attn_tensor_is_aligned(mask, sizeof(ggml_fp16_t)) &&
+        amd_flash_attn_tensor_is_aligned(op, sizeof(float)) &&
         op->nb[1] / sizeof(float) <= INT32_MAX && op->nb[2] / sizeof(float) <= INT32_MAX &&
         ggml_is_contiguous(mask) && ggml_is_contiguous(op) &&
         std::isfinite(scale) && max_bias == 0.0f && logit_softcap == 0.0f &&
         !amd_tensor_data_overlaps(op, q) && !amd_tensor_data_overlaps(op, k) &&
         !amd_tensor_data_overlaps(op, v) && !amd_tensor_data_overlaps(op, mask);
+}
+
+static bool amd_launch_flash_attn(amd_backend_context * context, ggml_tensor * node, bool prefill) {
+    if (!(prefill ? amd_supports_flash_attn_prefill(context->device, node)
+                  : amd_supports_flash_attn_decode(context->device, node)) ||
+        !amd_tensor_bindings_ready(node)) {
+        return false;
+    }
+    const auto * metadata = amd_flash_attn_kernel(context->device, node, prefill);
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * mask = node->src[3];
+    int query_length = static_cast<int>(q->ne[1]);
+    int key_length = static_cast<int>(k->ne[1]);
+    int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
+    int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
+    int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
+    int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
+    int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
+    int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
+    int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
+    int stride_mask_token = static_cast<int>(mask->nb[0] / sizeof(ggml_fp16_t));
+    int stride_mask_query = static_cast<int>(mask->nb[1] / sizeof(ggml_fp16_t));
+    int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
+    int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
+    float scale = 0.0f;
+    std::memcpy(&scale, node->op_params, sizeof(scale));
+    void * q_data = q->data;
+    void * k_data = k->data;
+    void * v_data = v->data;
+    void * mask_data = mask->data;
+    void * output_data = node->data;
+    flagos_amd::kernel_arguments arguments;
+    if (prefill) {
+        arguments.assign(&q_data, &k_data, &v_data, &mask_data, &output_data,
+            &query_length, &key_length, &q_per_kv, &stride_q_token, &stride_q_head,
+            &stride_k_token, &stride_k_head, &stride_v_token, &stride_v_head,
+            &stride_mask_token, &stride_mask_query, &stride_output_token, &stride_output_head, &scale);
+    } else {
+        arguments.assign(&q_data, &k_data, &v_data, &mask_data, &output_data,
+            &key_length, &q_per_kv, &stride_q_token, &stride_q_head,
+            &stride_k_token, &stride_k_head, &stride_v_token, &stride_v_head,
+            &stride_output_token, &stride_output_head, &scale);
+    }
+    const unsigned int grid_y = prefill ? static_cast<unsigned int>(
+        (static_cast<uint64_t>(query_length) + metadata->block_size - 1) / metadata->block_size) : 1;
+    return context->device->aot->launch(metadata->name, context->stream,
+        static_cast<unsigned int>(q->ne[2]), grid_y, 1, arguments);
 }
 
 static bool amd_supports_soft_max(const amd_device_context * device, const ggml_tensor * op) {
@@ -4342,37 +4431,7 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
     }
     if (step.candidate.id == flagos_pattern_id::flash_attn_decode && step.candidate.node_indices.size() == 1) {
         ggml_tensor * node = cgraph->nodes[step.candidate.node_indices[0]];
-        if (!amd_supports_flash_attn_decode(context->device, node) ||
-            !amd_tensor_bindings_ready(node)) return false;
-        const ggml_tensor * q = node->src[0];
-        const ggml_tensor * k = node->src[1];
-        const ggml_tensor * v = node->src[2];
-        const ggml_tensor * mask = node->src[3];
-        int key_length = static_cast<int>(k->ne[1]);
-        int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-        int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-        int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-        int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-        int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-        int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-        int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-        int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-        int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-        float scale = 0.0f;
-        std::memcpy(&scale, node->op_params, sizeof(scale));
-        void * q_data = q->data;
-        void * k_data = k->data;
-        void * v_data = v->data;
-        void * mask_data = mask->data;
-        void * output_data = node->data;
-        flagos_amd::kernel_arguments arguments = {
-            &q_data, &k_data, &v_data, &mask_data, &output_data,
-            &key_length, &q_per_kv, &stride_q_token, &stride_q_head,
-            &stride_k_token, &stride_k_head, &stride_v_token, &stride_v_head,
-            &stride_output_token, &stride_output_head, &scale,
-        };
-        const bool launched = context->device->aot->launch("flagos_flash_attn_decode_f32_f16", context->stream,
-            static_cast<unsigned int>(q->ne[2]), 1, 1, arguments);
+        const bool launched = amd_launch_flash_attn(context, node, false);
         if (launched) {
             context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
@@ -4385,48 +4444,7 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
 
     if (step.candidate.id == flagos_pattern_id::flash_attn_prefill && step.candidate.node_indices.size() == 1) {
         ggml_tensor * node = cgraph->nodes[step.candidate.node_indices[0]];
-        if (!amd_supports_flash_attn_prefill(context->device, node) ||
-            !amd_tensor_bindings_ready(node)) return false;
-        const ggml_tensor * q = node->src[0];
-        const ggml_tensor * k = node->src[1];
-        const ggml_tensor * v = node->src[2];
-        const ggml_tensor * mask = node->src[3];
-        const auto * metadata = context->device->aot->find("flagos_flash_attn_prefill_f32_f16");
-        int query_length = static_cast<int>(q->ne[1]);
-        int key_length = static_cast<int>(k->ne[1]);
-        int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-        int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-        int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-        int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-        int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-        int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-        int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-        int stride_mask_token = static_cast<int>(mask->nb[0] / sizeof(ggml_fp16_t));
-        int stride_mask_query = static_cast<int>(mask->nb[1] / sizeof(ggml_fp16_t));
-        int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-        int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-        float scale = 0.0f;
-        std::memcpy(&scale, node->op_params, sizeof(scale));
-        void * q_data = q->data;
-        void * k_data = k->data;
-        void * v_data = v->data;
-        void * mask_data = mask->data;
-        void * output_data = node->data;
-        flagos_amd::kernel_arguments arguments = {
-            &q_data, &k_data, &v_data, &mask_data, &output_data,
-            &query_length, &key_length, &q_per_kv,
-            &stride_q_token, &stride_q_head,
-            &stride_k_token, &stride_k_head,
-            &stride_v_token, &stride_v_head,
-            &stride_mask_token, &stride_mask_query,
-            &stride_output_token, &stride_output_head, &scale,
-        };
-        const unsigned int grid_y = static_cast<unsigned int>(
-            (static_cast<uint64_t>(query_length) + metadata->block_size - 1) /
-            metadata->block_size);
-        const bool launched = context->device->aot->launch(
-            "flagos_flash_attn_prefill_f32_f16", context->stream,
-            static_cast<unsigned int>(q->ne[2]), grid_y, 1, arguments);
+        const bool launched = amd_launch_flash_attn(context, node, true);
         if (launched) {
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_flash_attn_prefill.fetch_add(1, std::memory_order_relaxed);
@@ -5626,35 +5644,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             continue;
         }
         if (node->op == GGML_OP_FLASH_ATTN_EXT && amd_supports_flash_attn_decode(backend_context->device, node)) {
-            const ggml_tensor * q = node->src[0];
-            const ggml_tensor * k = node->src[1];
-            const ggml_tensor * v = node->src[2];
-            const ggml_tensor * mask = node->src[3];
-            int key_length = static_cast<int>(k->ne[1]);
-            int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-            int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-            int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-            int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-            int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-            int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-            int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-            int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-            int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-            float scale = 0.0f;
-            std::memcpy(&scale, node->op_params, sizeof(scale));
-            void * q_data = q->data;
-            void * k_data = k->data;
-            void * v_data = v->data;
-            void * mask_data = mask->data;
-            void * output_data = node->data;
-            flagos_amd::kernel_arguments arguments = {
-                &q_data, &k_data, &v_data, &mask_data, &output_data,
-                &key_length, &q_per_kv, &stride_q_token, &stride_q_head,
-                &stride_k_token, &stride_k_head, &stride_v_token, &stride_v_head,
-                &stride_output_token, &stride_output_head, &scale,
-            };
-            if (!backend_context->device->aot->launch("flagos_flash_attn_decode_f32_f16", backend_context->stream,
-                    static_cast<unsigned int>(q->ne[2]), 1, 1, arguments)) {
+            if (!amd_launch_flash_attn(backend_context, node, false)) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
@@ -5664,46 +5654,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             continue;
         }
         if (node->op == GGML_OP_FLASH_ATTN_EXT && amd_supports_flash_attn_prefill(backend_context->device, node)) {
-            const ggml_tensor * q = node->src[0];
-            const ggml_tensor * k = node->src[1];
-            const ggml_tensor * v = node->src[2];
-            const ggml_tensor * mask = node->src[3];
-            const auto * metadata = backend_context->device->aot->find("flagos_flash_attn_prefill_f32_f16");
-            int query_length = static_cast<int>(q->ne[1]);
-            int key_length = static_cast<int>(k->ne[1]);
-            int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-            int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-            int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-            int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-            int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-            int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-            int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-            int stride_mask_token = static_cast<int>(mask->nb[0] / sizeof(ggml_fp16_t));
-            int stride_mask_query = static_cast<int>(mask->nb[1] / sizeof(ggml_fp16_t));
-            int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-            int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-            float scale = 0.0f;
-            std::memcpy(&scale, node->op_params, sizeof(scale));
-            void * q_data = q->data;
-            void * k_data = k->data;
-            void * v_data = v->data;
-            void * mask_data = mask->data;
-            void * output_data = node->data;
-            flagos_amd::kernel_arguments arguments = {
-                &q_data, &k_data, &v_data, &mask_data, &output_data,
-                &query_length, &key_length, &q_per_kv,
-                &stride_q_token, &stride_q_head,
-                &stride_k_token, &stride_k_head,
-                &stride_v_token, &stride_v_head,
-                &stride_mask_token, &stride_mask_query,
-                &stride_output_token, &stride_output_head, &scale,
-            };
-            const unsigned int grid_y = static_cast<unsigned int>(
-                (static_cast<uint64_t>(query_length) + metadata->block_size - 1) /
-                metadata->block_size);
-            if (!backend_context->device->aot->launch(
-                    "flagos_flash_attn_prefill_f32_f16", backend_context->stream,
-                    static_cast<unsigned int>(q->ne[2]), grid_y, 1, arguments)) {
+            if (!amd_launch_flash_attn(backend_context, node, true)) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);

@@ -8,6 +8,7 @@
 #include "../../ggml-backend-impl.h"
 #include "../../ggml-impl.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@ int main(int argc, char ** argv) {
     bool require_ssm_conv_silu = false;
     bool require_attention_output_gate = false;
     bool require_gdn_gate_projections = false;
+    bool require_generic_attention = false;
     for (int argument = 1; argument < argc; ++argument) {
         if (std::strcmp(argv[argument], "--require-ssm-conv-silu") == 0) {
             require_ssm_conv_silu = true;
@@ -35,10 +37,12 @@ int main(int argc, char ** argv) {
             require_attention_output_gate = true;
         } else if (std::strcmp(argv[argument], "--require-gdn-gate-projections") == 0) {
             require_gdn_gate_projections = true;
+        } else if (std::strcmp(argv[argument], "--require-generic-attention") == 0) {
+            require_generic_attention = true;
         } else {
             std::fprintf(stderr,
                 "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate] "
-                "[--require-gdn-gate-projections]\n",
+                "[--require-gdn-gate-projections] [--require-generic-attention]\n",
                 argv[0]);
             return 2;
         }
@@ -154,12 +158,21 @@ int main(int argc, char ** argv) {
     empty_graph.n_nodes = 4;
     empty_graph.nodes = empty_nodes;
     CHECK(ggml_backend_graph_compute(backend, &empty_graph) == GGML_STATUS_SUCCESS);
+    const char * requested_package = std::getenv("FLAGOS_AMD_KERNEL_DIR");
+    std::filesystem::path package_dir;
+    if (requested_package && requested_package[0]) {
+        package_dir = requested_package;
+    }
 #if defined(FLAGOS_AMD_CONFIGURED_KERNEL_DIR)
-    {
+    else {
+        package_dir = FLAGOS_AMD_CONFIGURED_KERNEL_DIR;
+    }
+#endif
+    CHECK(!require_generic_attention || !package_dir.empty());
+    if (!package_dir.empty()) {
         flagos_device_profile device_profile {};
         CHECK(flagos_provider_get_device_profile(provider, 0, &device_profile));
         CHECK(device_profile.target != nullptr && device_profile.target[0] != '\0');
-        std::filesystem::path package_dir(FLAGOS_AMD_CONFIGURED_KERNEL_DIR);
         if (!std::filesystem::exists(package_dir / "manifest.json")) {
             package_dir /= device_profile.target;
         }
@@ -1826,264 +1839,309 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_free(masked_values_buffer);
         ggml_backend_buffer_free(masked_output_buffer);
 
-        const int64_t attn_dim = 128;
-        const int64_t attn_q_heads = 4;
-        const int64_t attn_kv_heads = 2;
-        const int64_t attn_keys = 37;
-        ggml_tensor * attn_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, attn_dim, 1, attn_q_heads);
-        ggml_tensor * attn_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, attn_dim, attn_keys, attn_kv_heads);
-        ggml_tensor * attn_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, attn_dim, attn_keys, attn_kv_heads);
-        ggml_tensor * attn_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, attn_keys);
-        CHECK(attn_q != nullptr && attn_k != nullptr && attn_v != nullptr && attn_mask != nullptr);
-        // Match the permuted [head_dim, token, head] layout produced by the
-        // llama graph before FLASH_ATTN_EXT.
-        attn_q->nb[1] = attn_dim * attn_q_heads * sizeof(float);
-        attn_q->nb[2] = attn_dim * sizeof(float);
-        attn_k->nb[1] = attn_dim * attn_kv_heads * sizeof(ggml_fp16_t);
-        attn_k->nb[2] = attn_dim * sizeof(ggml_fp16_t);
-        attn_v->nb[1] = attn_dim * attn_kv_heads * sizeof(ggml_fp16_t);
-        attn_v->nb[2] = attn_dim * sizeof(ggml_fp16_t);
-        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(attn_dim));
-        ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, attn_q, attn_k, attn_v, attn_mask,
-            attn_scale, 0.0f, 0.0f);
-        CHECK(attn_out != nullptr);
-        ggml_backend_buffer_t attn_q_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_q));
-        ggml_backend_buffer_t attn_k_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_k));
-        ggml_backend_buffer_t attn_v_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_v));
-        ggml_backend_buffer_t attn_mask_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_mask));
-        ggml_backend_buffer_t attn_out_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_out));
-        CHECK(attn_q_buffer && attn_k_buffer && attn_v_buffer && attn_mask_buffer && attn_out_buffer);
-        CHECK(ggml_backend_tensor_alloc(attn_q_buffer, attn_q, ggml_backend_buffer_get_base(attn_q_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(attn_k_buffer, attn_k, ggml_backend_buffer_get_base(attn_k_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(attn_v_buffer, attn_v, ggml_backend_buffer_get_base(attn_v_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(attn_mask_buffer, attn_mask, ggml_backend_buffer_get_base(attn_mask_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(attn_out_buffer, attn_out, ggml_backend_buffer_get_base(attn_out_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_dev_supports_op(dev, attn_out));
-        std::vector<float> attn_q_host(ggml_nbytes(attn_q) / sizeof(float), 0.0f);
-        std::vector<ggml_fp16_t> attn_k_host(ggml_nbytes(attn_k) / sizeof(ggml_fp16_t));
-        std::vector<ggml_fp16_t> attn_v_host(ggml_nbytes(attn_v) / sizeof(ggml_fp16_t));
-        std::vector<ggml_fp16_t> attn_mask_host(attn_keys, ggml_fp32_to_fp16(0.0f));
-        std::vector<float> attn_expected(static_cast<size_t>(attn_dim * attn_q_heads), 0.0f);
-        std::vector<float> attn_output(attn_expected.size(), -1.0f);
-        auto q_at = [&](int64_t dim, int64_t head) -> float & {
-            return attn_q_host[static_cast<size_t>((dim * sizeof(float) + head * attn_q->nb[2]) / sizeof(float))];
-        };
-        auto kv_at = [&](std::vector<ggml_fp16_t> & data, int64_t dim, int64_t token, int64_t head) -> ggml_fp16_t & {
-            const size_t byte_offset = static_cast<size_t>(dim * sizeof(ggml_fp16_t) + token * attn_k->nb[1] + head * attn_k->nb[2]);
-            return data[byte_offset / sizeof(ggml_fp16_t)];
-        };
-        for (int64_t head = 0; head < attn_q_heads; ++head) {
-            for (int64_t dim = 0; dim < attn_dim; ++dim) {
-                q_at(dim, head) = static_cast<float>((dim + 3 * head) % 29) * 0.01f - 0.12f;
+        const bool generic_attention =
+            package_metadata.find("flagos_flash_attn_decode_f32_f16_generic_h128") != nullptr &&
+            package_metadata.find("flagos_flash_attn_prefill_f32_f16_generic_h128") != nullptr &&
+            package_metadata.find("flagos_flash_attn_decode_f32_f16_generic_h256") != nullptr &&
+            package_metadata.find("flagos_flash_attn_prefill_f32_f16_generic_h256") != nullptr;
+        CHECK(!require_generic_attention || generic_attention);
+        for (const int64_t attn_dim : {128, 256}) {
+            if (attn_dim == 256 && !generic_attention) {
+                continue;
             }
-        }
-        for (int64_t head = 0; head < attn_kv_heads; ++head) {
-            for (int64_t token = 0; token < attn_keys; ++token) {
+            const int64_t attn_q_heads = 4;
+            const int64_t attn_kv_heads = 2;
+            const int64_t attn_keys = 37;
+            ggml_tensor * attn_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, attn_dim, 1, attn_q_heads);
+            ggml_tensor * attn_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, attn_dim, attn_keys, attn_kv_heads);
+            ggml_tensor * attn_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, attn_dim, attn_keys, attn_kv_heads);
+            ggml_tensor * attn_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, attn_keys);
+            CHECK(attn_q != nullptr && attn_k != nullptr && attn_v != nullptr && attn_mask != nullptr);
+            // Match the permuted [head_dim, token, head] layout produced by the
+            // llama graph before FLASH_ATTN_EXT.
+            attn_q->nb[1] = attn_dim * attn_q_heads * sizeof(float);
+            attn_q->nb[2] = attn_dim * sizeof(float);
+            attn_k->nb[1] = attn_dim * attn_kv_heads * sizeof(ggml_fp16_t);
+            attn_k->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+            attn_v->nb[1] = attn_dim * attn_kv_heads * sizeof(ggml_fp16_t);
+            attn_v->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+            const float attn_scale = 1.0f / std::sqrt(static_cast<float>(attn_dim));
+            ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, attn_q, attn_k, attn_v, attn_mask,
+                attn_scale, 0.0f, 0.0f);
+            CHECK(attn_out != nullptr);
+            ggml_backend_buffer_t attn_q_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_q));
+            ggml_backend_buffer_t attn_k_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_k));
+            ggml_backend_buffer_t attn_v_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_v));
+            ggml_backend_buffer_t attn_mask_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_mask));
+            ggml_backend_buffer_t attn_out_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_out));
+            CHECK(attn_q_buffer && attn_k_buffer && attn_v_buffer && attn_mask_buffer && attn_out_buffer);
+            CHECK(ggml_backend_tensor_alloc(attn_q_buffer, attn_q, ggml_backend_buffer_get_base(attn_q_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(attn_k_buffer, attn_k, ggml_backend_buffer_get_base(attn_k_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(attn_v_buffer, attn_v, ggml_backend_buffer_get_base(attn_v_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(attn_mask_buffer, attn_mask, ggml_backend_buffer_get_base(attn_mask_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(attn_out_buffer, attn_out, ggml_backend_buffer_get_base(attn_out_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_dev_supports_op(dev, attn_out));
+            ggml_tensor unsupported_attn = *attn_out;
+            unsupported_attn.src[3] = nullptr;
+            CHECK(!ggml_backend_dev_supports_op(dev, &unsupported_attn));
+            unsupported_attn = *attn_out;
+            unsupported_attn.data = attn_q->data;
+            CHECK(!ggml_backend_dev_supports_op(dev, &unsupported_attn));
+            unsupported_attn = *attn_out;
+            unsupported_attn.data = nullptr;
+            unsupported_attn.view_src = attn_q;
+            unsupported_attn.view_offs = 0;
+            CHECK(!ggml_backend_dev_supports_op(dev, &unsupported_attn));
+            ggml_tensor unaligned_q = *attn_q;
+            unaligned_q.data = nullptr;
+            unaligned_q.view_src = attn_q;
+            unaligned_q.view_offs = 1;
+            unsupported_attn = *attn_out;
+            unsupported_attn.src[0] = &unaligned_q;
+            CHECK(!ggml_backend_dev_supports_op(dev, &unsupported_attn));
+            std::vector<float> attn_q_host(ggml_nbytes(attn_q) / sizeof(float), 0.0f);
+            std::vector<ggml_fp16_t> attn_k_host(ggml_nbytes(attn_k) / sizeof(ggml_fp16_t));
+            std::vector<ggml_fp16_t> attn_v_host(ggml_nbytes(attn_v) / sizeof(ggml_fp16_t));
+            std::vector<ggml_fp16_t> attn_mask_host(attn_keys, ggml_fp32_to_fp16(0.0f));
+            std::vector<float> attn_expected(static_cast<size_t>(attn_dim * attn_q_heads), 0.0f);
+            std::vector<float> attn_output(attn_expected.size(), -1.0f);
+            auto q_at = [&](int64_t dim, int64_t head) -> float & {
+                return attn_q_host[static_cast<size_t>((dim * sizeof(float) + head * attn_q->nb[2]) / sizeof(float))];
+            };
+            auto kv_at = [&](std::vector<ggml_fp16_t> & data, int64_t dim, int64_t token, int64_t head) -> ggml_fp16_t & {
+                const size_t byte_offset = static_cast<size_t>(dim * sizeof(ggml_fp16_t) + token * attn_k->nb[1] + head * attn_k->nb[2]);
+                return data[byte_offset / sizeof(ggml_fp16_t)];
+            };
+            for (int64_t head = 0; head < attn_q_heads; ++head) {
                 for (int64_t dim = 0; dim < attn_dim; ++dim) {
-                    kv_at(attn_k_host, dim, token, head) = ggml_fp32_to_fp16(static_cast<float>((dim + token + head) % 23) * 0.01f - 0.1f);
-                    kv_at(attn_v_host, dim, token, head) = ggml_fp32_to_fp16(static_cast<float>((2 * dim + token + 3 * head) % 31) * 0.008f - 0.09f);
+                    q_at(dim, head) = static_cast<float>((dim + 3 * head) % 29) * 0.01f - 0.12f;
                 }
             }
-        }
-        for (int64_t head = 0; head < attn_q_heads; ++head) {
-            const int64_t kv_head = head / (attn_q_heads / attn_kv_heads);
-            std::vector<float> scores(attn_keys);
-            float max_score = -INFINITY;
-            for (int64_t token = 0; token < attn_keys; ++token) {
-                float score = 0.0f;
-                for (int64_t dim = 0; dim < attn_dim; ++dim) {
-                    score += q_at(dim, head) * ggml_fp16_to_fp32(kv_at(attn_k_host, dim, token, kv_head));
-                }
-                scores[static_cast<size_t>(token)] = score * attn_scale;
-                max_score = std::max(max_score, scores[static_cast<size_t>(token)]);
-            }
-            float sum = 0.0f;
-            for (float & score : scores) { score = std::exp(score - max_score); sum += score; }
-            for (int64_t dim = 0; dim < attn_dim; ++dim) {
-                float value = 0.0f;
+            for (int64_t head = 0; head < attn_kv_heads; ++head) {
                 for (int64_t token = 0; token < attn_keys; ++token) {
-                    value += scores[static_cast<size_t>(token)] / sum * ggml_fp16_to_fp32(kv_at(attn_v_host, dim, token, kv_head));
-                }
-                attn_expected[static_cast<size_t>(head * attn_dim + dim)] = value;
-            }
-        }
-        ggml_backend_tensor_set_async(backend, attn_q, attn_q_host.data(), 0, ggml_nbytes(attn_q));
-        ggml_backend_tensor_set_async(backend, attn_k, attn_k_host.data(), 0, ggml_nbytes(attn_k));
-        ggml_backend_tensor_set_async(backend, attn_v, attn_v_host.data(), 0, ggml_nbytes(attn_v));
-        ggml_backend_tensor_set_async(backend, attn_mask, attn_mask_host.data(), 0, ggml_nbytes(attn_mask));
-        ggml_backend_synchronize(backend);
-        ggml_tensor * attn_nodes[] = { attn_out };
-        ggml_cgraph attn_graph {};
-        attn_graph.n_nodes = 1;
-        attn_graph.nodes = attn_nodes;
-        CHECK(ggml_backend_graph_compute(backend, &attn_graph) == GGML_STATUS_SUCCESS);
-        ggml_backend_tensor_get_async(backend, attn_out, attn_output.data(), 0, ggml_nbytes(attn_out));
-        ggml_backend_synchronize(backend);
-        for (size_t i = 0; i < attn_output.size(); ++i) {
-            CHECK(std::fabs(attn_output[i] - attn_expected[i]) < 4e-3f);
-        }
-        ggml_backend_buffer_free(attn_q_buffer);
-        ggml_backend_buffer_free(attn_k_buffer);
-        ggml_backend_buffer_free(attn_v_buffer);
-        ggml_backend_buffer_free(attn_mask_buffer);
-        ggml_backend_buffer_free(attn_out_buffer);
-
-        // Prefill attention uses a tiled query dimension and the same
-        // provider-neutral FLASH_ATTN_EXT pattern with a distinct selector.
-        const int64_t prefill_query_length = 5;
-        const int64_t prefill_key_length = 9;
-        const int64_t prefill_q_heads = 4;
-        const int64_t prefill_kv_heads = 2;
-        ggml_tensor * prefill_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
-            attn_dim, prefill_query_length, prefill_q_heads);
-        ggml_tensor * prefill_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
-            attn_dim, prefill_key_length, prefill_kv_heads);
-        ggml_tensor * prefill_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
-            attn_dim, prefill_key_length, prefill_kv_heads);
-        ggml_tensor * prefill_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
-            prefill_key_length, prefill_query_length);
-        // Use the [token, head, dim] physical layout emitted by the llama
-        // attention graph; the provider ABI carries explicit strides.
-        prefill_q->nb[1] = attn_dim * prefill_q_heads * sizeof(float);
-        prefill_q->nb[2] = attn_dim * sizeof(float);
-        prefill_k->nb[1] = attn_dim * prefill_kv_heads * sizeof(ggml_fp16_t);
-        prefill_k->nb[2] = attn_dim * sizeof(ggml_fp16_t);
-        prefill_v->nb[1] = attn_dim * prefill_kv_heads * sizeof(ggml_fp16_t);
-        prefill_v->nb[2] = attn_dim * sizeof(ggml_fp16_t);
-        ggml_tensor * prefill_out = ggml_flash_attn_ext(ctx, prefill_q, prefill_k, prefill_v,
-            prefill_mask, attn_scale, 0.0f, 0.0f);
-        CHECK(prefill_q && prefill_k && prefill_v && prefill_mask && prefill_out);
-        CHECK(prefill_out->ne[0] == attn_dim && prefill_out->ne[1] == prefill_q_heads &&
-            prefill_out->ne[2] == prefill_query_length);
-        ggml_backend_buffer_t prefill_q_buffer = ggml_backend_buft_alloc_buffer(
-            buft, ggml_nbytes(prefill_q));
-        ggml_backend_buffer_t prefill_k_buffer = ggml_backend_buft_alloc_buffer(
-            buft, ggml_nbytes(prefill_k));
-        ggml_backend_buffer_t prefill_v_buffer = ggml_backend_buft_alloc_buffer(
-            buft, ggml_nbytes(prefill_v));
-        ggml_backend_buffer_t prefill_mask_buffer = ggml_backend_buft_alloc_buffer(
-            buft, ggml_nbytes(prefill_mask));
-        ggml_backend_buffer_t prefill_out_buffer = ggml_backend_buft_alloc_buffer(
-            buft, ggml_nbytes(prefill_out));
-        CHECK(prefill_q_buffer && prefill_k_buffer && prefill_v_buffer &&
-            prefill_mask_buffer && prefill_out_buffer);
-        CHECK(ggml_backend_tensor_alloc(prefill_q_buffer, prefill_q,
-            ggml_backend_buffer_get_base(prefill_q_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(prefill_k_buffer, prefill_k,
-            ggml_backend_buffer_get_base(prefill_k_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(prefill_v_buffer, prefill_v,
-            ggml_backend_buffer_get_base(prefill_v_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(prefill_mask_buffer, prefill_mask,
-            ggml_backend_buffer_get_base(prefill_mask_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_tensor_alloc(prefill_out_buffer, prefill_out,
-            ggml_backend_buffer_get_base(prefill_out_buffer)) == GGML_STATUS_SUCCESS);
-        CHECK(ggml_backend_dev_supports_op(dev, prefill_out));
-
-        const size_t prefill_q_elements = static_cast<size_t>(attn_dim * prefill_query_length * prefill_q_heads);
-        const size_t prefill_kv_elements = static_cast<size_t>(attn_dim * prefill_key_length * prefill_kv_heads);
-        std::vector<float> prefill_q_host(prefill_q_elements);
-        std::vector<ggml_fp16_t> prefill_k_host(prefill_kv_elements);
-        std::vector<ggml_fp16_t> prefill_v_host(prefill_kv_elements);
-        std::vector<ggml_fp16_t> prefill_mask_host(
-            static_cast<size_t>(prefill_key_length * prefill_query_length));
-        std::vector<float> prefill_output_host(
-            static_cast<size_t>(attn_dim * prefill_q_heads * prefill_query_length), -1.0f);
-        std::vector<float> prefill_expected(prefill_output_host.size(), 0.0f);
-        auto prefill_q_at = [&](int64_t query, int64_t head, int64_t dim) -> float & {
-            return prefill_q_host[static_cast<size_t>(
-                query * prefill_q_heads * attn_dim + head * attn_dim + dim)];
-        };
-        auto prefill_kv_at = [&](std::vector<ggml_fp16_t> & data, int64_t token,
-                                 int64_t head, int64_t dim) -> ggml_fp16_t & {
-            return data[static_cast<size_t>(
-                token * prefill_kv_heads * attn_dim + head * attn_dim + dim)];
-        };
-        for (int64_t query = 0; query < prefill_query_length; ++query) {
-            for (int64_t head = 0; head < prefill_q_heads; ++head) {
-                for (int64_t dim = 0; dim < attn_dim; ++dim) {
-                    prefill_q_at(query, head, dim) =
-                        static_cast<float>((query * 11 + head * 7 + dim) % 37) * 0.013f - 0.2f;
+                    for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                        kv_at(attn_k_host, dim, token, head) = ggml_fp32_to_fp16(static_cast<float>((dim + token + head) % 23) * 0.01f - 0.1f);
+                        kv_at(attn_v_host, dim, token, head) = ggml_fp32_to_fp16(static_cast<float>((2 * dim + token + 3 * head) % 31) * 0.008f - 0.09f);
+                    }
                 }
             }
-        }
-        for (int64_t head = 0; head < prefill_kv_heads; ++head) {
-            for (int64_t token = 0; token < prefill_key_length; ++token) {
-                for (int64_t dim = 0; dim < attn_dim; ++dim) {
-                    prefill_kv_at(prefill_k_host, token, head, dim) = ggml_fp32_to_fp16(
-                        static_cast<float>((head * 5 + token * 3 + dim) % 43) * 0.009f - 0.15f);
-                    prefill_kv_at(prefill_v_host, token, head, dim) = ggml_fp32_to_fp16(
-                        static_cast<float>((head * 3 + token * 7 + dim * 2) % 47) * 0.008f - 0.12f);
-                }
-            }
-        }
-        for (int64_t query = 0; query < prefill_query_length; ++query) {
-            const int64_t query_position = prefill_key_length - prefill_query_length + query;
-            for (int64_t token = 0; token < prefill_key_length; ++token) {
-                const float value = token > query_position ? -INFINITY : 0.0f;
-                prefill_mask_host[static_cast<size_t>(token + query * prefill_key_length)] =
-                    ggml_fp32_to_fp16(value);
-            }
-        }
-        for (int64_t query = 0; query < prefill_query_length; ++query) {
-            for (int64_t head = 0; head < prefill_q_heads; ++head) {
-                const int64_t kv_head = head / (prefill_q_heads / prefill_kv_heads);
-                std::vector<float> scores(static_cast<size_t>(prefill_key_length));
+            for (int64_t head = 0; head < attn_q_heads; ++head) {
+                const int64_t kv_head = head / (attn_q_heads / attn_kv_heads);
+                std::vector<float> scores(attn_keys);
                 float max_score = -INFINITY;
-                for (int64_t token = 0; token < prefill_key_length; ++token) {
+                for (int64_t token = 0; token < attn_keys; ++token) {
                     float score = 0.0f;
                     for (int64_t dim = 0; dim < attn_dim; ++dim) {
-                        score += prefill_q_at(query, head, dim) * ggml_fp16_to_fp32(
-                            prefill_kv_at(prefill_k_host, token, kv_head, dim));
+                        score += q_at(dim, head) * ggml_fp16_to_fp32(kv_at(attn_k_host, dim, token, kv_head));
                     }
-                    score *= attn_scale;
-                    score += ggml_fp16_to_fp32(prefill_mask_host[static_cast<size_t>(
-                        token + query * prefill_key_length)]);
-                    scores[static_cast<size_t>(token)] = score;
-                    max_score = std::max(max_score, score);
+                    scores[static_cast<size_t>(token)] = score * attn_scale;
+                    max_score = std::max(max_score, scores[static_cast<size_t>(token)]);
                 }
                 float sum = 0.0f;
-                for (float & score : scores) {
-                    score = std::exp(score - max_score);
-                    sum += score;
-                }
+                for (float & score : scores) { score = std::exp(score - max_score); sum += score; }
                 for (int64_t dim = 0; dim < attn_dim; ++dim) {
                     float value = 0.0f;
-                    for (int64_t token = 0; token < prefill_key_length; ++token) {
-                        value += scores[static_cast<size_t>(token)] / sum * ggml_fp16_to_fp32(
-                            prefill_kv_at(prefill_v_host, token, kv_head, dim));
+                    for (int64_t token = 0; token < attn_keys; ++token) {
+                        value += scores[static_cast<size_t>(token)] / sum * ggml_fp16_to_fp32(kv_at(attn_v_host, dim, token, kv_head));
                     }
-                    prefill_expected[static_cast<size_t>(
-                        query * prefill_q_heads * attn_dim + head * attn_dim + dim)] = value;
+                    attn_expected[static_cast<size_t>(head * attn_dim + dim)] = value;
                 }
             }
+            ggml_backend_tensor_set_async(backend, attn_q, attn_q_host.data(), 0, ggml_nbytes(attn_q));
+            ggml_backend_tensor_set_async(backend, attn_k, attn_k_host.data(), 0, ggml_nbytes(attn_k));
+            ggml_backend_tensor_set_async(backend, attn_v, attn_v_host.data(), 0, ggml_nbytes(attn_v));
+            ggml_backend_tensor_set_async(backend, attn_mask, attn_mask_host.data(), 0, ggml_nbytes(attn_mask));
+            ggml_backend_synchronize(backend);
+            ggml_tensor * attn_nodes[] = { attn_out };
+            ggml_cgraph attn_graph {};
+            attn_graph.n_nodes = 1;
+            attn_graph.nodes = attn_nodes;
+            CHECK(ggml_backend_graph_compute(backend, &attn_graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get_async(backend, attn_out, attn_output.data(), 0, ggml_nbytes(attn_out));
+            ggml_backend_synchronize(backend);
+            for (size_t i = 0; i < attn_output.size(); ++i) {
+                CHECK(std::fabs(attn_output[i] - attn_expected[i]) < 4e-3f);
+            }
+            if (generic_attention) {
+                std::fill(attn_mask_host.begin(), attn_mask_host.end(), ggml_fp32_to_fp16(-INFINITY));
+                ggml_backend_tensor_set(attn_mask, attn_mask_host.data(), 0, ggml_nbytes(attn_mask));
+                CHECK(ggml_backend_graph_compute(backend, &attn_graph) == GGML_STATUS_SUCCESS);
+                ggml_backend_tensor_get(attn_out, attn_output.data(), 0, ggml_nbytes(attn_out));
+                for (float value : attn_output) {
+                    CHECK(value == 0.0f && !std::signbit(value));
+                }
+            }
+            ggml_backend_buffer_free(attn_q_buffer);
+            ggml_backend_buffer_free(attn_k_buffer);
+            ggml_backend_buffer_free(attn_v_buffer);
+            ggml_backend_buffer_free(attn_mask_buffer);
+            ggml_backend_buffer_free(attn_out_buffer);
+
+            // Prefill attention uses a tiled query dimension and the same
+            // provider-neutral FLASH_ATTN_EXT pattern with a distinct selector.
+            const int64_t prefill_query_length = 5;
+            const int64_t prefill_key_length = 9;
+            const int64_t prefill_q_heads = 4;
+            const int64_t prefill_kv_heads = 2;
+            ggml_tensor * prefill_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                attn_dim, prefill_query_length, prefill_q_heads);
+            ggml_tensor * prefill_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                attn_dim, prefill_key_length, prefill_kv_heads);
+            ggml_tensor * prefill_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16,
+                attn_dim, prefill_key_length, prefill_kv_heads);
+            ggml_tensor * prefill_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+                prefill_key_length, prefill_query_length);
+            // Use the [token, head, dim] physical layout emitted by the llama
+            // attention graph; the provider ABI carries explicit strides.
+            prefill_q->nb[1] = attn_dim * prefill_q_heads * sizeof(float);
+            prefill_q->nb[2] = attn_dim * sizeof(float);
+            prefill_k->nb[1] = attn_dim * prefill_kv_heads * sizeof(ggml_fp16_t);
+            prefill_k->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+            prefill_v->nb[1] = attn_dim * prefill_kv_heads * sizeof(ggml_fp16_t);
+            prefill_v->nb[2] = attn_dim * sizeof(ggml_fp16_t);
+            ggml_tensor * prefill_out = ggml_flash_attn_ext(ctx, prefill_q, prefill_k, prefill_v,
+                prefill_mask, attn_scale, 0.0f, 0.0f);
+            CHECK(prefill_q && prefill_k && prefill_v && prefill_mask && prefill_out);
+            CHECK(prefill_out->ne[0] == attn_dim && prefill_out->ne[1] == prefill_q_heads &&
+                prefill_out->ne[2] == prefill_query_length);
+            ggml_backend_buffer_t prefill_q_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(prefill_q));
+            ggml_backend_buffer_t prefill_k_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(prefill_k));
+            ggml_backend_buffer_t prefill_v_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(prefill_v));
+            ggml_backend_buffer_t prefill_mask_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(prefill_mask));
+            ggml_backend_buffer_t prefill_out_buffer = ggml_backend_buft_alloc_buffer(
+                buft, ggml_nbytes(prefill_out));
+            CHECK(prefill_q_buffer && prefill_k_buffer && prefill_v_buffer &&
+                prefill_mask_buffer && prefill_out_buffer);
+            CHECK(ggml_backend_tensor_alloc(prefill_q_buffer, prefill_q,
+                ggml_backend_buffer_get_base(prefill_q_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(prefill_k_buffer, prefill_k,
+                ggml_backend_buffer_get_base(prefill_k_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(prefill_v_buffer, prefill_v,
+                ggml_backend_buffer_get_base(prefill_v_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(prefill_mask_buffer, prefill_mask,
+                ggml_backend_buffer_get_base(prefill_mask_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_tensor_alloc(prefill_out_buffer, prefill_out,
+                ggml_backend_buffer_get_base(prefill_out_buffer)) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_dev_supports_op(dev, prefill_out));
+
+            const size_t prefill_q_elements = static_cast<size_t>(attn_dim * prefill_query_length * prefill_q_heads);
+            const size_t prefill_kv_elements = static_cast<size_t>(attn_dim * prefill_key_length * prefill_kv_heads);
+            std::vector<float> prefill_q_host(prefill_q_elements);
+            std::vector<ggml_fp16_t> prefill_k_host(prefill_kv_elements);
+            std::vector<ggml_fp16_t> prefill_v_host(prefill_kv_elements);
+            std::vector<ggml_fp16_t> prefill_mask_host(
+                static_cast<size_t>(prefill_key_length * prefill_query_length));
+            std::vector<float> prefill_output_host(
+                static_cast<size_t>(attn_dim * prefill_q_heads * prefill_query_length), -1.0f);
+            std::vector<float> prefill_expected(prefill_output_host.size(), 0.0f);
+            auto prefill_q_at = [&](int64_t query, int64_t head, int64_t dim) -> float & {
+                return prefill_q_host[static_cast<size_t>(
+                    query * prefill_q_heads * attn_dim + head * attn_dim + dim)];
+            };
+            auto prefill_kv_at = [&](std::vector<ggml_fp16_t> & data, int64_t token,
+                                     int64_t head, int64_t dim) -> ggml_fp16_t & {
+                return data[static_cast<size_t>(
+                    token * prefill_kv_heads * attn_dim + head * attn_dim + dim)];
+            };
+            for (int64_t query = 0; query < prefill_query_length; ++query) {
+                for (int64_t head = 0; head < prefill_q_heads; ++head) {
+                    for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                        prefill_q_at(query, head, dim) =
+                            static_cast<float>((query * 11 + head * 7 + dim) % 37) * 0.013f - 0.2f;
+                    }
+                }
+            }
+            for (int64_t head = 0; head < prefill_kv_heads; ++head) {
+                for (int64_t token = 0; token < prefill_key_length; ++token) {
+                    for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                        prefill_kv_at(prefill_k_host, token, head, dim) = ggml_fp32_to_fp16(
+                            static_cast<float>((head * 5 + token * 3 + dim) % 43) * 0.009f - 0.15f);
+                        prefill_kv_at(prefill_v_host, token, head, dim) = ggml_fp32_to_fp16(
+                            static_cast<float>((head * 3 + token * 7 + dim * 2) % 47) * 0.008f - 0.12f);
+                    }
+                }
+            }
+            for (int64_t query = 0; query < prefill_query_length; ++query) {
+                const int64_t query_position = prefill_key_length - prefill_query_length + query;
+                for (int64_t token = 0; token < prefill_key_length; ++token) {
+                    const float value = token > query_position ? -INFINITY : 0.0f;
+                    prefill_mask_host[static_cast<size_t>(token + query * prefill_key_length)] =
+                        ggml_fp32_to_fp16(value);
+                }
+            }
+            for (int64_t query = 0; query < prefill_query_length; ++query) {
+                for (int64_t head = 0; head < prefill_q_heads; ++head) {
+                    const int64_t kv_head = head / (prefill_q_heads / prefill_kv_heads);
+                    std::vector<float> scores(static_cast<size_t>(prefill_key_length));
+                    float max_score = -INFINITY;
+                    for (int64_t token = 0; token < prefill_key_length; ++token) {
+                        float score = 0.0f;
+                        for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                            score += prefill_q_at(query, head, dim) * ggml_fp16_to_fp32(
+                                prefill_kv_at(prefill_k_host, token, kv_head, dim));
+                        }
+                        score *= attn_scale;
+                        score += ggml_fp16_to_fp32(prefill_mask_host[static_cast<size_t>(
+                            token + query * prefill_key_length)]);
+                        scores[static_cast<size_t>(token)] = score;
+                        max_score = std::max(max_score, score);
+                    }
+                    float sum = 0.0f;
+                    for (float & score : scores) {
+                        score = std::exp(score - max_score);
+                        sum += score;
+                    }
+                    for (int64_t dim = 0; dim < attn_dim; ++dim) {
+                        float value = 0.0f;
+                        for (int64_t token = 0; token < prefill_key_length; ++token) {
+                            value += scores[static_cast<size_t>(token)] / sum * ggml_fp16_to_fp32(
+                                prefill_kv_at(prefill_v_host, token, kv_head, dim));
+                        }
+                        prefill_expected[static_cast<size_t>(
+                            query * prefill_q_heads * attn_dim + head * attn_dim + dim)] = value;
+                    }
+                }
+            }
+            ggml_backend_tensor_set_async(backend, prefill_q, prefill_q_host.data(),
+                0, ggml_nbytes(prefill_q));
+            ggml_backend_tensor_set_async(backend, prefill_k, prefill_k_host.data(),
+                0, ggml_nbytes(prefill_k));
+            ggml_backend_tensor_set_async(backend, prefill_v, prefill_v_host.data(),
+                0, ggml_nbytes(prefill_v));
+            ggml_backend_tensor_set_async(backend, prefill_mask, prefill_mask_host.data(),
+                0, ggml_nbytes(prefill_mask));
+            ggml_backend_synchronize(backend);
+            ggml_tensor * prefill_nodes[] = { prefill_out };
+            ggml_cgraph prefill_graph {};
+            prefill_graph.n_nodes = 1;
+            prefill_graph.nodes = prefill_nodes;
+            CHECK(ggml_backend_graph_compute(backend, &prefill_graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get_async(backend, prefill_out, prefill_output_host.data(),
+                0, ggml_nbytes(prefill_out));
+            ggml_backend_synchronize(backend);
+            for (size_t i = 0; i < prefill_output_host.size(); ++i) {
+                CHECK(std::fabs(prefill_output_host[i] - prefill_expected[i]) < 1e-2f);
+            }
+            if (generic_attention) {
+                std::fill(prefill_mask_host.begin(), prefill_mask_host.end(), ggml_fp32_to_fp16(-INFINITY));
+                ggml_backend_tensor_set(prefill_mask, prefill_mask_host.data(), 0, ggml_nbytes(prefill_mask));
+                CHECK(ggml_backend_graph_compute(backend, &prefill_graph) == GGML_STATUS_SUCCESS);
+                ggml_backend_tensor_get(prefill_out, prefill_output_host.data(), 0, ggml_nbytes(prefill_out));
+                for (float value : prefill_output_host) {
+                    CHECK(value == 0.0f && !std::signbit(value));
+                }
+            }
+            ggml_backend_buffer_free(prefill_q_buffer);
+            ggml_backend_buffer_free(prefill_k_buffer);
+            ggml_backend_buffer_free(prefill_v_buffer);
+            ggml_backend_buffer_free(prefill_mask_buffer);
+            ggml_backend_buffer_free(prefill_out_buffer);
         }
-        ggml_backend_tensor_set_async(backend, prefill_q, prefill_q_host.data(),
-            0, ggml_nbytes(prefill_q));
-        ggml_backend_tensor_set_async(backend, prefill_k, prefill_k_host.data(),
-            0, ggml_nbytes(prefill_k));
-        ggml_backend_tensor_set_async(backend, prefill_v, prefill_v_host.data(),
-            0, ggml_nbytes(prefill_v));
-        ggml_backend_tensor_set_async(backend, prefill_mask, prefill_mask_host.data(),
-            0, ggml_nbytes(prefill_mask));
-        ggml_backend_synchronize(backend);
-        ggml_tensor * prefill_nodes[] = { prefill_out };
-        ggml_cgraph prefill_graph {};
-        prefill_graph.n_nodes = 1;
-        prefill_graph.nodes = prefill_nodes;
-        CHECK(ggml_backend_graph_compute(backend, &prefill_graph) == GGML_STATUS_SUCCESS);
-        ggml_backend_tensor_get_async(backend, prefill_out, prefill_output_host.data(),
-            0, ggml_nbytes(prefill_out));
-        ggml_backend_synchronize(backend);
-        for (size_t i = 0; i < prefill_output_host.size(); ++i) {
-            CHECK(std::fabs(prefill_output_host[i] - prefill_expected[i]) < 1e-2f);
-        }
-        ggml_backend_buffer_free(prefill_q_buffer);
-        ggml_backend_buffer_free(prefill_k_buffer);
-        ggml_backend_buffer_free(prefill_v_buffer);
-        ggml_backend_buffer_free(prefill_mask_buffer);
-        ggml_backend_buffer_free(prefill_out_buffer);
     }
-#endif
 
     ggml_backend_free(backend);
     ggml_backend_buffer_free(buffer);
