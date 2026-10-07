@@ -175,7 +175,7 @@ def markdown_summary(comparisons: list[dict], candidate_label: str, baseline_lab
 
 def benchmark_command(args, binary: Path, device: str, override: str) -> list[str]:
     command = [
-        str(binary),
+        str(binary), "-v",
         "-m", ",".join(str(model) for model in args.model),
         "-p", str(args.prompt),
         "-n", str(args.generation),
@@ -193,12 +193,12 @@ def benchmark_command(args, binary: Path, device: str, override: str) -> list[st
     return command
 
 
-def run_one(guard: Path, timeout: int, command: list[str], environment: dict[str, str], stdout_path: Path, stderr_path: Path) -> int:
+def run_one(guard: Path, timeout: int, command: list[str], environment: dict[str, str], stdout_path: Path, stderr_path: Path, max_processes_per_boot: int = 2) -> int:
     guard_command = [
         sys.executable,
         str(guard),
         "--timeout", str(timeout),
-        "--max-processes-per-boot", "2",
+        "--max-processes-per-boot", str(max_processes_per_boot),
         "--",
         *command,
     ]
@@ -219,6 +219,17 @@ def checked_file(path: Path, description: str, executable: bool = False) -> Path
     if executable and not os.access(resolved, os.X_OK):
         raise ValueError(f"{description} is not executable: {resolved}")
     return resolved
+
+
+def validate_device_selection(device: str, label: str) -> None:
+    if not device or device == "none" or "," in device:
+        raise ValueError(f"{label} GPU benchmark requires one explicit device")
+
+
+def validate_executed_device(rows: list[dict], device: str, label: str) -> None:
+    validate_device_selection(device, label)
+    if any(row.get("devices") != device for row in rows):
+        raise ValueError(f"{label} did not execute on the requested device: {device}")
 
 
 def main() -> int:
@@ -245,6 +256,8 @@ def main() -> int:
     parser.add_argument("--gpu-layers", type=int, default=99)
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--max-processes-per-boot", type=int, default=2,
+                        help="total guarded model-process limit for this boot (default: 2)")
     parser.add_argument("--first", choices=("candidate", "baseline"), default="candidate")
     args = parser.parse_args()
 
@@ -259,19 +272,25 @@ def main() -> int:
                 args.prompt, args.generation, args.batch, args.ubatch,
                 args.repetitions, args.threads, args.timeout)):
             raise ValueError("benchmark sizes, repetitions, threads, and timeout must be positive")
+        if args.max_processes_per_boot < 2:
+            raise ValueError("max-processes-per-boot must allow at least two processes for an A/B pair")
         if args.gpu_layers < 0:
             raise ValueError("gpu-layers must not be negative")
+        if args.gpu_layers > 0:
+            validate_device_selection(args.candidate_device, args.candidate_label)
+            validate_device_selection(args.baseline_device, args.baseline_label)
         output_dir = args.output_dir.expanduser().resolve()
         if output_dir.exists():
             raise ValueError(f"output directory already exists: {output_dir}")
         if not output_dir.parent.is_dir():
             raise ValueError(f"output parent directory does not exist: {output_dir.parent}")
-    except ValueError as error:
+    except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         print(f"FlagOS benchmark A/B: {error}", file=sys.stderr)
         return 2
 
     status_result = subprocess.run(
-        [sys.executable, str(guard), "--check-only", "--json", "--max-processes-per-boot", "2"],
+        [sys.executable, str(guard), "--check-only", "--json",
+         "--max-processes-per-boot", str(args.max_processes_per_boot)],
         text=True,
         capture_output=True,
         check=False,
@@ -300,6 +319,8 @@ def main() -> int:
     order = [args.first, "baseline" if args.first == "candidate" else "candidate"]
     metadata = {
         "boot_id": guard_status.get("boot_id"),
+        "max_processes_per_boot": args.max_processes_per_boot,
+        "commands_started_before_pair": guard_status.get("commands_started"),
         "started_unix": int(time.time()),
         "status": "ready",
         "order": order,
@@ -324,7 +345,8 @@ def main() -> int:
         write_json(run_metadata_path, metadata)
         return_code = run_one(
             guard, args.timeout, command, environment,
-            output_dir / f"{name}.jsonl", output_dir / f"{name}.log")
+            output_dir / f"{name}.jsonl", output_dir / f"{name}.log",
+            args.max_processes_per_boot)
         metadata["return_codes"][name] = return_code
         metadata["run_finished_unix"][name] = int(time.time())
         metadata.pop("active_run", None)
@@ -341,6 +363,9 @@ def main() -> int:
     try:
         candidate_rows = read_jsonl(output_dir / "candidate.jsonl")
         baseline_rows = read_jsonl(output_dir / "baseline.jsonl")
+        if args.gpu_layers > 0:
+            validate_executed_device(candidate_rows, args.candidate_device, args.candidate_label)
+            validate_executed_device(baseline_rows, args.baseline_device, args.baseline_label)
         validate_expected_rows(
             candidate_rows, args.model, args.prompt, args.generation, args.candidate_label)
         validate_expected_rows(

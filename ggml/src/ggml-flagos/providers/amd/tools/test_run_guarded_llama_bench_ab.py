@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -40,6 +41,33 @@ def _row(model: str, prompt: int, generation: int, rate: float) -> dict:
 
 
 class GuardedLlamaBenchABTest(unittest.TestCase):
+    def test_explicit_device_selection(self):
+        for device in ("", "none", "ROCm0,ROCm1"):
+            with self.assertRaises(ValueError):
+                AB.validate_device_selection(device, "candidate")
+        AB.validate_device_selection("ROCm0", "baseline")
+        AB.validate_device_selection("FlagOS:AMD:0", "candidate")
+
+    def test_executed_device_rejects_cpu_fallback_and_different_device(self):
+        for row in ({}, {"devices": ""}, {"devices": "ROCm01"}):
+            with self.assertRaises(ValueError):
+                AB.validate_executed_device([row], "ROCm0", "baseline")
+        AB.validate_executed_device([{"devices": "ROCm0"}], "ROCm0", "baseline")
+        with self.assertRaises(ValueError):
+            AB.validate_executed_device([
+                {"devices": "FlagOS:AMD:0"}, {"devices": ""}], "FlagOS:AMD:0", "candidate")
+
+    def test_run_preserves_explicit_guard_limit(self):
+        for limit in (2, 4):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with mock.patch.object(AB.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+                    self.assertEqual(AB.run_one(Path("guard.py"), 180, ["llama-bench"], {},
+                        root / "out", root / "err", limit), 0)
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("--max-processes-per-boot") + 1], str(limit))
+                self.assertEqual(command[command.index("--") + 1:], ["llama-bench"])
+
     def test_json_metadata_replace_is_complete(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.json"
