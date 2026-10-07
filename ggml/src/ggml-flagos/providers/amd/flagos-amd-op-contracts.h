@@ -11,6 +11,17 @@
 
 namespace flagos_amd {
 
+inline bool supports_aligned_f16_gemm_launch(
+        const void * weights, const void * x, const void * output,
+        int k, int rows) {
+    return weights != nullptr && x != nullptr && output != nullptr &&
+        k > 0 && rows > 0 && k % 16 == 0 && rows % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(weights) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(x) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(output) % 16 == 0;
+}
+
+
 inline constexpr int dense_gather_block_size = 256;
 
 struct dense_gather_signature {

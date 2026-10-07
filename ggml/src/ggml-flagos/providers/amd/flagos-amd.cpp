@@ -482,6 +482,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_FUSIONS"));
     add(std::getenv("FLAGOS_AMD_PREFILL_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_GROUPED_F16_GEMM"));
+    add(std::getenv("FLAGOS_AMD_ALIGNED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW"));
@@ -5077,9 +5078,16 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                     };
                     const bool grouped = amd_grouped_f16_gemm_enabled(backend_context->device, columns) &&
                         backend_context->device->aot->find("flagos_mul_mat_f16_f32_grouped") != nullptr;
+                    const char * aligned_config = std::getenv("FLAGOS_AMD_ALIGNED_F16_GEMM");
+                    const bool aligned = !grouped &&
+                        (aligned_config == nullptr || std::strcmp(aligned_config, "0") != 0) &&
+                        backend_context->device->aot->find("flagos_mul_mat_f16_f32_batched_aligned") != nullptr &&
+                        flagos_amd::supports_aligned_f16_gemm_launch(
+                            dequantized_weights, activation_data, output_data, k, rows);
                     const char * f16_kernel = grouped
-                        ? "flagos_mul_mat_f16_f32_grouped" : "flagos_mul_mat_f16_f32_batched";
-                    if (grouped) {
+                        ? "flagos_mul_mat_f16_f32_grouped" : aligned
+                        ? "flagos_mul_mat_f16_f32_batched_aligned" : "flagos_mul_mat_f16_f32_batched";
+                    if (grouped || aligned) {
                         f16_metadata = backend_context->device->aot->find(f16_kernel);
                     }
                     const unsigned int tile_m = f16_metadata->tile_m > 0
@@ -5101,7 +5109,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                     backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
                     backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
                     amd_trace_op(backend_context, node,
-                        grouped ? "f16_matmul_grouped" : "f16_matmul_batched");
+                        grouped ? "f16_matmul_grouped" : aligned ? "f16_matmul_aligned" : "f16_matmul_batched");
                     continue;
                 }
             }

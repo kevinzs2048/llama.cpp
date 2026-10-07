@@ -181,3 +181,9 @@ endif()
 if (GGML_FLAGOS_TRITON_JIT)
     install(DIRECTORY kernels/triton/ DESTINATION "${CMAKE_INSTALL_DATADIR}/ggml/flagos/triton")
 endif()
+
+if (GGML_FLAGOS_AMD)
+    add_executable(flagos-check-amd-aligned-gemm EXCLUDE_FROM_ALL
+        tests/check_amd_aligned_gemm.cpp)
+    target_link_libraries(flagos-check-amd-aligned-gemm PRIVATE ggml)
+endif()
