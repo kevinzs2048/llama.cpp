@@ -2171,6 +2171,35 @@ def compile_packed_ffn_package_without_launch(output_dir: Path, arch: str) -> No
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_q6_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the GGUF Q6_K GEMV export without device launches."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("q6-gemv requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_mul_mat_q6_k_f32"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="gguf.q6_k.gemv_f32_activation_acc_f32.v1",
+        runtime_arguments=("weights_u8", "weights_f16", "x", "output", "k", "rows"),
+        constexpr_arguments=())
+    if export.aot_divisibility:
+        raise RuntimeError("generic Q6_K GEMV must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {"weights_u8": "*u8", "weights_f16": "*fp16", "x": "*fp32",
+        "output": "*fp32", "k": "i32", "rows": "i32"}
+    compiled = triton.compile(ASTSource(export.function, signature, {}, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 1})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("Q6_K GEMV requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+        "argument_count": 6, "global_scratch_size": 0, "global_scratch_align": 1,
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
 def compile_strided_rms_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the GGML outer-stride RMS export with its tested arithmetic."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3049,7 +3078,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv"),
                         help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
     if args.extension and (not args.compile_only or not args.arch):
@@ -3088,6 +3117,8 @@ def main() -> None:
             compile_tiled_ffn_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "packed-ffn":
             compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "q6-gemv":
+            compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
         else:
             compile_strided_rms_package_without_launch(args.output_dir, args.arch)
         commit_output()
