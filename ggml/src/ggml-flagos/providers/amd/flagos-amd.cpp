@@ -1,5 +1,6 @@
 #include "flagos-amd-api.h"
 #include "flagos-amd-aot.h"
+#include "flagos-amd-op-contracts.h"
 
 #include "../../../ggml-backend-impl.h"
 #include "../../../ggml-impl.h"
@@ -2710,6 +2711,19 @@ static bool amd_supports_set_rows(const amd_device_context * device, const ggml_
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
+static bool amd_supports_dense_get_rows(const amd_device_context * device, const ggml_tensor * op) {
+    flagos_amd::dense_gather_signature signature;
+    if (device == nullptr || device->aot == nullptr ||
+        !flagos_amd::describe_dense_gather(op, &signature)) {
+        return false;
+    }
+    const auto * metadata = device->aot->find("flagos_get_rows_f32");
+    return metadata != nullptr && metadata->argument_count == 4 &&
+        metadata->block_size == flagos_amd::dense_gather_block_size &&
+        (signature.rows == 0 || (!amd_tensor_data_overlaps(op, op->src[0]) &&
+                                !amd_tensor_data_overlaps(op, op->src[1])));
+}
+
 static bool amd_supports_get_rows(const amd_device_context * device, const ggml_tensor * op) {
     const flagos_quantized_matmul_kind kind = op == nullptr || op->src[0] == nullptr
         ? flagos_quantized_matmul_kind::none : amd_quantized_kind(op->src[0]->type);
@@ -4919,7 +4933,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         }
         if (ggml_nelements(node) == 0 &&
             (amd_supports_copy_f32(backend_context->device, node) ||
-             amd_supports_scale(backend_context->device, node))) {
+             amd_supports_scale(backend_context->device, node) ||
+             amd_supports_dense_get_rows(backend_context->device, node))) {
             continue;
         }
         if (!amd_tensor_bindings_ready(node)) {
@@ -5087,6 +5102,27 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(backend_context, node, "gated_delta_net_scalar");
+            continue;
+        }
+        if (node->op == GGML_OP_GET_ROWS && amd_supports_dense_get_rows(backend_context->device, node)) {
+            flagos_amd::dense_gather_signature signature;
+            if (!flagos_amd::describe_dense_gather(node, &signature)) {
+                return GGML_STATUS_FAILED;
+            }
+            void * table = node->src[0]->data;
+            void * indices = node->src[1]->data;
+            void * output = node->data;
+            const auto * metadata = backend_context->device->aot->find("flagos_get_rows_f32");
+            flagos_amd::kernel_arguments arguments { &table, &indices, &output, &signature.columns };
+            const unsigned int blocks = static_cast<unsigned int>(
+                (static_cast<uint64_t>(signature.columns) + metadata->block_size - 1) / metadata->block_size);
+            if (!backend_context->device->aot->launch("flagos_get_rows_f32", backend_context->stream,
+                    static_cast<unsigned int>(signature.rows), blocks, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "get_rows_f32");
             continue;
         }
         if (node->op == GGML_OP_GET_ROWS && amd_supports_get_rows(backend_context->device, node)) {
@@ -5822,7 +5858,9 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
          (op->op == GGML_OP_L2_NORM && amd_supports_l2_norm(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_GATED_DELTA_NET &&
           amd_supports_gated_delta_net(amd_device_from_dev(dev), op)) ||
-         (op->op == GGML_OP_GET_ROWS && amd_supports_get_rows(amd_device_from_dev(dev), op)) ||
+         (op->op == GGML_OP_GET_ROWS &&
+          (amd_supports_get_rows(amd_device_from_dev(dev), op) ||
+           amd_supports_dense_get_rows(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_MUL_MAT && amd_supports_quantized_mul_mat(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_ADD && amd_supports_add(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_MUL && amd_supports_mul(amd_device_from_dev(dev), op)) ||

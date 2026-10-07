@@ -114,6 +114,10 @@ if (GGML_FLAGOS_AMD)
         ${FLAGOS_AMD_PRIVATE_DEFINITIONS})
     target_link_libraries(flagos-check-amd PRIVATE ggml hip::host ${CMAKE_DL_LIBS})
 
+    add_executable(flagos-check-amd-dense-gather EXCLUDE_FROM_ALL
+        tests/check_amd_dense_gather.cpp)
+    target_link_libraries(flagos-check-amd-dense-gather PRIVATE ggml)
+
     add_executable(flagos-check-amd-precision EXCLUDE_FROM_ALL
         tests/check_amd_matmul_precision.cpp)
     target_link_libraries(flagos-check-amd-precision PRIVATE ggml)
