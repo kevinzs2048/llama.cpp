@@ -3204,6 +3204,7 @@ def main() -> None:
     if args.cache_dir is None:
         raise RuntimeError("--cache-dir or TRITON_CACHE_DIR is required")
     args.cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = str(args.cache_dir.resolve())
     final_output_dir = args.output_dir.resolve()
     if final_output_dir.exists() and (
             final_output_dir.is_symlink() or not final_output_dir.is_dir() or
@@ -3309,7 +3310,6 @@ def main() -> None:
                 "FLAGOS_AMD_ONLY_GDN_ALPHA_GATE=1 or "
                 "FLAGOS_AMD_ONLY_GDN_Q8_GATE=1 or "
                 "FLAGOS_AMD_ONLY_RMS_NORM_NARROW=1")
-        os.environ["TRITON_CACHE_DIR"] = str(args.cache_dir)
         if only_residual or only_residual_narrow:
             compile_residual_package_without_launch(
                 args.output_dir, args.arch, only_residual_narrow)
