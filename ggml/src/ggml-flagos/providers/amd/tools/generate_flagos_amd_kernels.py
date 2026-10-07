@@ -2171,6 +2171,35 @@ def compile_packed_ffn_package_without_launch(output_dir: Path, arch: str) -> No
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_strided_rms_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the GGML outer-stride RMS export with its tested arithmetic."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("strided-rms requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_rms_norm_ggml_strided_f32"
+    arguments = ("output", "x", "n_cols", "ne1", "ne2", "stride_x1", "stride_x2", "stride_x3", "eps")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.rms_norm.inner_contiguous_outer_strided.square_f32_sum_f64.v1",
+        runtime_arguments=arguments, constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("strided RMS must not add unproved divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "*fp32" if argument in ("output", "x") else "fp32" if argument == "eps" else "i32" for argument in arguments}
+    signature["BLOCK"] = "constexpr"
+    compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 256}, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("strided RMS requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size, "block_size": 256,
+        "tile_m": 0, "tile_n": 0, "tile_k": 0, "argument_count": 9, "global_scratch_size": 0,
+        "global_scratch_align": getattr(m, "global_scratch_align", 1), "profile_scratch_size": 0,
+        "profile_scratch_align": m.profile_scratch_align}])
+
+
 def compile_scale_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the common SCALE kernel for an AMD package without a device launch."""
     if not arch:
@@ -3020,7 +3049,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms"),
                         help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
     if args.extension and (not args.compile_only or not args.arch):
@@ -3057,8 +3086,10 @@ def main() -> None:
             compile_aligned_gemm_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "tiled-ffn":
             compile_tiled_ffn_package_without_launch(args.output_dir, args.arch)
-        else:
+        elif args.extension == "packed-ffn":
             compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
+        else:
+            compile_strided_rms_package_without_launch(args.output_dir, args.arch)
         commit_output()
         print(f"wrote {args.extension} extension for {args.arch} to {final_output_dir}")
         return
