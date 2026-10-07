@@ -20,6 +20,19 @@ bool flagos_provider_is_valid(const flagos_provider_v1 * provider) {
         provider->score != nullptr;
 }
 
+bool flagos_device_interface_is_valid(ggml_backend_dev_t device) {
+    return device != nullptr &&
+        device->iface.get_name != nullptr &&
+        device->iface.get_description != nullptr &&
+        device->iface.get_memory != nullptr &&
+        device->iface.get_type != nullptr &&
+        device->iface.get_props != nullptr &&
+        device->iface.init_backend != nullptr &&
+        device->iface.get_buffer_type != nullptr &&
+        device->iface.supports_op != nullptr &&
+        device->iface.supports_buft != nullptr;
+}
+
 bool flagos_device_identity_is_valid(
         const flagos_provider_v1 * provider,
         size_t local_index,

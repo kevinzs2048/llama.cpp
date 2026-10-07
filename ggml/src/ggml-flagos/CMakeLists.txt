@@ -61,6 +61,10 @@ if (GGML_FLAGOS_DENGLIN)
     target_link_libraries(flagos-check-kernels PRIVATE "${FLAGOS_DENGLIN_CURT_LIBRARY}")
 endif()
 
+add_library(flagos-check-public-header OBJECT EXCLUDE_FROM_ALL tests/check_public_header.c)
+target_include_directories(flagos-check-public-header PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(flagos-check-public-header PRIVATE ggml-base)
+
 add_executable(flagos-check-graph-plan EXCLUDE_FROM_ALL
     flagos-graph-plan.cpp
     tests/check_graph_plan.cpp)

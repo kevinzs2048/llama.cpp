@@ -89,6 +89,7 @@ static constexpr size_t FLAGOS_PROVIDER_V1_REQUIRED_SIZE =
     offsetof(flagos_provider_v1, get_device_profile);
 
 GGML_BACKEND_API bool flagos_provider_is_valid(const flagos_provider_v1 * provider);
+GGML_BACKEND_API bool flagos_device_interface_is_valid(ggml_backend_dev_t device);
 GGML_BACKEND_API bool flagos_device_identity_is_valid(
     const flagos_provider_v1 * provider,
     size_t local_index,

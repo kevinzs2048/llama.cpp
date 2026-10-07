@@ -1733,14 +1733,15 @@ static size_t amd_buffer_max_size(ggml_backend_buffer_type_t) {
     return SIZE_MAX;
 }
 
-static const ggml_backend_buffer_type_i g_buffer_type_iface = {
-    /* .get_name       = */ amd_buffer_type_name,
-    /* .alloc_buffer   = */ amd_buffer_alloc,
-    /* .get_alignment  = */ amd_buffer_alignment,
-    /* .get_max_size   = */ amd_buffer_max_size,
-    /* .get_alloc_size = */ nullptr,
-    /* .is_host        = */ [](ggml_backend_buffer_type_t) { return false; },
-};
+static const ggml_backend_buffer_type_i g_buffer_type_iface = []() {
+    ggml_backend_buffer_type_i iface {};
+    iface.get_name = amd_buffer_type_name;
+    iface.alloc_buffer = amd_buffer_alloc;
+    iface.get_alignment = amd_buffer_alignment;
+    iface.get_max_size = amd_buffer_max_size;
+    iface.is_host = [](ggml_backend_buffer_type_t) { return false; };
+    return iface;
+}();
 
 static bool amd_buffer_is_local_storage(ggml_backend_buffer_t buffer) {
     return buffer != nullptr && ggml_backend_buffer_get_type(buffer) != nullptr &&

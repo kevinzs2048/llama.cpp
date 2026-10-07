@@ -2,7 +2,6 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "flagos-registry.h"
 
 #ifdef __cplusplus
 extern "C" {

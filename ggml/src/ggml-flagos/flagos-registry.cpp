@@ -164,7 +164,7 @@ ggml_backend_reg_t ggml_backend_flagos_reg() {
                 flagos_device_identity identity {};
                 flagos_device_caps caps {};
                 flagos_device_profile profile {};
-                if (device == nullptr ||
+                if (!flagos_device_interface_is_valid(device) ||
                     !provider->device_identity(local_index, &identity) ||
                     !flagos_device_identity_is_valid(provider, local_index, &identity) ||
                     flagos_device_identity_is_registered(identity) ||
