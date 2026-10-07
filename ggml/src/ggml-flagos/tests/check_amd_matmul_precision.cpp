@@ -16,6 +16,7 @@ static void require(bool ok, const char * message) {
 struct policy_observations {
     std::atomic<size_t> plans { 0 };
     std::atomic<size_t> captures { 0 };
+    std::atomic<size_t> replays { 0 };
 };
 
 static void observe_policy_log(enum ggml_log_level, const char * text, void * user_data) {
@@ -25,6 +26,9 @@ static void observe_policy_log(enum ggml_log_level, const char * text, void * us
     }
     if (std::strstr(text, "FlagOS AMD: captured HIP graph ") != nullptr) {
         ++counts.captures;
+    }
+    if (const char * value = std::strstr(text, "graph_replays=")) {
+        counts.replays = std::strtoull(value + std::strlen("graph_replays="), nullptr, 10);
     }
     std::fputs(text, stderr);
 }
@@ -122,6 +126,81 @@ static std::vector<float> run(bool forced_f32, bool prefill_f16, bool ffn = fals
     return result;
 }
 
+static void check_many_decode_splits() {
+    constexpr int count = 96, k = 256, rows = 64;
+    setenv("FLAGOS_AMD_PREFILL_F16_GEMM", "0", 1);
+    setenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS", "0", 1);
+    setenv("FLAGOS_AMD_GRAPH_CAPTURE", "1", 1);
+    setenv("FLAGOS_LOG_KERNELS", "1", 1);
+    auto * backend = ggml_backend_init_by_name("FlagOS:AMD:0", nullptr);
+    require(backend != nullptr, "multi-split backend");
+    ggml_init_params params { 8u << 20, nullptr, true };
+    auto * wc = ggml_init(params); auto * ec = ggml_init(params);
+    require(wc && ec, "multi-split contexts");
+    std::vector<ggml_tensor *> weights, inputs, outputs;
+    std::vector<ggml_cgraph *> graphs;
+    for (int index = 0; index < count; ++index) {
+        weights.push_back(ggml_new_tensor_2d(wc, GGML_TYPE_Q4_K, k, rows));
+        inputs.push_back(ggml_new_tensor_1d(ec, GGML_TYPE_F32, k));
+        auto * out = ggml_mul_mat(ec, weights.back(), inputs.back());
+        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        for (int scale = 0; scale < 4; ++scale) out = ggml_scale(ec, out, 1.01f);
+        outputs.push_back(out);
+        auto * graph = ggml_new_graph_custom(ec, 32, false);
+        ggml_build_forward_expand(graph, out);
+        graphs.push_back(graph);
+    }
+    auto wb = ggml_backend_alloc_ctx_tensors(wc, backend);
+    auto eb = ggml_backend_alloc_ctx_tensors(ec, backend);
+    require(wb && eb, "multi-split buffers");
+    std::vector<std::vector<unsigned char>> quantized(count);
+    std::vector<std::vector<float>> activation(count, std::vector<float>(k));
+    std::vector<std::vector<double>> expected(count, std::vector<double>(rows));
+    std::vector<float> source(k*rows), decoded(k*rows), result(rows);
+    for (int index = 0; index < count; ++index) {
+        for (int inner = 0; inner < k*rows; ++inner) source[inner] = std::sin(float(inner)*0.017f + index*0.1f)*0.13f;
+        for (int inner = 0; inner < k; ++inner) activation[index][inner] = std::cos(float(inner)*0.013f + index*0.2f);
+        quantized[index].resize(ggml_nbytes(weights[index]));
+        require(ggml_quantize_chunk(GGML_TYPE_Q4_K, source.data(), quantized[index].data(), 0, rows, k, nullptr) == quantized[index].size(), "multi-split quantization");
+        ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(quantized[index].data(), decoded.data(), k*rows);
+        for (int row = 0; row < rows; ++row) {
+            double sum = 0;
+            for (int inner = 0; inner < k; ++inner) sum += double(decoded[row*k + inner])*activation[index][inner];
+            for (int scale = 0; scale < 4; ++scale) sum *= double(1.01f);
+            expected[index][row] = sum;
+        }
+        ggml_backend_tensor_set(weights[index], quantized[index].data(), 0, quantized[index].size());
+        ggml_backend_tensor_set(inputs[index], activation[index].data(), 0, k*sizeof(float));
+    }
+    policy_observations counts;
+    ggml_log_set(observe_policy_log, &counts);
+    // A decode round visits multiple bound splits before any one repeats.
+    for (int round = 0; round < 3; ++round) {
+        for (int index = 0; index < count; ++index) {
+            require(ggml_backend_graph_compute(backend, graphs[index]) == GGML_STATUS_SUCCESS, "multi-split compute");
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_get(outputs[index], result.data(), 0, rows*sizeof(float));
+            for (int row = 0; row < rows; ++row) require(std::isfinite(result[row]) && std::abs(result[row] - expected[index][row]) <= 1e-3 + 3e-5*std::abs(expected[index][row]), "multi-split CPU reference");
+        }
+    }
+    for (int index = 0; index < count; ++index) {
+        std::vector<unsigned char> actual(quantized[index].size());
+        ggml_backend_tensor_get(weights[index], actual.data(), 0, actual.size());
+        require(actual == quantized[index], "multi-split weight modified");
+        std::vector<float> actual_input(k);
+        ggml_backend_tensor_get(inputs[index], actual_input.data(), 0, k*sizeof(float));
+        require(std::memcmp(actual_input.data(), activation[index].data(), k*sizeof(float)) == 0, "multi-split input modified");
+    }
+    ggml_backend_buffer_free(eb); ggml_backend_buffer_free(wb);
+    ggml_free(ec); ggml_free(wc); ggml_backend_free(backend);
+    ggml_log_set(nullptr, nullptr);
+    unsetenv("FLAGOS_LOG_KERNELS");
+    unsetenv("FLAGOS_AMD_GRAPH_CAPTURE");
+    unsetenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS");
+    std::printf("AMD multi-split captures=%zu replays=%zu expected=%d/%d\n", counts.captures.load(), counts.replays.load(), count, count);
+    require(counts.captures.load() == count && counts.replays.load() == count, "decode split cache thrashes before reuse");
+}
+
 int main(int argc, char ** argv) {
     require(argc == 2, "backend directory argument");
     ggml_backend_load_all_from_path(argv[1]);
@@ -149,5 +228,6 @@ int main(int argc, char ** argv) {
     require(!same(default_plain, default_half), "fixture did not exercise the optional F16 matrix path");
     require(!same(ffn_default_plain, ffn_default_half), "fixture did not exercise the optional F16 FFN path");
     run(true, false, false, true);
+    check_many_decode_splits();
     return 0;
 }

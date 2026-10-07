@@ -312,8 +312,8 @@ struct amd_backend_context {
 
     amd_backend_context(amd_device_context * device_, hipStream_t stream_):
         device(device_), stream(stream_), graph_plans(128) {
-        graph_captures.reserve(8);
-        graph_capture_candidates.reserve(16);
+        graph_captures.reserve(128);
+        graph_capture_candidates.reserve(256);
         dequant_cache.reserve(64);
         dequant_arena.reserve(8);
         // Bound F16 cache residency on larger models.
@@ -551,7 +551,8 @@ static bool amd_store_graph_capture(
     if (context == nullptr || executable == nullptr) {
         return false;
     }
-    constexpr size_t capacity = 8;
+    // A decode round can visit one GPU split per layer before any repeats.
+    constexpr size_t capacity = 128;
     if (context->graph_captures.size() >= capacity) {
         auto lru = std::min_element(context->graph_captures.begin(), context->graph_captures.end(),
             [](const amd_graph_capture_entry & left, const amd_graph_capture_entry & right) {
@@ -627,7 +628,8 @@ static void amd_store_graph_capture_candidate(
     if (context == nullptr) {
         return;
     }
-    constexpr size_t capacity = 16;
+    // Keep warmup bindings across a full round of layer-sized GPU splits.
+    constexpr size_t capacity = 256;
     if (context->graph_capture_candidates.size() >= capacity) {
         const auto lru = std::min_element(
             context->graph_capture_candidates.begin(), context->graph_capture_candidates.end(),
