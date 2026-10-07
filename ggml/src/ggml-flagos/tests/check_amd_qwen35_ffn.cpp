@@ -1,3 +1,4 @@
+#include "check_closed_graph.h"
 #include "ggml-impl.h"
 
 #include "check_amd_qwen35_ffn.h"
@@ -85,6 +86,7 @@ void flagos_check_amd_qwen35_ffn_case(
     ggml_cgraph graph {};
     graph.n_nodes = 3;
     graph.nodes = nodes;
+    flagos_check_closed_graph(context, graph);
     CHECK(ggml_backend_graph_compute(backend, &graph) == GGML_STATUS_SUCCESS);
 
     std::vector<float> actual(static_cast<size_t>(ROWS));

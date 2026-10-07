@@ -81,7 +81,8 @@ struct flagos_pattern_candidate {
     flagos_pattern_id id = flagos_pattern_id::none;
     flagos_fusion_scope scope = flagos_fusion_scope::graph;
     std::vector<int> node_indices;
-    // The provider must write every listed output.
+    // The provider must write every listed output. Missing whole-graph use
+    // metadata makes every covered node output observable.
     std::vector<int> required_output_node_indices;
     uint64_t eliminated_read_bytes = 0;
     uint64_t eliminated_write_bytes = 0;

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 
 static void check(bool condition, const char * expression, int line) {
     if (!condition) {
@@ -15,6 +16,38 @@ static void check(bool condition, const char * expression, int line) {
 }
 
 #define CHECK(expression) check((expression), #expression, __LINE__)
+
+// These synthetic fixtures declare complete graphs. Build the same operand
+// consumer metadata that ggml_build_forward_expand supplies for real graphs.
+// Incomplete-metadata regressions below deliberately omit this declaration.
+struct closed_test_graph_metadata {
+    std::vector<ggml_tensor *> keys;
+    std::vector<ggml_bitset_t> used;
+    std::vector<int32_t> counts;
+};
+
+static void declare_closed_test_graph(ggml_cgraph & graph) {
+    static std::unordered_map<const ggml_cgraph *, closed_test_graph_metadata> metadata;
+    auto & storage = metadata[&graph];
+    const size_t size = static_cast<size_t>(graph.n_nodes) * 2 + 1;
+    storage.keys.assign(size, nullptr);
+    storage.used.assign(ggml_bitset_size(size), 0);
+    storage.counts.assign(size, 0);
+    graph.visited_hash_set = {size, storage.used.data(), storage.keys.data()};
+    graph.use_counts = storage.counts.data();
+    for (int index = 0; index < graph.n_nodes; ++index) {
+        ggml_hash_find_or_insert(&graph.visited_hash_set, graph.nodes[index]);
+    }
+    for (int index = 0; index < graph.n_nodes; ++index) {
+        for (const auto * source : graph.nodes[index]->src) {
+            if (source == nullptr) continue;
+            const size_t slot = ggml_hash_find(&graph.visited_hash_set, source);
+            if (slot != GGML_HASHSET_FULL && ggml_bitset_get(storage.used.data(), slot)) {
+                ++storage.counts[slot];
+            }
+        }
+    }
+}
 
 struct test_graph {
     ggml_tensor input {};
@@ -62,6 +95,7 @@ static void make_norm_mul_graph(test_graph & result, bool with_add) {
     result.nodes[2] = with_add ? &result.mul : nullptr;
     result.graph.n_nodes = with_add ? 3 : 2;
     result.graph.nodes = result.nodes;
+    declare_closed_test_graph(result.graph);
 }
 
 static flagos_lowering_choice query_pattern(
@@ -360,6 +394,7 @@ int main() {
     ggml_cgraph residual_graph {};
     residual_graph.n_nodes = 4;
     residual_graph.nodes = residual_nodes;
+    declare_closed_test_graph(residual_graph);
     plan = flagos_build_graph_plan(&residual_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 2);
     CHECK(plan->steps[0].kind == flagos_execution_kind::pattern);
@@ -425,6 +460,7 @@ int main() {
     ggml_cgraph direct_graph {};
     direct_graph.n_nodes = 1;
     direct_graph.nodes = direct_nodes;
+    declare_closed_test_graph(direct_graph);
     interface_state direct_state;
     flagos_fusion_interface direct_interface {
         query_pattern_interface,
@@ -549,6 +585,7 @@ int main() {
     ggml_cgraph inter_graph {};
     inter_graph.n_nodes = 3;
     inter_graph.nodes = inter_nodes;
+    declare_closed_test_graph(inter_graph);
     supported = flagos_pattern_id::rms_norm_mul;
     plan = flagos_build_graph_plan(&inter_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 2);
@@ -715,6 +752,7 @@ int main() {
     ggml_cgraph late_graph {};
     late_graph.n_nodes = 3;
     late_graph.nodes = late_nodes;
+    declare_closed_test_graph(late_graph);
     supported = flagos_pattern_id::rms_norm_mul;
     plan = flagos_build_graph_plan(&late_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 3);
@@ -744,6 +782,7 @@ int main() {
     ggml_cgraph fanout_graph {};
     fanout_graph.n_nodes = 3;
     fanout_graph.nodes = fanout_nodes;
+    declare_closed_test_graph(fanout_graph);
     supported = flagos_pattern_id::rms_norm_mul;
     plan = flagos_build_graph_plan(&fanout_graph, query_pattern_terminal_only, &supported);
     CHECK(plan->steps.size() == 3);
@@ -778,6 +817,7 @@ int main() {
     ggml_cgraph rope_graph {};
     rope_graph.n_nodes = 3;
     rope_graph.nodes = rope_nodes;
+    declare_closed_test_graph(rope_graph);
     supported = flagos_pattern_id::rms_norm_mul_rope;
     plan = flagos_build_graph_plan(&rope_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 1);
@@ -823,6 +863,7 @@ int main() {
     ggml_cgraph rope_store_graph {};
     rope_store_graph.n_nodes = 5;
     rope_store_graph.nodes = rope_store_nodes;
+    declare_closed_test_graph(rope_store_graph);
     supported = flagos_pattern_id::rms_norm_mul_rope_kv_store;
     plan = flagos_build_graph_plan(&rope_store_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 1);
@@ -842,6 +883,7 @@ int main() {
     ggml_cgraph rope_fanout_graph {};
     rope_fanout_graph.n_nodes = 6;
     rope_fanout_graph.nodes = rope_fanout_nodes;
+    declare_closed_test_graph(rope_fanout_graph);
     plan = flagos_build_graph_plan(&rope_fanout_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 2);
     CHECK(plan->steps[0].kind == flagos_execution_kind::pattern);
@@ -870,6 +912,7 @@ int main() {
     ggml_cgraph ssm_graph {};
     ssm_graph.n_nodes = 2;
     ssm_graph.nodes = ssm_nodes;
+    declare_closed_test_graph(ssm_graph);
     supported = flagos_pattern_id::ssm_conv_silu;
     plan = flagos_build_graph_plan(&ssm_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 1);
@@ -885,6 +928,7 @@ int main() {
     ggml_cgraph ssm_fanout_graph {};
     ssm_fanout_graph.n_nodes = 3;
     ssm_fanout_graph.nodes = ssm_fanout_nodes;
+    declare_closed_test_graph(ssm_fanout_graph);
     plan = flagos_build_graph_plan(&ssm_fanout_graph, query_pattern_terminal_only, &supported);
     CHECK(plan->steps.size() == 3);
     for (const auto & step : plan->steps) {
@@ -907,6 +951,7 @@ int main() {
     ggml_cgraph gated_graph {};
     gated_graph.n_nodes = 2;
     gated_graph.nodes = gated_nodes;
+    declare_closed_test_graph(gated_graph);
     supported = flagos_pattern_id::attention_output_gate;
     plan = flagos_build_graph_plan(&gated_graph, query_pattern_terminal_only, &supported);
     CHECK(plan->steps.size() == 1);
@@ -957,6 +1002,7 @@ int main() {
     ggml_cgraph alpha_graph {};
     alpha_graph.n_nodes = 3;
     alpha_graph.nodes = alpha_nodes;
+    declare_closed_test_graph(alpha_graph);
     plan = flagos_build_graph_plan(
         &alpha_graph, query_pattern_terminal_only, &supported);
     CHECK(plan->steps.size() == 1);
@@ -975,6 +1021,7 @@ int main() {
     ggml_cgraph alpha_fanout_graph {};
     alpha_fanout_graph.n_nodes = 4;
     alpha_fanout_graph.nodes = alpha_fanout_nodes;
+    declare_closed_test_graph(alpha_fanout_graph);
     plan = flagos_build_graph_plan(
         &alpha_fanout_graph, query_pattern_terminal_only, &supported);
     CHECK(plan->steps.size() == 3);
@@ -1038,6 +1085,7 @@ int main() {
     ggml_cgraph gdn_gate_graph {};
     gdn_gate_graph.n_nodes = 9;
     gdn_gate_graph.nodes = gdn_gate_nodes;
+    declare_closed_test_graph(gdn_gate_graph);
     supported = flagos_pattern_id::gdn_gate_projections;
     plan = flagos_build_graph_plan(
         &gdn_gate_graph, query_pattern_gdn_gate_outputs, &supported);
@@ -1062,6 +1110,7 @@ int main() {
     ggml_cgraph gdn_gate_fanout_graph {};
     gdn_gate_fanout_graph.n_nodes = 10;
     gdn_gate_fanout_graph.nodes = gdn_gate_fanout_nodes;
+    declare_closed_test_graph(gdn_gate_fanout_graph);
     plan = flagos_build_graph_plan(
         &gdn_gate_fanout_graph, query_pattern_gdn_gate_outputs, &supported);
     CHECK(plan->steps.size() == 10);
@@ -1077,6 +1126,7 @@ int main() {
     ggml_cgraph gated_fanout_graph {};
     gated_fanout_graph.n_nodes = 3;
     gated_fanout_graph.nodes = gated_fanout_nodes;
+    declare_closed_test_graph(gated_fanout_graph);
     plan = flagos_build_graph_plan(
         &gated_fanout_graph, query_pattern_terminal_only, &supported);
     CHECK(plan->steps.size() == 3);
@@ -1098,6 +1148,7 @@ int main() {
     ggml_cgraph gated_late_input_graph {};
     gated_late_input_graph.n_nodes = 3;
     gated_late_input_graph.nodes = gated_late_input_nodes;
+    declare_closed_test_graph(gated_late_input_graph);
     plan = flagos_build_graph_plan(
         &gated_late_input_graph, query_pattern_terminal_only, &supported);
     CHECK(plan->steps.size() == 3);
@@ -1164,6 +1215,7 @@ int main() {
     ggml_cgraph gdn_graph {};
     gdn_graph.n_nodes = 5;
     gdn_graph.nodes = gdn_nodes;
+    declare_closed_test_graph(gdn_graph);
     supported = flagos_pattern_id::gated_delta_net_decode;
     plan = flagos_build_graph_plan(&gdn_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 2);
@@ -1191,6 +1243,7 @@ int main() {
     ggml_cgraph gdn_implicit_view_graph {};
     gdn_implicit_view_graph.n_nodes = 3;
     gdn_implicit_view_graph.nodes = gdn_implicit_view_nodes;
+    declare_closed_test_graph(gdn_implicit_view_graph);
     plan = flagos_build_graph_plan(&gdn_implicit_view_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 2);
     CHECK(plan->steps[0].kind == flagos_execution_kind::pattern);
@@ -1206,6 +1259,7 @@ int main() {
     ggml_cgraph gdn_scheduled_destination_graph {};
     gdn_scheduled_destination_graph.n_nodes = 4;
     gdn_scheduled_destination_graph.nodes = gdn_scheduled_destination_nodes;
+    declare_closed_test_graph(gdn_scheduled_destination_graph);
     plan = flagos_build_graph_plan(
         &gdn_scheduled_destination_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 2);
@@ -1298,6 +1352,7 @@ int main() {
     ggml_cgraph gdn_intervening_graph {};
     gdn_intervening_graph.n_nodes = 6;
     gdn_intervening_graph.nodes = gdn_intervening_nodes;
+    declare_closed_test_graph(gdn_intervening_graph);
     plan = flagos_build_graph_plan(&gdn_intervening_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 6);
 
@@ -1312,6 +1367,7 @@ int main() {
     ggml_cgraph gdn_fanout_graph {};
     gdn_fanout_graph.n_nodes = 6;
     gdn_fanout_graph.nodes = gdn_fanout_nodes;
+    declare_closed_test_graph(gdn_fanout_graph);
     plan = flagos_build_graph_plan(&gdn_fanout_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 3);
     CHECK(plan->steps[0].candidate.required_output_node_indices.size() == 3);
@@ -1339,6 +1395,7 @@ int main() {
     ggml_cgraph ffn_graph {};
     ffn_graph.n_nodes = 3;
     ffn_graph.nodes = ffn_nodes;
+    declare_closed_test_graph(ffn_graph);
     supported = flagos_pattern_id::ffn_swiglu;
     plan = flagos_build_graph_plan(&ffn_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 1);
@@ -1354,6 +1411,7 @@ int main() {
     ggml_cgraph ffn_down_graph {};
     ffn_down_graph.n_nodes = 4;
     ffn_down_graph.nodes = ffn_down_nodes;
+    declare_closed_test_graph(ffn_down_graph);
     supported = flagos_pattern_id::ffn_swiglu_down;
     plan = flagos_build_graph_plan(&ffn_down_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 1);
@@ -1380,6 +1438,7 @@ int main() {
     ggml_cgraph ffn_fanout_graph {};
     ffn_fanout_graph.n_nodes = 5;
     ffn_fanout_graph.nodes = ffn_fanout_nodes;
+    declare_closed_test_graph(ffn_fanout_graph);
     plan = flagos_build_graph_plan(&ffn_fanout_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 5);
 
@@ -1391,6 +1450,7 @@ int main() {
     ggml_cgraph ffn_barrier_graph {};
     ffn_barrier_graph.n_nodes = 5;
     ffn_barrier_graph.nodes = ffn_barrier_nodes;
+    declare_closed_test_graph(ffn_barrier_graph);
     plan = flagos_build_graph_plan(&ffn_barrier_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 5);
 
@@ -1425,6 +1485,7 @@ int main() {
     ggml_cgraph ffn_interleaved_graph {};
     ffn_interleaved_graph.n_nodes = 4;
     ffn_interleaved_graph.nodes = ffn_interleaved_nodes;
+    declare_closed_test_graph(ffn_interleaved_graph);
     supported = flagos_pattern_id::ffn_swiglu;
     plan = flagos_build_graph_plan(&ffn_interleaved_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 2);
@@ -1455,6 +1516,7 @@ int main() {
     ggml_cgraph flash_graph {};
     flash_graph.n_nodes = 1;
     flash_graph.nodes = flash_nodes;
+    declare_closed_test_graph(flash_graph);
     supported = flagos_pattern_id::flash_attn_decode;
     plan = flagos_build_graph_plan(&flash_graph, query_pattern, &supported);
     CHECK(plan->steps.size() == 1);
@@ -1481,7 +1543,10 @@ int main() {
     ggml_cgraph split = ggml_graph_view(full, 0, 2);
     supported = flagos_pattern_id::rms_norm_mul;
     CHECK(flagos_graph_exposes_all_consumers(&split, norm));
-    CHECK(!flagos_graph_exposes_all_consumers(&graph.graph, &graph.norm));
+    ggml_cgraph unknown_graph = graph.graph;
+    unknown_graph.use_counts = nullptr;
+    unknown_graph.visited_hash_set = {};
+    CHECK(!flagos_graph_exposes_all_consumers(&unknown_graph, &graph.norm));
     flagos_graph_plan_cache split_cache(2);
     bool split_created = false;
     split_cache.get_or_create(&split, query_pattern_terminal_only, &supported, &split_created);
@@ -1505,6 +1570,44 @@ int main() {
     auto multi_output = flagos_build_graph_plan(&split, query_pattern, &supported);
     CHECK(multi_output->steps.size() == 1);
     CHECK(multi_output->steps[0].candidate.required_output_node_indices.size() == 2);
+    // The same escaping intermediate remains observable when a caller omits
+    // use metadata. A terminal-only kernel must not silently discard it.
+    for (const bool omit_hash : {false, true}) {
+        ggml_cgraph incomplete = split;
+        if (omit_hash) incomplete.visited_hash_set = {};
+        else incomplete.use_counts = nullptr;
+        auto terminal_only = flagos_build_graph_plan(&incomplete, query_pattern_terminal_only, &supported);
+        CHECK(terminal_only->steps.size() == 2);
+        CHECK(terminal_only->steps[0].kind == flagos_execution_kind::direct);
+        auto preserve_all = flagos_build_graph_plan(&incomplete, query_pattern, &supported);
+        CHECK(preserve_all->steps.size() == 1);
+        CHECK(preserve_all->steps[0].candidate.required_output_node_indices == std::vector<int>({0, 1}));
+        CHECK(!multi_output->matches(&incomplete));
+    }
+    // An explicitly closed real GGML graph can still use a terminal-only
+    // fusion; removing its proof invalidates the cached lowering.
+    ggml_cgraph * closed_full = ggml_new_graph(ctx);
+    ggml_build_forward_expand(closed_full, mul);
+    ggml_cgraph closed_split = ggml_graph_view(closed_full, 0, 2);
+    flagos_graph_plan_cache visibility_cache(2);
+    const auto & known = visibility_cache.get_or_create(&closed_split, query_pattern_terminal_only, &supported, &split_created);
+    CHECK(known.steps.size() == 1);
+    closed_split.use_counts = nullptr;
+    const auto & unknown = visibility_cache.get_or_create(&closed_split, query_pattern_terminal_only, &supported, &split_created);
+    CHECK(split_created && unknown.steps.size() == 2);
+    closed_split = ggml_graph_view(closed_full, 0, 2);
+    const auto & restored = visibility_cache.get_or_create(&closed_split, query_pattern_terminal_only, &supported, &split_created);
+    CHECK(!split_created && restored.steps.size() == 1);
+    // Private GLU scratch cannot elide an observable intermediate without
+    // whole-graph consumer visibility, even if the local FFN looks complete.
+    ggml_cgraph unknown_ffn = ffn_down_graph;
+    unknown_ffn.use_counts = nullptr;
+    unknown_ffn.visited_hash_set = {};
+    supported = flagos_pattern_id::ffn_swiglu_down;
+    auto unknown_ffn_plan = flagos_build_graph_plan(&unknown_ffn, query_pattern, &supported);
+    CHECK(unknown_ffn_plan->steps.size() == 4);
+    for (const auto & step : unknown_ffn_plan->steps) CHECK(step.kind == flagos_execution_kind::direct);
+
     // A covered alias can itself escape even when its backing tensor's
     // direct consumers are all visible in the split.
     ggml_tensor * alias = ggml_view_1d(ctx, norm, 512, 0);

@@ -1,3 +1,4 @@
+#include "check_closed_graph.h"
 #include "flagos-provider.h"
 #include "flagos-graph-plan.h"
 #include "ggml-flagos.h"
@@ -157,6 +158,7 @@ int main(int argc, char ** argv) {
     ggml_cgraph empty_graph {};
     empty_graph.n_nodes = 4;
     empty_graph.nodes = empty_nodes;
+    flagos_check_closed_graph(ctx, empty_graph);
     CHECK(ggml_backend_graph_compute(backend, &empty_graph) == GGML_STATUS_SUCCESS);
     const char * requested_package = std::getenv("FLAGOS_AMD_KERNEL_DIR");
     std::filesystem::path package_dir;
@@ -213,6 +215,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph graph {};
         graph.n_nodes = 1;
         graph.nodes = nodes;
+        flagos_check_closed_graph(ctx, graph);
         CHECK(ggml_backend_graph_compute(backend, &graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, sum, sum_host.data(), 0, ggml_nbytes(sum));
         ggml_backend_synchronize(backend);
@@ -253,6 +256,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph scale_graph {};
             scale_graph.n_nodes = 1;
             scale_graph.nodes = scale_nodes;
+            flagos_check_closed_graph(ctx, scale_graph);
             CHECK(ggml_backend_graph_compute(backend, &scale_graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(
                 backend, scale_output, scale_output_host.data(), 0, ggml_nbytes(scale_output));
@@ -302,6 +306,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph rms_graph {};
         rms_graph.n_nodes = 1;
         rms_graph.nodes = rms_nodes;
+        flagos_check_closed_graph(ctx, rms_graph);
         CHECK(ggml_backend_graph_compute(backend, &rms_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, rms_output, rms_output_host.data(), 0, ggml_nbytes(rms_output));
         ggml_backend_synchronize(backend);
@@ -359,6 +364,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph fused_graph {};
         fused_graph.n_nodes = 2;
         fused_graph.nodes = fused_nodes;
+        flagos_check_closed_graph(ctx, fused_graph);
         CHECK(ggml_backend_graph_compute(backend, &fused_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, fused_mul, fused_output_host.data(), 0, ggml_nbytes(fused_mul));
         ggml_backend_synchronize(backend);
@@ -434,6 +440,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph narrow_rms_graph {};
         narrow_rms_graph.n_nodes = 2;
         narrow_rms_graph.nodes = narrow_rms_nodes;
+        flagos_check_closed_graph(ctx, narrow_rms_graph);
         CHECK(ggml_backend_graph_compute(backend, &narrow_rms_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, narrow_rms_mul,
             narrow_rms_output_host.data(), 0, ggml_nbytes(narrow_rms_mul));
@@ -492,6 +499,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph add_graph {};
         add_graph.n_nodes = 3;
         add_graph.nodes = add_nodes;
+        flagos_check_closed_graph(ctx, add_graph);
         CHECK(ggml_backend_graph_compute(backend, &add_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, add_mul, add_output_host.data(), 0, ggml_nbytes(add_mul));
         ggml_backend_synchronize(backend);
@@ -552,6 +560,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph set_rows_graph {};
         set_rows_graph.n_nodes = 1;
         set_rows_graph.nodes = set_rows_nodes;
+        flagos_check_closed_graph(ctx, set_rows_graph);
         CHECK(ggml_backend_graph_compute(backend, &set_rows_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, set_rows_dst, set_rows_dst_host.data(),
             0, ggml_nbytes(set_rows_dst));
@@ -628,6 +637,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph quant_graph {};
             quant_graph.n_nodes = 1;
             quant_graph.nodes = quant_nodes;
+            flagos_check_closed_graph(ctx, quant_graph);
             CHECK(ggml_backend_graph_compute(backend, &quant_graph) == GGML_STATUS_SUCCESS);
             std::vector<float> output_host(static_cast<size_t>(rows * columns), -1.0f);
             ggml_backend_tensor_get_async(backend, quant_output, output_host.data(),
@@ -730,6 +740,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph gather_graph {};
             gather_graph.n_nodes = 1;
             gather_graph.nodes = gather_nodes;
+            flagos_check_closed_graph(ctx, gather_graph);
             CHECK(ggml_backend_graph_compute(backend, &gather_graph) == GGML_STATUS_SUCCESS);
             std::vector<float> gathered_host(static_cast<size_t>(tokens * k), -1.0f);
             ggml_backend_tensor_get_async(backend, gathered, gathered_host.data(), 0, ggml_nbytes(gathered));
@@ -809,6 +820,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph rope_graph {};
         rope_graph.n_nodes = 1;
         rope_graph.nodes = rope_nodes;
+        flagos_check_closed_graph(ctx, rope_graph);
         CHECK(ggml_backend_graph_compute(backend, &rope_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, rope_output, rope_output_host.data(), 0, ggml_nbytes(rope_output));
         ggml_backend_synchronize(backend);
@@ -843,6 +855,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph rope_store_graph {};
         rope_store_graph.n_nodes = 3;
         rope_store_graph.nodes = rope_store_nodes;
+        flagos_check_closed_graph(ctx, rope_store_graph);
         CHECK(ggml_backend_graph_compute(backend, &rope_store_graph) == GGML_STATUS_SUCCESS);
         std::vector<ggml_fp16_t> rope_cache_host(static_cast<size_t>(rope_ne0 * rope_ne1 * 32),
             ggml_fp32_to_fp16(0.0f));
@@ -1023,6 +1036,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph gdn_direct_graph {};
             gdn_direct_graph.n_nodes = 1;
             gdn_direct_graph.nodes = gdn_direct_nodes;
+            flagos_check_closed_graph(ctx, gdn_direct_graph);
             const int clear_order_trials =
                 gdn_tokens == 4 && gdn_snapshots == 3 && gdn_state_size == 128 ? 16 : 1;
             for (int trial = 0; trial < clear_order_trials; ++trial) {
@@ -1038,6 +1052,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph gdn_copy_graph {};
             gdn_copy_graph.n_nodes = 2;
             gdn_copy_graph.nodes = gdn_copy_nodes;
+            flagos_check_closed_graph(ctx, gdn_copy_graph);
             CHECK(ggml_backend_graph_compute(backend, &gdn_copy_graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(backend, gdn_output, gdn_direct_output.data(),
                 0, ggml_nbytes(gdn_output));
@@ -1058,6 +1073,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph gdn_graph {};
             gdn_graph.n_nodes = 4;
             gdn_graph.nodes = gdn_nodes;
+            flagos_check_closed_graph(ctx, gdn_graph);
             CHECK(ggml_backend_graph_compute(backend, &gdn_graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(backend, gdn_output, gdn_fused_output.data(),
                 0, ggml_nbytes(gdn_output));
@@ -1089,6 +1105,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph gdn_scheduled_view_graph {};
             gdn_scheduled_view_graph.n_nodes = 4;
             gdn_scheduled_view_graph.nodes = gdn_scheduled_view_nodes;
+            flagos_check_closed_graph(ctx, gdn_scheduled_view_graph);
             CHECK(ggml_backend_graph_compute(
                 backend, &gdn_scheduled_view_graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(backend, gdn_output, gdn_fused_output.data(),
@@ -1118,6 +1135,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph gdn_snapshot_observer_graph {};
             gdn_snapshot_observer_graph.n_nodes = 5;
             gdn_snapshot_observer_graph.nodes = gdn_snapshot_observer_nodes;
+            flagos_check_closed_graph(ctx, gdn_snapshot_observer_graph);
             CHECK(ggml_backend_graph_compute(
                 backend, &gdn_snapshot_observer_graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(backend, gdn_output, gdn_fused_output.data(),
@@ -1214,6 +1232,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph ssm_graph {};
         ssm_graph.n_nodes = 2;
         ssm_graph.nodes = ssm_nodes;
+        flagos_check_closed_graph(ctx, ssm_graph);
         CHECK(ggml_backend_graph_compute(backend, &ssm_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(
             backend, ssm_conv, ssm_conv_host.data(), 0, ggml_nbytes(ssm_conv));
@@ -1253,6 +1272,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph silu_graph {};
         silu_graph.n_nodes = 1;
         silu_graph.nodes = silu_nodes;
+        flagos_check_closed_graph(ctx, silu_graph);
         CHECK(ggml_backend_graph_compute(backend, &silu_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, silu_output, silu_output_host.data(), 0, ggml_nbytes(silu_output));
         ggml_backend_synchronize(backend);
@@ -1313,6 +1333,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph gated_graph {};
         gated_graph.n_nodes = 2;
         gated_graph.nodes = gated_nodes;
+        flagos_check_closed_graph(ctx, gated_graph);
         CHECK(ggml_backend_graph_compute(backend, &gated_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(
             backend, gated_silu, gated_silu_host.data(), 0, ggml_nbytes(gated_silu));
@@ -1382,6 +1403,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph graph {};
             graph.n_nodes = 2;
             graph.nodes = nodes;
+            flagos_check_closed_graph(ctx, graph);
             CHECK(ggml_backend_graph_compute(backend, &graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(
                 backend, activation, activation_host.data(), 0, ggml_nbytes(activation));
@@ -1482,6 +1504,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph alpha_graph {};
         alpha_graph.n_nodes = 3;
         alpha_graph.nodes = alpha_nodes;
+        flagos_check_closed_graph(ctx, alpha_graph);
         CHECK(ggml_backend_graph_compute(backend, &alpha_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(
             backend, alpha_add, alpha_add_host.data(), 0, ggml_nbytes(alpha_add));
@@ -1626,6 +1649,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph gate_projection_graph {};
         gate_projection_graph.n_nodes = 8;
         gate_projection_graph.nodes = gate_projection_nodes;
+        flagos_check_closed_graph(ctx, gate_projection_graph);
         CHECK(ggml_backend_graph_compute(backend, &gate_projection_graph) ==
             GGML_STATUS_SUCCESS);
         std::vector<float> beta_gate_host(
@@ -1704,6 +1728,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph swiglu_graph {};
         swiglu_graph.n_nodes = 1;
         swiglu_graph.nodes = swiglu_nodes;
+        flagos_check_closed_graph(ctx, swiglu_graph);
         CHECK(ggml_backend_graph_compute(backend, &swiglu_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, swiglu_tensor, swiglu_host.data(), 0, ggml_nbytes(swiglu_tensor));
         ggml_backend_synchronize(backend);
@@ -1760,6 +1785,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph softmax_graph {};
         softmax_graph.n_nodes = 1;
         softmax_graph.nodes = softmax_nodes;
+        flagos_check_closed_graph(ctx, softmax_graph);
         CHECK(ggml_backend_graph_compute(backend, &softmax_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, softmax_output, softmax_output_host.data(),
             0, ggml_nbytes(softmax_output));
@@ -1828,6 +1854,7 @@ int main(int argc, char ** argv) {
         ggml_cgraph masked_graph {};
         masked_graph.n_nodes = 1;
         masked_graph.nodes = masked_nodes;
+        flagos_check_closed_graph(ctx, masked_graph);
         CHECK(ggml_backend_graph_compute(backend, &masked_graph) == GGML_STATUS_SUCCESS);
         ggml_backend_tensor_get_async(backend, masked_output, masked_output_host.data(),
             0, ggml_nbytes(masked_output));
@@ -1956,6 +1983,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph attn_graph {};
             attn_graph.n_nodes = 1;
             attn_graph.nodes = attn_nodes;
+            flagos_check_closed_graph(ctx, attn_graph);
             CHECK(ggml_backend_graph_compute(backend, &attn_graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(backend, attn_out, attn_output.data(), 0, ggml_nbytes(attn_out));
             ggml_backend_synchronize(backend);
@@ -2119,6 +2147,7 @@ int main(int argc, char ** argv) {
             ggml_cgraph prefill_graph {};
             prefill_graph.n_nodes = 1;
             prefill_graph.nodes = prefill_nodes;
+            flagos_check_closed_graph(ctx, prefill_graph);
             CHECK(ggml_backend_graph_compute(backend, &prefill_graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get_async(backend, prefill_out, prefill_output_host.data(),
                 0, ggml_nbytes(prefill_out));

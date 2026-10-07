@@ -573,7 +573,7 @@ static bool flagos_tensor_is_private_to_consumer(
         return false;
     }
     const int32_t global_uses = flagos_global_use_count(cgraph, producer);
-    if (global_uses >= 0 && global_uses !=
+    if (global_uses < 0 || global_uses !=
         flagos_operand_uses(cgraph->nodes[expected_consumer_index], producer)) {
         return false;
     }
@@ -615,6 +615,8 @@ static bool flagos_populate_required_outputs(
         bool required = position + 1 == candidate.node_indices.size() ||
             (producer->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
         const int32_t global_uses = flagos_global_use_count(cgraph, producer);
+        // Missing whole-graph visibility cannot prove an intermediate private.
+        required = required || global_uses < 0;
         if (global_uses >= 0) {
             int32_t internal_uses = 0;
             for (const int index : candidate.node_indices) {
