@@ -2128,6 +2128,49 @@ def compile_tiled_ffn_package_without_launch(output_dir: Path, arch: str) -> Non
         "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align, "aot_divisibility": divisibility}])
 
 
+def compile_matrix_stage1_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile optional pipeline variants from the existing library exports."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("matrix-stage1 requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    for source_name, semantic, arguments, tile_m in (
+        ("flagos_mul_mat_f16_f32_batched_aligned",
+         "ggml.gemm_f16_round_activation_f16_acc_f32.ptr16_k_rows_multiple16.v1",
+         ("weights", "x", "output", "k", "rows", "columns"), 64),
+        ("flagos_ffn_swiglu_f16_f32_batched_tiled",
+         "transformer.ffn_f16_round_activation_f16_acc_f32_swiglu.ptr16_k_rows_multiple16.v1",
+         ("gate_weights", "up_weights", "x", "output", "k", "rows", "columns"), 32),
+    ):
+        export, _, _, _ = load_flaggems_aot_export(name=source_name, semantic=semantic,
+            runtime_arguments=arguments, constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+        divisibility = tuple((argument, 16) for argument in arguments[:-1])
+        if export.aot_divisibility != divisibility:
+            raise RuntimeError(f"incompatible matrix divisibility contract: {source_name}")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {argument: "*fp16" if "weights" in argument else
+                     "*fp32" if argument in ("x", "output") else "i32" for argument in arguments}
+        signature.update({argument: "constexpr" for argument in export.constexpr_arguments})
+        options = {"num_warps": 4, "num_stages": 1}
+        compiled = triton.compile(ASTSource(export.function, signature,
+            {"BLOCK_M": tile_m, "BLOCK_N": 128, "BLOCK_K": 32}, attrs=export.aot_attributes),
+            target=GPUTarget("hip", arch, 32), options=options)
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError(f"{source_name} requires unsupported Triton scratch storage")
+        name = source_name + "_stage1"
+        artifact = output_dir / f"{name}.hsaco"
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 128, "tile_m": tile_m, "tile_n": 128, "tile_k": 32,
+            "argument_count": len(arguments), "global_scratch_size": 0,
+            "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align,
+            "aot_divisibility": divisibility, "compile_options": options})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_packed_ffn_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile both packing stages from versioned library contracts."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3112,7 +3155,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gdn-value-tile"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gdn-value-tile", "matrix-stage1"),
                         help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
     if args.extension and (not args.compile_only or not args.arch):
@@ -3155,6 +3198,8 @@ def main() -> None:
             compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":
             compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "matrix-stage1":
+            compile_matrix_stage1_package_without_launch(args.output_dir, args.arch)
         else:
             compile_strided_rms_package_without_launch(args.output_dir, args.arch)
         commit_output()
