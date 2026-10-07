@@ -2250,6 +2250,49 @@ def compile_packed_ffn_package_without_launch(output_dir: Path, arch: str) -> No
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_flash_attention_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile generic 128/256 attention from explicit library contracts."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("flash-attention requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    pointers = ("q", "k", "v", "attention_mask", "output")
+    strides = ("stride_q_token", "stride_q_head", "stride_k_token", "stride_k_head",
+               "stride_v_token", "stride_v_head", "stride_output_token", "stride_output_head")
+    kernels = []
+    for prefill in (False, True):
+        kind = "prefill" if prefill else "decode"
+        name = f"flagos_flash_attn_{kind}_f32_f16"
+        lengths = ("query_length", "key_length", "q_per_kv") if prefill else ("key_length", "q_per_kv")
+        mask_strides = ("stride_mask_token", "stride_mask_query") if prefill else ()
+        runtime = pointers + lengths + strides[:6] + mask_strides + strides[6:] + ("scale",)
+        export, _, _, _ = load_flaggems_aot_export(name=name,
+            semantic=f"ggml.flash_{kind}_q_round_f16_kv_f16_online_softmax.generic_strides.all_masked_zero.v1",
+            runtime_arguments=runtime, constexpr_arguments=("HEAD_DIM", "BLOCK_M", "BLOCK_N"))
+        if export.aot_divisibility:
+            raise RuntimeError(f"generic attention must not require extra divisibility: {name}")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {argument: "i32" for argument in runtime}
+        signature.update(q="*fp32", k="*fp16", v="*fp16", attention_mask="*fp16",
+                         output="*fp32", scale="fp32", HEAD_DIM="constexpr", BLOCK_M="constexpr", BLOCK_N="constexpr")
+        for head_dim in (128, 256):
+            entry = name + f"_generic_h{head_dim}"
+            constants = {"HEAD_DIM": head_dim, "BLOCK_M": 16, "BLOCK_N": 16}
+            compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": NUM_WARPS, "num_stages": 1})
+            metadata = compiled.metadata
+            if getattr(metadata, "global_scratch_size", 0) or metadata.profile_scratch_size:
+                raise RuntimeError(f"{entry} requires unsupported Triton scratch storage")
+            artifact = output_dir / f"{entry}.hsaco"
+            artifact.write_bytes(compiled.asm["hsaco"])
+            kernels.append({"name": entry, "symbol": metadata.name, "file": artifact.name,
+                "shared": metadata.shared, "num_warps": metadata.num_warps, "warp_size": metadata.warp_size,
+                "block_size": 16, "tile_m": 16, "tile_n": 16, "tile_k": head_dim,
+                "argument_count": len(runtime), "global_scratch_size": 0,
+                "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+                "profile_scratch_size": 0, "profile_scratch_align": metadata.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_q6_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the GGUF Q6_K GEMV export without device launches."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3191,7 +3234,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "flash-attention", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
     if args.extension and (not args.compile_only or not args.arch):
@@ -3231,6 +3274,8 @@ def main() -> None:
             compile_tiled_ffn_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "packed-ffn":
             compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "flash-attention":
+            compile_flash_attention_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "q6-gemv":
             compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":
