@@ -19,6 +19,7 @@ read for lower VGPR pressure.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib
 import json
@@ -86,6 +87,24 @@ FLAGGEMS_AOT_EXPORT = None
 FLAGGEMS_AOT_SOURCE_ROOT = None
 FLAGGEMS_AOT_COMMIT = ""
 FLAGGEMS_AOT_TREE_STATE = "unknown"
+
+
+@contextmanager
+def amd_hint_context():
+    try:
+        from triton.compiler import hint_manager
+    except ImportError:
+        yield
+        return
+    if not hasattr(hint_manager, "HintManager") or not hasattr(hint_manager, "_global_hint_manager"):
+        raise RuntimeError("unsupported FlagTree hint API for explicit HIP compilation")
+    previous = hint_manager._global_hint_manager
+    # The CLI compiles for HIP; driver discovery can select CUDA or require a GPU.
+    hint_manager._global_hint_manager = hint_manager.HintManager("hip")
+    try:
+        yield
+    finally:
+        hint_manager._global_hint_manager = previous
 
 
 def assert_common_kernel_close(actual, expected, *args, **kwargs) -> None:
@@ -3546,4 +3565,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    with amd_hint_context():
+        main()
