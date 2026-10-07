@@ -106,7 +106,11 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_flaggems_aot_export():
+def load_flaggems_aot_export(
+        name="flagos_add_rms_norm_mul_residual_f32",
+        semantic="transformer.add_rms_norm_scale_residual.v1",
+        runtime_arguments=("residual_output", "mul_output", "x", "bias", "weight", "n_cols", "eps"),
+        constexpr_arguments=("BLOCK",)):
     source = os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE")
     if not source:
         return None, None, "", "unknown"
@@ -124,13 +128,12 @@ def load_flaggems_aot_export():
     module_file = Path(module.__file__).resolve()
     if not module_file.is_relative_to(package_dir.resolve()):
         raise RuntimeError(f"flag_gems_aot was imported from an unexpected path: {module_file}")
-    export = module.get_kernel_export("flagos_add_rms_norm_mul_residual_f32")
+    export = module.get_kernel_export(name)
     if (export.abi != "flag-gems-aot-v1" or
-            export.semantic != "transformer.add_rms_norm_scale_residual.v1" or
-            export.runtime_arguments != (
-                "residual_output", "mul_output", "x", "bias", "weight", "n_cols", "eps") or
-            export.constexpr_arguments != ("BLOCK",)):
-        raise RuntimeError("incompatible FlagGems residual AOT export contract")
+            export.semantic != semantic or
+            export.runtime_arguments != runtime_arguments or
+            export.constexpr_arguments != constexpr_arguments):
+        raise RuntimeError(f"incompatible FlagGems AOT export contract: {name}")
     commit = os.environ.get("FLAGOS_FLAGGEMS_COMMIT", "")
     if not commit:
         result = subprocess.run(
@@ -155,8 +158,8 @@ def package_metadata() -> dict:
         ("flagos_amd_hsaco.py", Path(__file__).resolve().parent / "flagos_amd_hsaco.py"),
     ]
     sources.extend((path.name, path) for path in TUNING_PROFILE_KERNEL_LISTS)
-    if FLAGGEMS_AOT_EXPORT is not None:
-        for source in FLAGGEMS_AOT_EXPORT.source_files:
+    for export in FLAGGEMS_AOT_EXPORTS:
+        for source in export.source_files:
             source_path = Path(source).resolve()
             if FLAGGEMS_AOT_SOURCE_ROOT is None or not source_path.is_file() or not source_path.is_relative_to(
                     FLAGGEMS_AOT_SOURCE_ROOT):
@@ -164,7 +167,7 @@ def package_metadata() -> dict:
             sources.append((f"FlagGems/{source_path.relative_to(FLAGGEMS_AOT_SOURCE_ROOT)}", source_path))
     source_entries = [
         {"name": name, "sha256": sha256_file(source)}
-        for name, source in sources
+        for name, source in dict(sources).items()
     ]
     combined = hashlib.sha256()
     for source in source_entries:
@@ -183,15 +186,15 @@ def package_metadata() -> dict:
         "source_sha256": combined.hexdigest(),
         "sources": source_entries,
     }
-    if FLAGGEMS_AOT_EXPORT is not None:
+    if FLAGGEMS_AOT_EXPORTS:
         metadata["source_dependencies"] = [{
             "name": "FlagGems",
             "commit": FLAGGEMS_AOT_COMMIT or "unknown",
             "tree_state": FLAGGEMS_AOT_TREE_STATE,
-            "abi": FLAGGEMS_AOT_EXPORT.abi,
-            "kernel": FLAGGEMS_AOT_EXPORT.name,
-            "semantic": FLAGGEMS_AOT_EXPORT.semantic,
-        }]
+            "abi": export.abi,
+            "kernel": export.name,
+            "semantic": export.semantic,
+        } for export in FLAGGEMS_AOT_EXPORTS]
     tuning_profile = os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME", "")
     if tuning_profile:
         tuning_profile_contracts(tuning_profile)
@@ -533,6 +536,16 @@ def flagos_add_rms_norm_mul_residual_f32_narrow(
 ) = load_flaggems_aot_export()
 if FLAGGEMS_AOT_EXPORT is not None:
     flagos_add_rms_norm_mul_residual_f32 = FLAGGEMS_AOT_EXPORT.function
+
+FLAGGEMS_DENSE_GATHER_EXPORT, _, _, _ = load_flaggems_aot_export(
+    "flagos_get_rows_f32",
+    "ggml.get_rows.contiguous_f32.i32_indices.in_range.bitwise.v1",
+    ("table", "row_index", "output", "n_cols"),
+)
+if FLAGGEMS_DENSE_GATHER_EXPORT is not None:
+    common.flagos_get_rows_f32 = FLAGGEMS_DENSE_GATHER_EXPORT.function
+FLAGGEMS_AOT_EXPORTS = tuple(export for export in (
+    FLAGGEMS_AOT_EXPORT, FLAGGEMS_DENSE_GATHER_EXPORT) if export is not None)
 
 
 @triton.jit
@@ -2015,6 +2028,38 @@ def compile_q4_dequant_package_without_launch(output_dir: Path, arch: str) -> No
     write_manifest(output_dir, arch, [kernel])
 
 
+def compile_dense_gather_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile contiguous F32 gather without GPU initialization or launch."""
+    if not arch:
+        raise RuntimeError("--compile-only requires --arch")
+    name = "flagos_get_rows_f32"
+    block_size = 256
+    source = ASTSource(
+        common.flagos_get_rows_f32,
+        {"table": "*fp32", "row_index": "*i32", "output": "*fp32",
+         "n_cols": "i32", "BLOCK": "constexpr"},
+        {"BLOCK": block_size},
+    )
+    compiled = triton.compile(source, target=GPUTarget("hip", arch, 32),
+                              options={"num_warps": NUM_WARPS})
+    metadata = compiled.metadata
+    global_scratch_size = getattr(metadata, "global_scratch_size", 0)
+    if global_scratch_size or metadata.profile_scratch_size:
+        raise RuntimeError(f"{name} requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{
+        "name": name, "symbol": name, "file": artifact.name,
+        "shared": metadata.shared, "num_warps": metadata.num_warps,
+        "warp_size": metadata.warp_size, "block_size": block_size,
+        "tile_m": 0, "tile_n": 0, "tile_k": 0, "argument_count": 4,
+        "global_scratch_size": global_scratch_size,
+        "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+        "profile_scratch_size": metadata.profile_scratch_size,
+        "profile_scratch_align": metadata.profile_scratch_align,
+    }])
+
+
 def compile_scale_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the common SCALE kernel for an AMD package without a device launch."""
     if not arch:
@@ -2864,7 +2909,15 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
+    parser.add_argument("--extension", choices=("dense-gather",),
+                        help="compile an optional ABI extension as a separate package")
     args = parser.parse_args()
+    if args.extension and (not args.compile_only or not args.arch):
+        raise RuntimeError("--extension requires --compile-only and --arch")
+    if args.extension and (os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME") or
+            any(key.startswith("FLAGOS_AMD_ONLY_") and value == "1"
+                for key, value in os.environ.items())):
+        raise RuntimeError("--extension cannot be combined with a tuning profile or ONLY mode")
     validate_tuning_profile_kernel_abis()
     if args.cache_dir is None:
         raise RuntimeError("--cache-dir or TRITON_CACHE_DIR is required")
@@ -2886,6 +2939,11 @@ def main() -> None:
             final_output_dir.rmdir()
         staging_output_dir.rename(final_output_dir)
         temporary_output.cleanup()
+    if args.extension:
+        compile_dense_gather_package_without_launch(args.output_dir, args.arch)
+        commit_output()
+        print(f"wrote {args.extension} extension for {args.arch} to {final_output_dir}")
+        return
     only_residual = os.environ.get("FLAGOS_AMD_ONLY_RESIDUAL") == "1"
     only_residual_narrow = os.environ.get("FLAGOS_AMD_ONLY_RESIDUAL_NARROW") == "1"
     only_q4_ffn_decode = os.environ.get("FLAGOS_AMD_ONLY_Q4_FFN_DECODE") == "1"
