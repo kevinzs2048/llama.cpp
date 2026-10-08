@@ -2491,6 +2491,26 @@ static bool amd_supports_gated_delta_net_cache(
     return true;
 }
 
+static bool amd_supports_ggml_rope(const amd_device_context * device, const ggml_tensor * op) {
+    if (device == nullptr || device->aot == nullptr) {
+        return false;
+    }
+    const auto * metadata = device->aot->find("flagos_rope_ggml_recurrence_f32");
+    if (metadata == nullptr || metadata->argument_count != 20 ||
+        !flagos_amd::supports_ggml_rope_layout(op, metadata->block_size) ||
+        !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[0], sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) ||
+        (op->src[2] != nullptr && !amd_tensor_data_is_aligned(op->src[2], sizeof(float))) ||
+        amd_tensor_data_overlaps(op, op->src[1]) ||
+        (op->src[2] != nullptr && amd_tensor_data_overlaps(op, op->src[2]))) {
+        return false;
+    }
+    return !amd_tensor_data_overlaps(op, op->src[0]) ||
+        (op->data == op->src[0]->data && ggml_is_contiguous(op->src[0]));
+}
+
 static bool amd_supports_rope_neox(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_ROPE || op->src[0] == nullptr || op->src[1] == nullptr ||
@@ -5507,6 +5527,41 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, "rms_norm");
             continue;
         }
+        if (node->op == GGML_OP_ROPE && amd_supports_ggml_rope(backend_context->device, node)) {
+            int ne0 = static_cast<int>(node->ne[0]);
+            int ne1 = static_cast<int>(node->ne[1]);
+            int ne2 = static_cast<int>(node->ne[2]);
+            int stride_x1 = static_cast<int>(node->src[0]->nb[1] / sizeof(float));
+            int stride_x2 = static_cast<int>(node->src[0]->nb[2] / sizeof(float));
+            int stride_x3 = static_cast<int>(node->src[0]->nb[3] / sizeof(float));
+            const auto * params = static_cast<const int32_t *>(node->op_params);
+            int n_dims = params[1];
+            int mode = params[2];
+            int has_factors = node->src[2] != nullptr;
+            int sections[4] = { params[11], params[12], params[13], params[14] };
+            float frequency[4];
+            std::memcpy(frequency, params + 5, sizeof(frequency));
+            float theta_scale = std::pow(frequency[0], -2.0f / n_dims);
+            void * x = node->src[0]->data;
+            void * positions = node->src[1]->data;
+            void * factors = has_factors ? node->src[2]->data : x;
+            void * output = node->data;
+            flagos_amd::kernel_arguments arguments = {
+                &x, &positions, &factors, &output, &ne0, &ne1, &ne2, &n_dims, &mode, &has_factors,
+                &stride_x1, &stride_x2, &stride_x3,
+                &sections[0], &sections[1], &sections[2], &sections[3],
+                &theta_scale, &frequency[1], &frequency[3],
+            };
+            if (!backend_context->device->aot->launch("flagos_rope_ggml_recurrence_f32", backend_context->stream,
+                    static_cast<unsigned int>(ggml_nrows(node)), 1, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.rope.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "ggml_rope");
+            continue;
+        }
         if (node->op == GGML_OP_ROPE && amd_supports_mrope(backend_context->device, node)) {
             int ne0 = static_cast<int>(node->ne[0]);
             int ne1 = static_cast<int>(node->ne[1]);
@@ -5816,7 +5871,8 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
          (op->op == GGML_OP_SET_ROWS && amd_supports_set_rows(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_RMS_NORM && amd_supports_rms_norm(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_ROPE &&
-          (amd_supports_rope_neox(amd_device_from_dev(dev), op) ||
+          (amd_supports_ggml_rope(amd_device_from_dev(dev), op) ||
+           amd_supports_rope_neox(amd_device_from_dev(dev), op) ||
            amd_supports_mrope(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_UNARY &&
           (amd_supports_silu(amd_device_from_dev(dev), op) ||

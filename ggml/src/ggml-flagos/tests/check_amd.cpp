@@ -26,11 +26,14 @@ static void check(bool condition, const char * expression, int line) {
 
 #define CHECK(expression) check((expression), #expression, __LINE__)
 
+#include "check_amd_rope.h"
+
 int main(int argc, char ** argv) {
     bool require_ssm_conv_silu = false;
     bool require_attention_output_gate = false;
     bool require_gdn_gate_projections = false;
     bool require_generic_attention = false;
+    bool require_ggml_rope = false;
     for (int argument = 1; argument < argc; ++argument) {
         if (std::strcmp(argv[argument], "--require-ssm-conv-silu") == 0) {
             require_ssm_conv_silu = true;
@@ -38,12 +41,14 @@ int main(int argc, char ** argv) {
             require_attention_output_gate = true;
         } else if (std::strcmp(argv[argument], "--require-gdn-gate-projections") == 0) {
             require_gdn_gate_projections = true;
+        } else if (std::strcmp(argv[argument], "--require-ggml-rope") == 0) {
+            require_ggml_rope = true;
         } else if (std::strcmp(argv[argument], "--require-generic-attention") == 0) {
             require_generic_attention = true;
         } else {
             std::fprintf(stderr,
                 "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate] "
-                "[--require-gdn-gate-projections] [--require-generic-attention]\n",
+                "[--require-gdn-gate-projections] [--require-generic-attention] [--require-ggml-rope]\n",
                 argv[0]);
             return 2;
         }
@@ -94,6 +99,7 @@ int main(int argc, char ** argv) {
     };
     ggml_context * ctx = ggml_init(params);
     CHECK(ctx != nullptr);
+    check_rope_layout_contracts(ctx, nullptr);
     ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
     CHECK(tensor != nullptr);
 
@@ -111,6 +117,10 @@ int main(int argc, char ** argv) {
     // The backend owns a stream; synchronize before checking asynchronous copies.
     ggml_backend_t backend = ggml_backend_flagos_init(0);
     CHECK(backend != nullptr);
+    if (require_ggml_rope) {
+        check_rope_layout_contracts(ctx, dev);
+        check_ggml_rope_device(backend, dev, buft, ctx);
+    }
     ggml_backend_tensor_set_async(backend, tensor, input.data(), 0, tensor_size);
     ggml_backend_synchronize(backend);
     ggml_backend_tensor_get_async(backend, tensor, output.data(), 0, tensor_size);

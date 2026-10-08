@@ -2305,6 +2305,38 @@ def compile_flash_attention_package_without_launch(output_dir: Path, arch: str, 
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_ggml_rope_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the no-YaRN GGML frequency-recurrence RoPE export."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("ggml-rope requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_rope_ggml_recurrence_f32"
+    runtime = ("x", "positions", "factors", "output", "ne0", "ne1", "ne2", "n_dims", "mode", "has_factors",
+               "stride_x1", "stride_x2", "stride_x3", "section_t", "section_h", "section_w", "section_e",
+               "theta_scale", "freq_scale", "attn_factor")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.rope_normal_imrope_f32.cpu_frequency_recurrence.no_yarn.v2",
+        runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("GGML recurrence RoPE must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "i32" for argument in runtime}
+    signature.update(x="*fp32", positions="*i32", factors="*fp32", output="*fp32",
+                     theta_scale="fp32", freq_scale="fp32", attn_factor="fp32", BLOCK="constexpr")
+    compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 128}, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("GGML recurrence RoPE requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 128, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+        "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
 def compile_q6_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the GGUF Q6_K GEMV export without device launches."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3246,7 +3278,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "flash-attention", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "flash-attention", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3294,6 +3326,8 @@ def main() -> None:
             compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "flash-attention":
             compile_flash_attention_package_without_launch(args.output_dir, args.arch, args.flash_attention_profile or "baseline")
+        elif args.extension == "ggml-rope":
+            compile_ggml_rope_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "q6-gemv":
             compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":

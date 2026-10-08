@@ -13,6 +13,87 @@
 
 namespace flagos_amd {
 
+inline bool supports_ggml_rope_layout(const ggml_tensor * op, int block_pairs) {
+    if (op == nullptr || op->op != GGML_OP_ROPE || op->src[0] == nullptr ||
+        op->src[1] == nullptr ||
+        op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
+        op->src[1]->type != GGML_TYPE_I32 || !ggml_are_same_shape(op, op->src[0]) ||
+        !ggml_is_contiguous(op) || op->src[0]->nb[0] != sizeof(float) ||
+        !ggml_is_contiguous(op->src[1]) || op->src[1]->ne[1] != 1 ||
+        op->src[1]->ne[2] != 1 || op->src[1]->ne[3] != 1 ||
+        op->src[1]->ne[0] > INT32_MAX ||
+        op->ne[0] <= 0 || op->ne[0] % 2 != 0 || block_pairs != 128 || block_pairs < op->ne[0] / 2) {
+        return false;
+    }
+    const ggml_tensor * tensors[] = { op, op->src[0], op->src[1], op->src[2] };
+    for (const ggml_tensor * tensor : tensors) {
+        if (tensor != nullptr &&
+            ((tensor->data != nullptr && reinterpret_cast<uintptr_t>(tensor->data) % sizeof(float) != 0) ||
+             (tensor->view_src != nullptr && tensor->view_offs % sizeof(float) != 0))) {
+            return false;
+        }
+    }
+    const auto storage = [](const ggml_tensor * tensor) {
+        return tensor->view_src == nullptr ? tensor : tensor->view_src;
+    };
+    const ggml_tensor * output_storage = storage(op);
+    for (const ggml_tensor * input : { op->src[1], op->src[2] }) {
+        if (input != nullptr && output_storage == storage(input)) {
+            return false;
+        }
+    }
+    if (output_storage == storage(op->src[0]) &&
+        (op->view_offs != op->src[0]->view_offs || !ggml_is_contiguous(op->src[0]))) {
+        return false;
+    }
+    int64_t elements = 1;
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        if (op->ne[dim] <= 0 || op->ne[dim] > INT32_MAX / elements ||
+            op->src[0]->nb[dim] % sizeof(float) != 0 ||
+            op->src[0]->nb[dim] / sizeof(float) > INT32_MAX) {
+            return false;
+        }
+        elements *= op->ne[dim];
+    }
+    if (ggml_nbytes(op->src[0]) / sizeof(float) > INT32_MAX) {
+        return false;
+    }
+    const auto * params = static_cast<const int32_t *>(op->op_params);
+    const int mode = params[2];
+    if ((mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_IMROPE) ||
+        params[1] <= 0 || params[1] % 2 != 0 || params[1] > op->ne[0] ||
+        op->src[1]->ne[0] != op->ne[2] * (mode == GGML_ROPE_TYPE_IMROPE ? 4 : 1)) {
+        return false;
+    }
+    if (mode == GGML_ROPE_TYPE_IMROPE) {
+        int64_t section_total = 0;
+        for (int i = 0; i < GGML_MROPE_SECTIONS; ++i) {
+            if (params[11 + i] < 0 || params[11 + i] > INT32_MAX / 3) {
+                return false;
+            }
+            section_total += params[11 + i];
+        }
+        if (section_total != params[1] / 2 ||
+            (params[11] == 0 && params[12] == 0 && params[13] == 0)) {
+            return false;
+        }
+    }
+    const ggml_tensor * factors = op->src[2];
+    if (factors != nullptr && (factors->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(factors) || factors->ne[0] < op->ne[0] / 2 ||
+        factors->ne[1] != 1 || factors->ne[2] != 1 || factors->ne[3] != 1)) {
+        return false;
+    }
+    float frequency[4];
+    std::memcpy(frequency, params + 5, sizeof(frequency));
+    return std::isfinite(frequency[0]) && frequency[0] > 0.0f &&
+        std::isfinite(frequency[1]) && frequency[1] > 0.0f &&
+        frequency[2] == 0.0f && std::isfinite(frequency[3]) &&
+        // Reject scale overflow/underflow and denormals before GPU launch.
+        std::isnormal(std::pow(frequency[0], -2.0f / params[1]));
+}
+
+
 inline bool supports_aligned_f16_gemm_launch(
         const void * weights, const void * x, const void * output,
         int k, int rows) {
