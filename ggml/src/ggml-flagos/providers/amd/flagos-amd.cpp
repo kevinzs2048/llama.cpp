@@ -2811,6 +2811,32 @@ static bool amd_i32_matrix_offsets_fit(
         signature.rows <= limit / signature.columns;
 }
 
+static const char * amd_strided_batched_f16_kernel_name(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT) {
+        return nullptr;
+    }
+    const int32_t precision = ggml_get_op_params_i32(op, 0);
+    if (precision != GGML_PREC_DEFAULT && precision != GGML_PREC_F32) {
+        return nullptr;
+    }
+    bool preserve_src1 = precision == GGML_PREC_F32;
+#if GGML_BACKEND_API_VERSION >= 3
+    // Keep legacy F32 requests conservative, and honor the new source ranks
+    // independently. The IEEE export keeps both internal operands in F32.
+    for (int source = 0; source < 2; ++source) {
+        const int32_t minimum = ggml_get_op_params_i32(op, 2 + source);
+        if (minimum != GGML_PREC_DEFAULT && minimum != GGML_PREC_F32 &&
+            minimum != GGML_PREC_BF16 && minimum != GGML_PREC_F16 &&
+            minimum != GGML_PREC_Q8 && minimum != GGML_PREC_Q4) {
+            return nullptr;
+        }
+        preserve_src1 = preserve_src1 || minimum == GGML_PREC_F32 || minimum == GGML_PREC_BF16;
+    }
+#endif
+    return preserve_src1 ? "flagos_mul_mat_f16_f32_strided_batched_ieee"
+                         : "flagos_mul_mat_f16_f32_strided_batched";
+}
+
 static bool amd_supports_strided_batched_f16_mul_mat(
         const amd_device_context * device, const ggml_tensor * op) {
     if (!amd_env_enabled("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM") ||
@@ -2820,22 +2846,10 @@ static bool amd_supports_strided_batched_f16_mul_mat(
         op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
         return false;
     }
-    const int32_t precision = ggml_get_op_params_i32(op, 0);
-    if (precision != GGML_PREC_DEFAULT && precision != GGML_PREC_F32) {
+    const char * kernel = amd_strided_batched_f16_kernel_name(op);
+    if (kernel == nullptr) {
         return false;
     }
-#if GGML_BACKEND_API_VERSION >= 3
-    // The export rounds src1 to F16 and accumulates in F32. Source precision
-    // is a separate minimum rank; an F32 accumulator request permits this
-    // implementation, while an F32/BF16 source minimum does not.
-    for (int source = 0; source < 2; ++source) {
-        const int32_t minimum = ggml_get_op_params_i32(op, 2 + source);
-        if (minimum != GGML_PREC_DEFAULT && minimum != GGML_PREC_F16 &&
-            minimum != GGML_PREC_Q8 && minimum != GGML_PREC_Q4) {
-            return false;
-        }
-    }
-#endif
     const auto * weights = op->src[0];
     const auto * input = op->src[1];
     if (weights->ne[0] != input->ne[0] || op->ne[0] != weights->ne[1] ||
@@ -2882,10 +2896,11 @@ static bool amd_supports_strided_batched_f16_mul_mat(
         !amd_tensor_data_is_aligned(op, sizeof(float))) {
         return false;
     }
-    const auto * metadata = device->aot->find("flagos_mul_mat_f16_f32_strided_batched");
+    const auto * metadata = device->aot->find(kernel);
+    const size_t shared = std::strcmp(kernel, "flagos_mul_mat_f16_f32_strided_batched_ieee") == 0 ? 6144 : 4096;
     return metadata != nullptr && metadata->argument_count == 15 && metadata->block_size == 32 &&
         metadata->tile_m == 32 && metadata->tile_n == 16 && metadata->tile_k == 32 &&
-        metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == 4096 &&
+        metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == shared &&
         metadata->static_shared_memory == 0 && metadata->global_scratch_size == 0 &&
         metadata->profile_scratch_size == 0;
 }
@@ -5591,7 +5606,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 &weights_data, &input_data, &output_data, &k, &rows, &columns, &heads,
                 &head_ratio, &sample_ratio, &sw1, &sw2, &sw3, &sx1, &sx2, &sx3,
             };
-            if (!backend_context->device->aot->launch("flagos_mul_mat_f16_f32_strided_batched",
+            const char * kernel = amd_strided_batched_f16_kernel_name(node);
+            if (!backend_context->device->aot->launch(kernel,
                     backend_context->stream, (rows + 31U) / 32U, (columns + 15U) / 16U,
                     static_cast<unsigned int>(node->ne[2] * node->ne[3]), arguments)) {
                 return GGML_STATUS_FAILED;
@@ -5599,7 +5615,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
-            amd_trace_op(backend_context, node, "f16_matmul_strided_batched");
+            amd_trace_op(backend_context, node, kernel);
             continue;
         }
         if (node->op == GGML_OP_MUL_MAT && amd_supports_quantized_mul_mat(backend_context->device, node)) {
