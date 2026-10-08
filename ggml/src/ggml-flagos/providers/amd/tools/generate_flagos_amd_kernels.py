@@ -2610,15 +2610,18 @@ def compile_softmax_broadcast_package_without_launch(output_dir: Path, arch: str
         "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
 
 
-def compile_strided_batched_gemm_package_without_launch(output_dir: Path, arch: str) -> None:
+def compile_strided_batched_gemm_package_without_launch(
+        output_dir: Path, arch: str, preserve_src1: bool = False) -> None:
     """Compile F16 attention matrix multiplication with GGML batch strides."""
     global FLAGGEMS_AOT_EXPORTS
     if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
         raise RuntimeError("strided-batched-gemm requires FLAGOS_FLAGGEMS_AOT_SOURCE")
     runtime = ("weights", "x", "output", "k", "rows", "columns", "n_heads",
         "head_ratio", "sample_ratio", "sw1", "sw2", "sw3", "sx1", "sx2", "sx3")
-    export, _, _, _ = load_flaggems_aot_export(name="flagos_mul_mat_f16_f32_strided_batched",
-        semantic="ggml.mul_mat.f16_weights.f32_src1_rne_f16.acc_f32.outer_strides.batch_floor_broadcast.v1",
+    name = "flagos_mul_mat_f16_f32_strided_batched" + ("_ieee" if preserve_src1 else "")
+    source_semantic = "f32_src1_preserved.ieee_products" if preserve_src1 else "f32_src1_rne_f16"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.mul_mat.f16_weights." + source_semantic + ".acc_f32.outer_strides.batch_floor_broadcast.v1",
         runtime_arguments=runtime, constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
     if export.aot_divisibility:
         raise RuntimeError("generic strided batched GEMM must not require extra divisibility")
@@ -3598,7 +3601,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "strided-batched-gemm", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "strided-batched-gemm", "strided-batched-gemm-ieee", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3666,6 +3669,8 @@ def main() -> None:
             compile_softmax_broadcast_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "strided-batched-gemm":
             compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "strided-batched-gemm-ieee":
+            compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch, preserve_src1=True)
         elif args.extension == "gdn-value-tile":
             compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "matrix-stage1":
