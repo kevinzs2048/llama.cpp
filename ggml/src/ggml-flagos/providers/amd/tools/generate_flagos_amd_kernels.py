@@ -2305,6 +2305,60 @@ def compile_flash_attention_package_without_launch(output_dir: Path, arch: str, 
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_splitkv_decode_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the explicit-workspace GGML decode pair without a GPU launch."""
+    global FLAGGEMS_AOT_EXPORTS
+    if arch != "gfx1150" or not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("flash-decode-splitkv requires gfx1150 and FLAGOS_FLAGGEMS_AOT_SOURCE")
+    partial_runtime = ("q", "k", "v", "mask", "partial_m", "partial_l", "partial_a",
+        "key_length", "q_per_kv", "split_count", "keys_per_split", "stride_q_token",
+        "stride_q_head", "stride_k_token", "stride_k_head", "stride_v_token", "stride_v_head", "scale")
+    merge_runtime = ("partial_m", "partial_l", "partial_a", "output",
+        "split_count", "stride_output_token", "stride_output_head")
+    pointers = {"q": "*fp32", "k": "*fp16", "v": "*fp16", "mask": "*fp16",
+        "partial_m": "*fp32", "partial_l": "*fp32", "partial_a": "*fp32", "output": "*fp32"}
+    stages = (
+        (False, "flagos_flash_decode_splitk_stage1_f32_f16", partial_runtime,
+         "ggml.flash_decode_splitkv.partial_m_l_a.q_round_f16.kv_f16.p_tile_f16.stats_f32.head128_256.explicit_workspace.single_query.all_masked_zero.v1",
+         ("HEAD_DIM", "BLOCK_KV")),
+        (True, "flagos_flash_decode_splitk_merge_f32", merge_runtime,
+         "ggml.flash_decode_splitkv.merge_m_l_a.f32.head128_256.explicit_workspace.single_query.all_masked_zero.v1",
+         ("HEAD_DIM", "MAX_SPLITS")),
+    )
+    kernels = []
+    with amd_hint_context():
+        for merge, export_name, runtime, semantic, constexpr in stages:
+            export, _, _, _ = load_flaggems_aot_export(name=export_name, semantic=semantic,
+                runtime_arguments=runtime, constexpr_arguments=constexpr)
+            if export.aot_attributes:
+                raise RuntimeError("split-KV requires generic pointer and stride attributes")
+            FLAGGEMS_AOT_EXPORTS += (export,)
+            for head in (128, 256):
+                block = 16 if merge else 32
+                constants = {"HEAD_DIM": head, "MAX_SPLITS" if merge else "BLOCK_KV": block}
+                signature = {argument: pointers.get(argument, "fp32" if argument == "scale" else "i32")
+                    for argument in runtime}
+                signature.update({argument: "constexpr" for argument in constexpr})
+                compiled = triton.compile(ASTSource(export.function, signature, constants, attrs={}),
+                    target=GPUTarget("hip", arch, 32),
+                    options={"num_warps": 4, "num_stages": 1, "enable_fp_fusion": False})
+                metadata = compiled.metadata
+                if getattr(metadata, "global_scratch_size", 0) or metadata.profile_scratch_size:
+                    raise RuntimeError("split-KV requires unsupported Triton scratch storage")
+                name = ("flagos_flash_decode_splitkv_merge_f32" if merge else
+                    "flagos_flash_decode_splitkv_partial_f32_f16") + f"_h{head}"
+                artifact = output_dir / f"{name}.hsaco"
+                artifact.write_bytes(compiled.asm["hsaco"])
+                kernels.append({"name": name, "symbol": metadata.name, "file": artifact.name,
+                    "shared": metadata.shared, "num_warps": metadata.num_warps,
+                    "warp_size": metadata.warp_size, "block_size": block,
+                    "tile_m": 0, "tile_n": block, "tile_k": head,
+                    "argument_count": len(runtime), "global_scratch_size": 0,
+                    "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+                    "profile_scratch_size": 0, "profile_scratch_align": metadata.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_ggml_rope_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the no-YaRN GGML frequency-recurrence RoPE export."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3278,7 +3332,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "flash-attention", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "flash-attention", "flash-decode-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3326,6 +3380,8 @@ def main() -> None:
             compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "flash-attention":
             compile_flash_attention_package_without_launch(args.output_dir, args.arch, args.flash_attention_profile or "baseline")
+        elif args.extension == "flash-decode-splitkv":
+            compile_splitkv_decode_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "ggml-rope":
             compile_ggml_rope_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "q6-gemv":

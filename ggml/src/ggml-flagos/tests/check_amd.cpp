@@ -28,12 +28,14 @@ static void check(bool condition, const char * expression, int line) {
 
 #include "check_amd_rope.h"
 #include "check_amd_gdn_alignment.h"
+#include "check_amd_splitkv.h"
 
 int main(int argc, char ** argv) {
     bool require_ssm_conv_silu = false;
     bool require_attention_output_gate = false;
     bool require_gdn_gate_projections = false;
     bool require_generic_attention = false;
+    bool require_splitkv_decode = false;
     bool require_ggml_rope = false;
     bool require_view_alignment = false;
     for (int argument = 1; argument < argc; ++argument) {
@@ -45,6 +47,8 @@ int main(int argc, char ** argv) {
             require_gdn_gate_projections = true;
         } else if (std::strcmp(argv[argument], "--require-view-alignment") == 0) {
             require_view_alignment = true;
+        } else if (std::strcmp(argv[argument], "--require-splitkv-decode") == 0) {
+            require_splitkv_decode = true;
         } else if (std::strcmp(argv[argument], "--require-ggml-rope") == 0) {
             require_ggml_rope = true;
         } else if (std::strcmp(argv[argument], "--require-generic-attention") == 0) {
@@ -52,7 +56,7 @@ int main(int argc, char ** argv) {
         } else {
             std::fprintf(stderr,
                 "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate] "
-                "[--require-gdn-gate-projections] [--require-generic-attention] [--require-ggml-rope] [--require-view-alignment]\n",
+                "[--require-gdn-gate-projections] [--require-generic-attention] [--require-ggml-rope] [--require-view-alignment] [--require-splitkv-decode]\n",
                 argv[0]);
             return 2;
         }
@@ -2203,6 +2207,11 @@ int main(int argc, char ** argv) {
             ggml_backend_buffer_free(prefill_mask_buffer);
             ggml_backend_buffer_free(prefill_out_buffer);
         }
+    }
+
+    if (require_splitkv_decode) {
+        CHECK(!package_dir.empty());
+        check_amd_splitkv_decode(backend, dev, buft);
     }
 
     ggml_backend_free(backend);

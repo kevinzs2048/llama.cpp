@@ -220,6 +220,9 @@ struct amd_backend_context {
     amd_device_context * device = nullptr;
     hipStream_t stream = nullptr;
     void * packed_ffn_workspace = nullptr;
+    void * splitkv_workspace = nullptr;
+    size_t splitkv_workspace_capacity = 0;
+    uint64_t splitkv_workspace_generation = 0;
     std::mutex execution_mutex;
     flagos_graph_plan_cache graph_plans;
     uint64_t graph_plan_config_key = 0;
@@ -286,6 +289,8 @@ struct amd_backend_context {
         std::atomic<uint64_t> rope_kv_store { 0 };
         std::atomic<uint64_t> flash_attn_decode { 0 };
         std::atomic<uint64_t> flash_attn_prefill { 0 };
+        std::atomic<uint64_t> splitkv_decode { 0 };
+        std::atomic<uint64_t> splitkv_workspace_allocations { 0 };
         std::atomic<uint64_t> soft_max { 0 };
         std::atomic<uint64_t> host_to_device_copies { 0 };
         std::atomic<uint64_t> device_to_device_copies { 0 };
@@ -489,6 +494,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
+    add(std::getenv("FLAGOS_AMD_SPLITKV_DECODE"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW"));
@@ -500,10 +506,15 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     // same provider-neutral configuration ID used by the common plan cache.
     // This lets a cold FFN plan be capture-unsafe for its allocating launch,
     // then rebuild as capture-safe once all pointers are stable.
-    const uint64_t epoch = context == nullptr ? 0 : context->dequant_cache_epoch;
-    for (size_t byte = 0; byte < sizeof(epoch); ++byte) {
-        hash ^= static_cast<uint8_t>(epoch >> (byte * 8));
-        hash *= 1099511628211ULL;
+    const uint64_t epochs[] = {
+        context == nullptr ? 0 : context->dequant_cache_epoch,
+        context == nullptr ? 0 : context->splitkv_workspace_generation,
+    };
+    for (const uint64_t epoch : epochs) {
+        for (size_t byte = 0; byte < sizeof(epoch); ++byte) {
+            hash ^= static_cast<uint8_t>(epoch >> (byte * 8));
+            hash *= 1099511628211ULL;
+        }
     }
     return hash == 0 ? 1 : hash;
 }
@@ -737,6 +748,11 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) s.graph_replays.load(),
         (unsigned long long) s.graph_replay_failures.load(),
         (unsigned long long) s.graph_capture_failures.load());
+    GGML_LOG_INFO("FlagOS AMD split-KV stats: decode_pairs=%llu workspace_allocations=%llu capacity=%zu generation=%llu\n",
+        (unsigned long long) s.splitkv_decode.load(),
+        (unsigned long long) s.splitkv_workspace_allocations.load(),
+        context->splitkv_workspace_capacity,
+        (unsigned long long) context->splitkv_workspace_generation);
     GGML_LOG_INFO(
         "FlagOS AMD graph capture stats: requests=%llu cache_waits=%llu prefill_skips=%llu "
         "unsafe_plans=%llu small_graphs=%llu eligible=%llu exec_misses=%llu "
@@ -1804,6 +1820,9 @@ static void amd_backend_free(ggml_backend_t backend) {
         amd_release_dequant_cache(context);
         if (context->packed_ffn_workspace != nullptr) {
             amd_hip_check(hipFree(context->packed_ffn_workspace), "hipFree packed FFN workspace");
+        }
+        if (context->splitkv_workspace != nullptr) {
+            amd_hip_check(hipFree(context->splitkv_workspace), "hipFree split-KV workspace");
         }
         amd_hip_check(hipStreamDestroy(context->stream), "hipStreamDestroy");
         auto & backends = device->backends;
@@ -3320,6 +3339,72 @@ static bool amd_supports_flash_attn_decode(const amd_device_context * device, co
         !amd_tensor_data_overlaps(op, v) && !amd_tensor_data_overlaps(op, mask);
 }
 
+static const flagos_amd::kernel_metadata * amd_splitkv_kernel(
+        const amd_device_context * device, const ggml_tensor * op, bool merge) {
+    const char * name = merge
+        ? (op->ne[0] == 256 ? "flagos_flash_decode_splitkv_merge_f32_h256" : "flagos_flash_decode_splitkv_merge_f32_h128")
+        : (op->ne[0] == 256 ? "flagos_flash_decode_splitkv_partial_f32_f16_h256" : "flagos_flash_decode_splitkv_partial_f32_f16_h128");
+    const auto * metadata = device->aot->find(name);
+    if (metadata == nullptr || metadata->argument_count != (merge ? 7 : 18) ||
+        metadata->symbol != (merge ? "flagos_flash_decode_splitk_merge_f32" : "flagos_flash_decode_splitk_stage1_f32_f16") ||
+        metadata->tile_k != op->ne[0] || metadata->tile_m != 0 ||
+        metadata->tile_n != (merge ? 16 : 32) || metadata->block_size != (merge ? 16 : 32) ||
+        metadata->num_warps != 4 || metadata->warp_size != 32 ||
+        metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0) {
+        return nullptr;
+    }
+    return metadata;
+}
+
+static bool amd_describe_splitkv(const amd_backend_context * context, const ggml_tensor * op,
+        flagos_amd::splitkv_decode_geometry * geometry) {
+    return amd_env_enabled("FLAGOS_AMD_SPLITKV_DECODE") && context != nullptr &&
+        amd_supports_flash_attn_decode(context->device, op) &&
+        flagos_amd::base_gcn_arch(context->device->arch) == "gfx1150" &&
+        flagos_amd::describe_splitkv_decode(op, geometry) &&
+        amd_splitkv_kernel(context->device, op, false) != nullptr &&
+        amd_splitkv_kernel(context->device, op, true) != nullptr;
+}
+
+static bool amd_splitkv_ready(const amd_backend_context * context, const ggml_tensor * op) {
+    flagos_amd::splitkv_decode_geometry geometry;
+    return amd_describe_splitkv(context, op, &geometry) && context->splitkv_workspace != nullptr &&
+        geometry.workspace_bytes <= context->splitkv_workspace_capacity;
+}
+
+static bool amd_prepare_splitkv_workspace(amd_backend_context * context, const ggml_cgraph * graph) {
+    size_t required = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        flagos_amd::splitkv_decode_geometry geometry;
+        if (amd_describe_splitkv(context, graph->nodes[i], &geometry)) {
+            required = std::max(required, geometry.workspace_bytes);
+        }
+    }
+    if (required <= context->splitkv_workspace_capacity) {
+        return true;
+    }
+    if (!amd_hip_check(hipStreamSynchronize(context->stream), "hipStreamSynchronize before split-KV allocation")) {
+        return false;
+    }
+    void * workspace = nullptr;
+    if (!amd_hip_check(hipMalloc(&workspace, required), "hipMalloc split-KV workspace")) {
+        GGML_LOG_WARN("FlagOS AMD: split-KV workspace unavailable; using qualified decode baseline\n");
+        return true;
+    }
+    context->graph_plans.clear();
+    amd_clear_graph_captures(context);
+    if (context->splitkv_workspace != nullptr &&
+        !amd_hip_check(hipFree(context->splitkv_workspace), "hipFree retired split-KV workspace")) {
+        amd_hip_check(hipFree(workspace), "hipFree unused split-KV workspace");
+        return false;
+    }
+    context->splitkv_workspace = workspace;
+    context->splitkv_workspace_capacity = required;
+    ++context->splitkv_workspace_generation;
+    context->stats.splitkv_workspace_allocations.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 static bool amd_supports_flash_attn_prefill(const amd_device_context * device, const ggml_tensor * op) {
     float scale = 0.0f;
     float max_bias = 0.0f;
@@ -3409,6 +3494,35 @@ static bool amd_launch_flash_attn(amd_backend_context * context, ggml_tensor * n
     void * mask_data = mask->data;
     void * output_data = node->data;
     flagos_amd::kernel_arguments arguments;
+    if (!prefill && amd_splitkv_ready(context, node)) {
+        flagos_amd::splitkv_decode_geometry geometry;
+        if (!amd_describe_splitkv(context, node, &geometry)) {
+            return false;
+        }
+        const auto * partial = amd_splitkv_kernel(context->device, node, false);
+        const auto * merge = amd_splitkv_kernel(context->device, node, true);
+        void * partial_m = context->splitkv_workspace;
+        void * partial_l = static_cast<float *>(partial_m) + geometry.partial_elements;
+        void * partial_a = static_cast<float *>(partial_l) + geometry.partial_elements;
+        arguments.assign(&q_data, &k_data, &v_data, &mask_data, &partial_m, &partial_l, &partial_a,
+            &key_length, &q_per_kv, &geometry.splits, &geometry.keys_per_split,
+            &stride_q_token, &stride_q_head, &stride_k_token, &stride_k_head,
+            &stride_v_token, &stride_v_head, &scale);
+        if (!context->device->aot->launch(partial->name, context->stream,
+                static_cast<unsigned int>(geometry.heads), static_cast<unsigned int>(geometry.splits), 1, arguments)) {
+            return false;
+        }
+        arguments.assign(&partial_m, &partial_l, &partial_a, &output_data,
+            &geometry.splits, &stride_output_token, &stride_output_head);
+        if (!context->device->aot->launch(merge->name, context->stream,
+                static_cast<unsigned int>(geometry.heads), 1, 1, arguments)) {
+            return false;
+        }
+        context->stats.splitkv_decode.fetch_add(1, std::memory_order_relaxed);
+        context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+        amd_trace_op(context, node, "flash_attn_decode_splitkv");
+        return true;
+    }
     if (prefill) {
         arguments.assign(&q_data, &k_data, &v_data, &mask_data, &output_data,
             &query_length, &key_length, &q_per_kv, &stride_q_token, &stride_q_head,
@@ -3794,7 +3908,7 @@ static flagos_lowering_choice amd_query_fusion(
             amd_supports_flash_attn_decode(context->device, attention)) {
             choice.supported = true;
             choice.capture_safe = true;
-            choice.implementation_id = 3;
+            choice.implementation_id = amd_splitkv_ready(context, attention) ? 20 : 3;
         }
     } else if (candidate.id == flagos_pattern_id::flash_attn_prefill && candidate.node_indices.size() == 1) {
         const ggml_tensor * attention = cgraph->nodes[candidate.node_indices[0]];
@@ -4791,6 +4905,9 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         return GGML_STATUS_SUCCESS;
     }
     amd_prepare_dequant_cache(backend_context, cgraph);
+    if (!amd_prepare_splitkv_workspace(backend_context, cgraph)) {
+        return GGML_STATUS_FAILED;
+    }
     const flagos_fusion_interface fusion_interface {
         /* .query_lowering = */ amd_query_fusion,
         /* .validate_lowering = */ amd_query_fusion,
@@ -4879,6 +4996,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         // binding key so an in-place model-weight update cannot replay an
         // executable bound to a retired dequantized allocation.
         capture_binding_fingerprint ^= backend_context->dequant_cache_epoch;
+        capture_binding_fingerprint *= 1099511628211ULL;
+        capture_binding_fingerprint ^= backend_context->splitkv_workspace_generation;
         capture_binding_fingerprint *= 1099511628211ULL;
     }
     flagos_graph_binding_snapshot capture_bindings;

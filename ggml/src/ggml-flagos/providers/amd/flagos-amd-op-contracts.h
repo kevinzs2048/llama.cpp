@@ -13,6 +13,39 @@
 
 namespace flagos_amd {
 
+struct splitkv_decode_geometry {
+    int heads = 0;
+    int splits = 0;
+    int keys_per_split = 0;
+    size_t partial_elements = 0;
+    size_t workspace_bytes = 0;
+};
+
+// The provider also checks the full baseline attention layout and package ABI.
+inline bool describe_splitkv_decode(const ggml_tensor * op, splitkv_decode_geometry * geometry) {
+    if (geometry == nullptr) {
+        return false;
+    }
+    *geometry = {};
+    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr ||
+        op->op != GGML_OP_FLASH_ATTN_EXT || (op->ne[0] != 128 && op->ne[0] != 256) ||
+        op->ne[1] <= 0 || op->ne[1] > 16 || op->ne[2] != 1 || op->ne[3] != 1 ||
+        op->src[1]->ne[1] < 4096 || op->src[1]->ne[1] > 8192 || op->src[1]->ne[2] <= 0 ||
+        op->ne[1] % op->src[1]->ne[2] != 0) {
+        return false;
+    }
+    const int64_t group = op->ne[1] / op->src[1]->ne[2];
+    if (group != 2 && group != 4 && group != 8) {
+        return false;
+    }
+    geometry->heads = static_cast<int>(op->ne[1]);
+    geometry->splits = 8;
+    geometry->keys_per_split = static_cast<int>((op->src[1]->ne[1] + 7) / 8);
+    geometry->partial_elements = static_cast<size_t>(geometry->heads) * geometry->splits;
+    geometry->workspace_bytes = geometry->partial_elements * (static_cast<size_t>(op->ne[0]) + 2) * sizeof(float);
+    return true;
+}
+
 inline bool supports_ggml_rope_layout(const ggml_tensor * op, int block_pairs) {
     if (op == nullptr || op->op != GGML_OP_ROPE || op->src[0] == nullptr ||
         op->src[1] == nullptr ||
