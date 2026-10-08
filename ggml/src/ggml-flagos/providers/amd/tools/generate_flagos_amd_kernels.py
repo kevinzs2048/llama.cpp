@@ -2250,9 +2250,13 @@ def compile_packed_ffn_package_without_launch(output_dir: Path, arch: str) -> No
     write_manifest(output_dir, arch, kernels)
 
 
-def compile_flash_attention_package_without_launch(output_dir: Path, arch: str) -> None:
+def compile_flash_attention_package_without_launch(output_dir: Path, arch: str, profile: str = "baseline") -> None:
     """Compile generic 128/256 attention from explicit library contracts."""
     global FLAGGEMS_AOT_EXPORTS
+    if profile not in ("baseline", "gfx1150-head256"):
+        raise RuntimeError(f"unknown flash-attention profile: {profile}")
+    if profile != "baseline" and arch != "gfx1150":
+        raise RuntimeError("gfx1150-head256 profile requires --arch gfx1150")
     if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
         raise RuntimeError("flash-attention requires FLAGOS_FLAGGEMS_AOT_SOURCE")
     pointers = ("q", "k", "v", "attention_mask", "output")
@@ -2265,20 +2269,28 @@ def compile_flash_attention_package_without_launch(output_dir: Path, arch: str) 
         lengths = ("query_length", "key_length", "q_per_kv") if prefill else ("key_length", "q_per_kv")
         mask_strides = ("stride_mask_token", "stride_mask_query") if prefill else ()
         runtime = pointers + lengths + strides[:6] + mask_strides + strides[6:] + ("scale",)
-        export, _, _, _ = load_flaggems_aot_export(name=name,
-            semantic=f"ggml.flash_{kind}_q_round_f16_kv_f16_online_softmax.generic_strides.all_masked_zero.v1",
-            runtime_arguments=runtime, constexpr_arguments=("HEAD_DIM", "BLOCK_M", "BLOCK_N"))
-        if export.aot_divisibility:
-            raise RuntimeError(f"generic attention must not require extra divisibility: {name}")
-        FLAGGEMS_AOT_EXPORTS += (export,)
         signature = {argument: "i32" for argument in runtime}
         signature.update(q="*fp32", k="*fp16", v="*fp16", attention_mask="*fp16",
                          output="*fp32", scale="fp32", HEAD_DIM="constexpr", BLOCK_M="constexpr", BLOCK_N="constexpr")
         for head_dim in (128, 256):
+            selected = profile == "gfx1150-head256" and head_dim == 256
+            export_name = name
+            semantic = f"ggml.flash_{kind}_q_round_f16_kv_f16_online_softmax.generic_strides.all_masked_zero.v1"
+            warps = NUM_WARPS if profile == "baseline" else 4
+            if selected:
+                export_name += "_skip_masked_generic" if prefill else "_simt_generic"
+                semantic = semantic[:-3] + (".skip_fully_masked_tiles.v1" if prefill else ".simt_f32_reductions.v1")
+                warps = 8 if prefill else 4
+            export, _, _, _ = load_flaggems_aot_export(name=export_name,
+                semantic=semantic, runtime_arguments=runtime,
+                constexpr_arguments=("HEAD_DIM", "BLOCK_M", "BLOCK_N"))
+            if export.aot_divisibility:
+                raise RuntimeError(f"generic attention must not require extra divisibility: {export_name}")
+            FLAGGEMS_AOT_EXPORTS += (export,)
             entry = name + f"_generic_h{head_dim}"
             constants = {"HEAD_DIM": head_dim, "BLOCK_M": 16, "BLOCK_N": 16}
             compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
-                target=GPUTarget("hip", arch, 32), options={"num_warps": NUM_WARPS, "num_stages": 1})
+                target=GPUTarget("hip", arch, 32), options={"num_warps": warps, "num_stages": 1})
             metadata = compiled.metadata
             if getattr(metadata, "global_scratch_size", 0) or metadata.profile_scratch_size:
                 raise RuntimeError(f"{entry} requires unsupported Triton scratch storage")
@@ -3236,7 +3248,13 @@ def main() -> None:
         help="compile one selected AMD tuning symbol without launching it")
     parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "flash-attention", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
+    parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
+                        help="optional offline attention profile; runtime dispatch and defaults are unchanged")
     args = parser.parse_args()
+    if args.flash_attention_profile and args.extension != "flash-attention":
+        raise RuntimeError("--flash-attention-profile requires --extension flash-attention")
+    if args.flash_attention_profile == "gfx1150-head256" and args.arch != "gfx1150":
+        raise RuntimeError("gfx1150-head256 profile requires --arch gfx1150")
     if args.extension and (not args.compile_only or not args.arch):
         raise RuntimeError("--extension requires --compile-only and --arch")
     if args.extension and (os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME") or
@@ -3275,7 +3293,7 @@ def main() -> None:
         elif args.extension == "packed-ffn":
             compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "flash-attention":
-            compile_flash_attention_package_without_launch(args.output_dir, args.arch)
+            compile_flash_attention_package_without_launch(args.output_dir, args.arch, args.flash_attention_profile or "baseline")
         elif args.extension == "q6-gemv":
             compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":
