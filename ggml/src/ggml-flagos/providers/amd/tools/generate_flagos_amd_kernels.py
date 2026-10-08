@@ -2611,22 +2611,26 @@ def compile_softmax_broadcast_package_without_launch(output_dir: Path, arch: str
 
 
 def compile_strided_batched_gemm_package_without_launch(
-        output_dir: Path, arch: str, preserve_src1: bool = False) -> None:
-    """Compile F16 attention matrix multiplication with GGML batch strides."""
+        output_dir: Path, arch: str, preserve_src1: bool = False,
+        f32_weights: bool = False) -> None:
+    """Compile explicit GGML floating matrix multiplication with batch strides."""
     global FLAGGEMS_AOT_EXPORTS
     if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
         raise RuntimeError("strided-batched-gemm requires FLAGOS_FLAGGEMS_AOT_SOURCE")
     runtime = ("weights", "x", "output", "k", "rows", "columns", "n_heads",
         "head_ratio", "sample_ratio", "sw1", "sw2", "sw3", "sx1", "sx2", "sx3")
-    name = "flagos_mul_mat_f16_f32_strided_batched" + ("_ieee" if preserve_src1 else "")
+    preserve_src1 = preserve_src1 or f32_weights
+    weight_type = "f32" if f32_weights else "f16"
+    name = "flagos_mul_mat_" + weight_type + "_f32_strided_batched" + ("_ieee" if preserve_src1 else "")
     source_semantic = "f32_src1_preserved.ieee_products" if preserve_src1 else "f32_src1_rne_f16"
     export, _, _, _ = load_flaggems_aot_export(name=name,
-        semantic="ggml.mul_mat.f16_weights." + source_semantic + ".acc_f32.outer_strides.batch_floor_broadcast.v1",
+        semantic="ggml.mul_mat." + weight_type + "_weights." + source_semantic + ".acc_f32.outer_strides.batch_floor_broadcast.v1",
         runtime_arguments=runtime, constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
     if export.aot_divisibility:
         raise RuntimeError("generic strided batched GEMM must not require extra divisibility")
     FLAGGEMS_AOT_EXPORTS += (export,)
-    signature = {argument: "*fp16" if argument == "weights" else
+    signature = {argument: "*fp16" if argument == "weights" and not f32_weights else
+        "*fp32" if argument == "weights" else
         "*fp32" if argument in ("x", "output") else "i32" for argument in runtime}
     constants = {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 32}
     signature.update({argument: "constexpr" for argument in constants})
@@ -2644,6 +2648,40 @@ def compile_strided_batched_gemm_package_without_launch(
         "argument_count": len(runtime), "global_scratch_size": 0,
         "global_scratch_align": getattr(m, "global_scratch_align", 1),
         "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
+def compile_half_gather_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile dense F16/BF16 embedding exports with explicit table bounds."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("half-gather requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    for dtype, pointer in (("f16", "*fp16"), ("bf16_bits", "*u16")):
+        table = "table" if dtype == "f16" else "table_bits"
+        runtime = (table, "row_index", "output", "n_cols", "table_rows")
+        export, _, _, _ = load_flaggems_aot_export(name="flagos_get_rows_" + dtype + "_f32",
+            semantic="ggml.get_rows.contiguous_" + dtype + "_to_f32.i32_indices.in_range.mask_invalid_zero.v1",
+            runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError("generic half gather must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {table: pointer, "row_index": "*i32", "output": "*fp32",
+            "n_cols": "i32", "table_rows": "i32", "BLOCK": "constexpr"}
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 256}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("half gather requires unsupported Triton scratch storage")
+        artifact = output_dir / (export.name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": export.name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": 5, "global_scratch_size": 0,
+            "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
 
 
 def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
@@ -3601,7 +3639,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "strided-batched-gemm", "strided-batched-gemm-ieee", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "strided-batched-gemm", "strided-batched-gemm-ieee", "dense-f32-gemm", "half-gather", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3671,6 +3709,10 @@ def main() -> None:
             compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "strided-batched-gemm-ieee":
             compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch, preserve_src1=True)
+        elif args.extension == "dense-f32-gemm":
+            compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch, f32_weights=True)
+        elif args.extension == "half-gather":
+            compile_half_gather_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":
             compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "matrix-stage1":
