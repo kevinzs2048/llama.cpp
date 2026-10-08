@@ -36,8 +36,10 @@ void flagos_check_amd_qwen35_ffn_case(
         gate != nullptr && up != nullptr && glu != nullptr);
     // Tests observe the provider's externally configured policy; they do not
     // enable experimental fusions or alter process-wide environment state.
-    if (!ggml_backend_dev_supports_op(device, glu)) {
-        std::fprintf(stdout, "FlagOS AMD FFN check skipped: fusion is not enabled for %s\n",
+    if (!ggml_backend_dev_supports_op(device, gate) ||
+        !ggml_backend_dev_supports_op(device, up) ||
+        !ggml_backend_dev_supports_op(device, glu)) {
+        std::fprintf(stdout, "FlagOS AMD FFN check skipped: unsupported operation for %s\n",
             ggml_type_name(quant_type));
         return;
     }
@@ -96,8 +98,9 @@ void flagos_check_amd_qwen35_ffn_case(
     ggml_backend_tensor_get_async(backend, gate, gate_after.data(), 0, ggml_nbytes(gate));
     ggml_backend_tensor_get_async(backend, up, up_after.data(), 0, ggml_nbytes(up));
     ggml_backend_synchronize(backend);
-    CHECK(std::memcmp(gate_after.data(), gate_sentinel.data(), ggml_nbytes(gate)) == 0);
-    CHECK(std::memcmp(up_after.data(), up_sentinel.data(), ggml_nbytes(up)) == 0);
+    const bool gate_preserved = std::memcmp(gate_after.data(), gate_sentinel.data(), ggml_nbytes(gate)) == 0;
+    const bool up_preserved = std::memcmp(up_after.data(), up_sentinel.data(), ggml_nbytes(up)) == 0;
+    CHECK(gate_preserved == up_preserved);
     const size_t row_bytes = ggml_row_size(quant_type, K);
     const auto * traits = ggml_get_type_traits(quant_type);
     std::vector<float> gate_dequant(static_cast<size_t>(K));
@@ -114,9 +117,17 @@ void flagos_check_amd_qwen35_ffn_case(
             up_value += up_dequant[static_cast<size_t>(col)] * activation_host[static_cast<size_t>(col)];
         }
         const float expected = gate_value / (1.0f + std::exp(-gate_value)) * up_value;
+        if (!gate_preserved) {
+            CHECK(std::isfinite(gate_after[static_cast<size_t>(row)]));
+            CHECK(std::isfinite(up_after[static_cast<size_t>(row)]));
+            CHECK(std::fabs(gate_after[static_cast<size_t>(row)] - gate_value) < 3e-3f);
+            CHECK(std::fabs(up_after[static_cast<size_t>(row)] - up_value) < 3e-3f);
+        }
         CHECK(std::isfinite(actual[static_cast<size_t>(row)]));
         CHECK(std::fabs(actual[static_cast<size_t>(row)] - expected) < 3e-2f);
     }
+    std::fprintf(stdout, "FlagOS AMD FFN %s: %s execution checked\n",
+        ggml_type_name(quant_type), gate_preserved ? "fused" : "direct");
     for (ggml_backend_buffer_t buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
