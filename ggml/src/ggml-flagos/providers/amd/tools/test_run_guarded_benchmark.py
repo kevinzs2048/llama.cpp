@@ -111,6 +111,45 @@ time.sleep(30)
             self.assertEqual(record["commands_failed"], 1)
             self.assertEqual(record["last_return_code"], 128 + signal.SIGHUP)
 
+    def run_live_failure(self, failure):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "guard.json"
+            checks = [[], failure, []]
+            def health():
+                value = checks.pop(0)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+            argv = ["guard", "--timeout", "30", "--", sys.executable, "-c", "import time; time.sleep(30)"]
+            before = time.monotonic()
+            with mock.patch.object(GUARD, "boot_id", return_value="test-boot"), \
+                    mock.patch.object(GUARD, "state_path", return_value=state), \
+                    mock.patch.object(GUARD, "kernel_gpu_errors", side_effect=health), \
+                    mock.patch.object(sys, "argv", argv):
+                self.assertEqual(GUARD.main(), 125)
+            self.assertLess(time.monotonic() - before, 10)
+            record = json.loads(state.read_text())
+            self.assertTrue(record["unhealthy"])
+            self.assertFalse(record["launch_in_progress"])
+            self.assertEqual(record["commands_failed"], 1)
+            self.assertEqual(record.get("commands_succeeded", 0), 0)
+            self.assertIn("last_live_health_error", record)
+
+    def test_live_mes_fault_stops_command_before_wall_timeout(self):
+        self.run_live_failure(["MES ring buffer is full."])
+
+    def test_live_log_failure_still_blocks_boot_if_final_check_recovers(self):
+        self.run_live_failure(GUARD.KernelLogUnavailable("temporary journal failure"))
+
+    def test_health_poll_keeps_original_wall_timeout(self):
+        with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True) as process:
+            try:
+                with mock.patch.object(GUARD, "kernel_gpu_errors", return_value=[]):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        GUARD.wait_with_health_checks(process, 0.1)
+            finally:
+                self.assertTrue(GUARD.stop_process_group(process, grace_seconds=1))
+
 
 if __name__ == "__main__":
     unittest.main()

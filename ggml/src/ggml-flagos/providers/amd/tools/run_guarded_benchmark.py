@@ -153,6 +153,27 @@ def stop_process_group(process: subprocess.Popen, grace_seconds: int = 5) -> boo
     return False
 
 
+class RunningHealthFailure(RuntimeError):
+    pass
+
+
+def wait_with_health_checks(process: subprocess.Popen, timeout_seconds: float) -> int:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+        try:
+            return process.wait(timeout=min(2.0, remaining))
+        except subprocess.TimeoutExpired:
+            try:
+                errors = kernel_gpu_errors()
+            except KernelLogUnavailable as error:
+                raise RunningHealthFailure(str(error)) from error
+            if errors:
+                raise RunningHealthFailure(errors[-1])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout", type=int, default=180, help="wall timeout in seconds")
@@ -403,7 +424,7 @@ def main() -> int:
             raise_interrupt = True
             if interrupted_signum is not None:
                 raise GuardInterrupted(interrupted_signum)
-            return_code = process.wait(timeout=args.timeout)
+            return_code = wait_with_health_checks(process, args.timeout)
             raise_interrupt = False
             if not wait_process_group_gone(process, 1):
                 print(
@@ -412,6 +433,13 @@ def main() -> int:
                 )
                 terminated_cleanly = stop_process_group(process)
                 return_code = 125
+        except RunningHealthFailure as error:
+            raise_interrupt = False
+            state["unhealthy"] = True
+            state["last_live_health_error"] = str(error)
+            print(f"FlagOS AMD guard: running health check failed; terminating: {error}", file=sys.stderr)
+            terminated_cleanly = stop_process_group(process)
+            return_code = 125
         except subprocess.TimeoutExpired:
             raise_interrupt = False
             print(
@@ -448,6 +476,7 @@ def main() -> int:
             state["launch_in_progress"] = False
             state["unhealthy"] = True
             state["last_log_check_error"] = str(error)
+            state["commands_failed"] = failed + 1
             state["last_return_code"] = return_code
             write_state(state_file, state)
             print(
