@@ -21,6 +21,20 @@ struct splitkv_decode_geometry {
     size_t workspace_bytes = 0;
 };
 
+inline bool supports_aligned_quantized_gemv_bindings(const ggml_tensor * op, int k, int rows) {
+    if (op == nullptr || k <= 0 || rows <= 0 || k % 16 != 0 || rows % 16 != 0) {
+        return false;
+    }
+    const ggml_tensor * operands[] = {op, op->src[0], op->src[1]};
+    for (const auto * tensor : operands) {
+        if (tensor == nullptr || tensor->data == nullptr ||
+            reinterpret_cast<uintptr_t>(tensor->data) % 16 != 0 || ggml_nbytes(tensor) > INT32_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // The provider also checks the full baseline attention layout and package ABI.
 inline bool describe_splitkv_decode(const ggml_tensor * op, splitkv_decode_geometry * geometry) {
     if (geometry == nullptr) {

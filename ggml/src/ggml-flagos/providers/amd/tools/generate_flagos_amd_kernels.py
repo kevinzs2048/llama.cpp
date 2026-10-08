@@ -2463,23 +2463,33 @@ def compile_q6_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
 
 
 def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
-    """Compile five generic GGUF GEMV exports from the selected library."""
+    """Compile generic and explicitly aligned GGUF GEMV library exports."""
     global FLAGGEMS_AOT_EXPORTS
     if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
         raise RuntimeError("gguf-gemv requires FLAGOS_FLAGGEMS_AOT_SOURCE")
     kernels = []
-    for kind, block in (("q4_0", 32), ("q4_1", 32), ("q8_0", 32), ("q4_k", 256), ("q5_k", 256)):
-        name = "flagos_mul_mat_" + kind + "_f32"
+    for kind, block, aligned in (("q4_0", 32, False), ("q4_1", 32, False), ("q8_0", 32, False),
+            ("q4_k", 256, False), ("q5_k", 256, False),
+            ("q4_1", 32, True), ("q8_0", 32, True), ("q4_k", 256, True)):
+        name = "flagos_mul_mat_" + kind + "_f32" + ("_model_aligned" if aligned else "")
+        semantic = "ggml.gguf_" + kind + "_gemv_dense_f32_acc_f32." + (
+            "ptr16_k_rows16.byte_spans_i31.v1" if aligned else "ptr2_packed.v1")
         export, _, _, _ = load_flaggems_aot_export(name=name,
-            semantic="ggml.gguf_" + kind + "_gemv_dense_f32_acc_f32.ptr2_packed.v1",
+            semantic=semantic,
             runtime_arguments=("weights_u8", "weights_f16", "x", "output", "k", "rows"),
             constexpr_arguments=())
-        if export.aot_divisibility:
-            raise RuntimeError("generic GGUF GEMV must not require extra divisibility")
+        required = tuple((argument, 16) for argument in export.runtime_arguments) if aligned else ()
+        if export.aot_divisibility != required:
+            raise RuntimeError("incompatible GGUF GEMV divisibility contract")
         FLAGGEMS_AOT_EXPORTS += (export,)
         signature = {"weights_u8": "*u8", "weights_f16": "*fp16", "x": "*fp32",
             "output": "*fp32", "k": "i32", "rows": "i32"}
-        compiled = triton.compile(ASTSource(export.function, signature, {}, attrs=export.aot_attributes),
+        attributes = export.aot_attributes
+        if aligned:
+            # The provider checks each operand byte span before this specialization.
+            for index in range(4):
+                attributes[(index,)].append(["tt.pointer_range", 32])
+        compiled = triton.compile(ASTSource(export.function, signature, {}, attrs=attributes),
             target=GPUTarget("hip", arch, 32), options={"num_warps": 1})
         m = compiled.metadata
         if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
@@ -2488,7 +2498,8 @@ def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> Non
         artifact.write_bytes(compiled.asm["hsaco"])
         kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
             "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
-            "block_size": block, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "block_size": block, "tile_m": 16 if aligned else 0,
+            "tile_n": 16 if aligned else 0, "tile_k": 16 if aligned else 0,
             "argument_count": 6, "global_scratch_size": 0, "global_scratch_align": 1,
             "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
     write_manifest(output_dir, arch, kernels)

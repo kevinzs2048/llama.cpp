@@ -1130,6 +1130,29 @@ static const char * amd_quantized_gemv_kernel(flagos_quantized_matmul_kind kind)
     return nullptr;
 }
 
+static const char * amd_aligned_quantized_gemv_kernel(const amd_device_context * device,
+        const ggml_tensor * op, flagos_quantized_matmul_kind kind, int k, int rows) {
+    if (!flagos_amd::supports_aligned_quantized_gemv_bindings(op, k, rows)) {
+        return nullptr;
+    }
+    const char * name = nullptr;
+    switch (kind) {
+        case flagos_quantized_matmul_kind::q4_1: name = "flagos_mul_mat_q4_1_f32_model_aligned"; break;
+        case flagos_quantized_matmul_kind::q8_0: name = "flagos_mul_mat_q8_0_f32_model_aligned"; break;
+        case flagos_quantized_matmul_kind::q4_k: name = "flagos_mul_mat_q4_k_f32_model_aligned"; break;
+        default: return nullptr;
+    }
+    const auto * metadata = device->aot->find(name);
+    if (metadata == nullptr || metadata->symbol != amd_quantized_gemv_kernel(kind) ||
+        metadata->argument_count != 6 || metadata->num_warps != 1 || metadata->warp_size != 32 ||
+        metadata->shared_memory != 0 || metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0 ||
+        metadata->tile_m != 16 || metadata->tile_n != 16 || metadata->tile_k != 16 ||
+        metadata->block_size != (kind == flagos_quantized_matmul_kind::q4_k ? 256 : 32)) {
+        return nullptr;
+    }
+    return name;
+}
+
 static const char * amd_quantized_get_rows_kernel(flagos_quantized_matmul_kind kind) {
     switch (kind) {
         case flagos_quantized_matmul_kind::q4_0: return "flagos_get_rows_q4_0_f32";
@@ -5459,7 +5482,9 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                     narrow_kernel = "flagos_mul_mat_q4_k_f32_narrow";
                     row_tile = 4U;
                 }
-                const char * kernel_name = narrow_kernel != nullptr ? narrow_kernel
+                const char * aligned_kernel = narrow_kernel == nullptr
+                    ? amd_aligned_quantized_gemv_kernel(backend_context->device, node, kind, k, rows) : nullptr;
+                const char * kernel_name = narrow_kernel != nullptr ? narrow_kernel : aligned_kernel != nullptr ? aligned_kernel
                     : amd_quantized_gemv_kernel(kind);
                 flagos_amd::kernel_arguments arguments = {
                     &weights_u8, &weights_f16, &activation_data, &output_data, &k, &rows,
@@ -5489,6 +5514,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                         ? "q40_matmul_narrow" : kind == flagos_quantized_matmul_kind::q5_k
                         ? "q5_matmul_narrow16" : row_tile == 8U
                         ? "q4_matmul_narrow8" : "q4_matmul_narrow4")
+                    : aligned_kernel != nullptr ? "quantized_gemv_model_aligned"
                     : kind == flagos_quantized_matmul_kind::q4_0
                     ? "q40_matmul" : kind == flagos_quantized_matmul_kind::q5_k
                     ? "q5_matmul" : q4 ? "q4_matmul" : "q6_matmul");
