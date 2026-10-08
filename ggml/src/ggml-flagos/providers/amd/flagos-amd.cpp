@@ -493,6 +493,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_QUANT_TILED_GEMM"));
     add(std::getenv("FLAGOS_AMD_TILED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
+    add(std::getenv("FLAGOS_AMD_F16_COPY"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
     add(std::getenv("FLAGOS_AMD_SPLITKV_DECODE"));
@@ -2359,21 +2360,61 @@ static bool amd_supports_concat(const amd_device_context * device, const ggml_te
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
-static bool amd_supports_copy_f32(const amd_device_context * device, const ggml_tensor * op) {
+static const char * amd_copy_kernel_name(const ggml_tensor * op) {
+    return op->type == GGML_TYPE_F16 ? "flagos_copy_strided_f16_bits" : "flagos_copy_strided_f32";
+}
+
+static bool amd_supports_copy(const amd_device_context * device, const ggml_tensor * op) {
+    if (op == nullptr || (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)) {
+        return false;
+    }
+    const bool f16 = op->type == GGML_TYPE_F16;
+    const size_t element_size = f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    if (f16 && !amd_env_enabled("FLAGOS_AMD_F16_COPY")) {
+        return false;
+    }
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         (op->op != GGML_OP_CPY && op->op != GGML_OP_CONT && op->op != GGML_OP_DUP) ||
-        op->src[0] == nullptr || device->aot->find("flagos_copy_strided_f32") == nullptr ||
-        op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
-        op->nb[0] != sizeof(float) || op->src[0]->nb[0] != sizeof(float) ||
-        !amd_tensor_element_offsets_fit_i32(op, sizeof(float)) ||
-        !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
+        op->src[0] == nullptr || device->aot->find(amd_copy_kernel_name(op)) == nullptr ||
+        op->src[0]->type != op->type ||
+        op->nb[0] != element_size || (!f16 && op->src[0]->nb[0] != element_size) ||
+        !amd_tensor_element_offsets_fit_i32(op, element_size) ||
+        !amd_tensor_element_offsets_fit_i32(op->src[0], element_size) ||
         ggml_nelements(op) > INT32_MAX ||
         ggml_nelements(op) != ggml_nelements(op->src[0])) {
         return false;
     }
     if (op->op == GGML_OP_CPY && (op->src[1] == nullptr ||
-        op->src[1]->type != GGML_TYPE_F32 || op->data != op->src[1]->data)) {
+        op->src[1]->type != op->type || op->data != op->src[1]->data)) {
         return false;
+    }
+    if (f16) {
+        const auto * metadata = device->aot->find(amd_copy_kernel_name(op));
+        const auto * output_root = op->view_src == nullptr ? op : op->view_src;
+        const auto * input_root = op->src[0]->view_src == nullptr ? op->src[0] : op->src[0]->view_src;
+        if (metadata->argument_count != 19 || metadata->block_size != 256 ||
+            metadata->num_warps != 4 || metadata->warp_size != 32 || metadata->shared_memory != 0 ||
+            metadata->static_shared_memory != 0 || metadata->global_scratch_size != 0 ||
+            metadata->profile_scratch_size != 0 ||
+            !amd_tensor_data_is_aligned(op, element_size) ||
+            !amd_tensor_data_is_aligned(op->src[0], element_size) || output_root == input_root) {
+            return false;
+        }
+        std::array<std::pair<size_t, int64_t>, GGML_MAX_DIMS> dimensions;
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            dimensions[dim] = {op->nb[dim] / element_size, op->ne[dim]};
+        }
+        std::sort(dimensions.begin(), dimensions.end());
+        size_t covered = 1;
+        for (const auto & dimension : dimensions) {
+            if (dimension.second <= 1) {
+                continue;
+            }
+            if (dimension.first < covered) {
+                return false;
+            }
+            covered += static_cast<size_t>(dimension.second - 1) * dimension.first;
+        }
     }
     if (ggml_nelements(op) == 0) {
         return true;
@@ -5159,7 +5200,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             continue;
         }
         if (ggml_nelements(node) == 0 &&
-            (amd_supports_copy_f32(backend_context->device, node) ||
+            (amd_supports_copy(backend_context->device, node) ||
              amd_supports_scale(backend_context->device, node) ||
              amd_supports_dense_get_rows(backend_context->device, node))) {
             continue;
@@ -5168,8 +5209,10 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             GGML_LOG_ERROR("FlagOS AMD: missing tensor binding for %s\n", ggml_op_name(node->op));
             return GGML_STATUS_FAILED;
         }
-        if (amd_supports_copy_f32(backend_context->device, node)) {
-            const auto * metadata = backend_context->device->aot->find("flagos_copy_strided_f32");
+        if (amd_supports_copy(backend_context->device, node)) {
+            const char * kernel_name = amd_copy_kernel_name(node);
+            const auto * metadata = backend_context->device->aot->find(kernel_name);
+            const size_t element_size = ggml_type_size(node->type);
             int src_ne[GGML_MAX_DIMS];
             int dst_ne[GGML_MAX_DIMS];
             int src_stride[GGML_MAX_DIMS];
@@ -5177,8 +5220,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
                 src_ne[dim] = static_cast<int>(node->src[0]->ne[dim]);
                 dst_ne[dim] = static_cast<int>(node->ne[dim]);
-                src_stride[dim] = static_cast<int>(node->src[0]->nb[dim] / sizeof(float));
-                dst_stride[dim] = static_cast<int>(node->nb[dim] / sizeof(float));
+                src_stride[dim] = static_cast<int>(node->src[0]->nb[dim] / element_size);
+                dst_stride[dim] = static_cast<int>(node->nb[dim] / element_size);
             }
             int n_elements = static_cast<int>(ggml_nelements(node));
             void * src_data = node->src[0]->data;
@@ -5195,7 +5238,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 (static_cast<uint64_t>(n_elements) + metadata->block_size - 1) /
                 metadata->block_size);
             if (!backend_context->device->aot->launch(
-                    "flagos_copy_strided_f32", backend_context->stream,
+                    kernel_name, backend_context->stream,
                     grid_x, 1, 1, arguments)) {
                 return GGML_STATUS_FAILED;
             }
@@ -6076,7 +6119,7 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
         return true;
     }
     return op != nullptr &&
-        (amd_supports_copy_f32(amd_device_from_dev(dev), op) ||
+        (amd_supports_copy(amd_device_from_dev(dev), op) ||
          (op->op == GGML_OP_CONCAT && amd_supports_concat(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_SSM_CONV && amd_supports_ssm_conv(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_L2_NORM && amd_supports_l2_norm(amd_device_from_dev(dev), op)) ||
