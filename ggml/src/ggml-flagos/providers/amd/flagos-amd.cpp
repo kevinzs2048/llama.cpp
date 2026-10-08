@@ -1819,7 +1819,7 @@ static void amd_backend_free(ggml_backend_t backend) {
         // registered until its stream and private resources are idle so a
         // concurrent buffer free cannot miss queued work during teardown.
         std::unique_lock<std::mutex> backends_lock(*device->backends_mutex);
-        std::lock_guard<std::mutex> execution_lock(context->execution_mutex);
+        std::unique_lock<std::mutex> execution_lock(context->execution_mutex);
         amd_log_stats(context);
         if (device->aot != nullptr) {
             device->aot->log_profile();
@@ -1853,6 +1853,7 @@ static void amd_backend_free(ggml_backend_t backend) {
         amd_hip_check(hipStreamDestroy(context->stream), "hipStreamDestroy");
         auto & backends = device->backends;
         backends.erase(std::remove(backends.begin(), backends.end(), context), backends.end());
+        execution_lock.unlock();
         backends_lock.unlock();
         delete context;
     }
