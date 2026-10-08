@@ -225,6 +225,7 @@ struct amd_backend_context {
     uint64_t splitkv_workspace_generation = 0;
     std::mutex execution_mutex;
     flagos_graph_plan_cache graph_plans;
+    uint64_t execution_policy_key = 0;
     uint64_t graph_plan_config_key = 0;
     std::vector<amd_graph_capture_entry> graph_captures;
     std::vector<amd_graph_capture_candidate> graph_capture_candidates;
@@ -463,7 +464,7 @@ static bool amd_candidate_outputs_are(
     return true;
 }
 
-static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
+static uint64_t amd_execution_policy_key() {
     // The graph-plan cache is provider-local, but its lowering decisions are
     // controlled by process configuration. Include all lowering-related
     // switches in a small generation key so tests or embedding applications
@@ -506,6 +507,11 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_Q40_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q40_FFN_DECODE_STAGED"));
     add(std::getenv("FLAGOS_AMD_TUNING_PROFILE"));
+    return hash == 0 ? 1 : hash;
+}
+
+static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
+    uint64_t hash = amd_execution_policy_key();
     // Query results also depend on whether persistent provider-private weight
     // caches are cold, warm, or invalidated. Fold their generation into the
     // same provider-neutral configuration ID used by the common plan cache.
@@ -2016,6 +2022,7 @@ static void amd_backend_synchronize(ggml_backend_t backend) {
 
 static void amd_backend_event_record(ggml_backend_t backend, ggml_backend_event_t event);
 static void amd_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
+static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op);
 
 static bool amd_tensor_is_contiguous_f32(const ggml_tensor * tensor) {
     return tensor != nullptr && tensor->type == GGML_TYPE_F32 &&
@@ -5133,6 +5140,19 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         }
     }
     std::lock_guard<std::mutex> execution_lock(backend_context->execution_mutex);
+    const uint64_t policy_key = amd_execution_policy_key();
+    if (cgraph->n_nodes > 0 && backend_context->execution_policy_key != policy_key) {
+        // A selector change cannot redo GGML placement. Validate the split
+        // before preparation or any state write; leave rejected policies cold.
+        for (int index = 0; index < cgraph->n_nodes; ++index) {
+            if (!amd_device_supports_op(&backend_context->device->device_iface, cgraph->nodes[index])) {
+                GGML_LOG_ERROR("FlagOS AMD: execution policy rejects %s before graph writes; rebuild scheduler placement\n",
+                    ggml_op_name(cgraph->nodes[index]->op));
+                return GGML_STATUS_FAILED;
+            }
+        }
+        backend_context->execution_policy_key = policy_key;
+    }
     if (!amd_hip_check(hipSetDevice(backend_context->device->ordinal), "hipSetDevice")) {
         return GGML_STATUS_FAILED;
     }

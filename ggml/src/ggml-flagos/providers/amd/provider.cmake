@@ -59,4 +59,17 @@ list(APPEND FLAGOS_SOURCES
 list(APPEND FLAGOS_PRIVATE_LIBRARIES hip::host ${CMAKE_DL_LIBS})
 list(APPEND FLAGOS_PRIVATE_DEFINITIONS ${FLAGOS_AMD_PRIVATE_DEFINITIONS} GGML_FLAGOS_HAVE_AMD)
 
+if (UNIX)
+    add_executable(flagos-check-amd-policy-preflight EXCLUDE_FROM_ALL
+        "${CMAKE_CURRENT_LIST_DIR}/tests/check_policy_preflight.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/flagos-amd-hsaco.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/flagos-amd-aot.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/../../flagos-provider.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/../../flagos-target.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/../../flagos-graph-plan.cpp")
+    target_include_directories(flagos-check-amd-policy-preflight PRIVATE "${CMAKE_SOURCE_DIR}/vendor")
+    target_compile_definitions(flagos-check-amd-policy-preflight PRIVATE GGML_FLAGOS_HAVE_AMD)
+    target_link_libraries(flagos-check-amd-policy-preflight PRIVATE ggml-base hip::host ${CMAKE_DL_LIBS})
+endif()
+
 message(STATUS "FlagOS: enabling AMD HIP provider with ROCM_PATH=${ROCM_PATH}")
