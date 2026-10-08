@@ -494,6 +494,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_TILED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
     add(std::getenv("FLAGOS_AMD_F16_COPY"));
+    add(std::getenv("FLAGOS_AMD_BROADCAST_SOFTMAX"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
     add(std::getenv("FLAGOS_AMD_SPLITKV_DECODE"));
@@ -3664,6 +3665,13 @@ static bool amd_launch_flash_attn(amd_backend_context * context, ggml_tensor * n
         static_cast<unsigned int>(q->ne[2]), grid_y, 1, arguments);
 }
 
+static const char * amd_soft_max_kernel_name(const ggml_tensor * mask) {
+    if (mask == nullptr) {
+        return "flagos_soft_max_unmasked_f32";
+    }
+    return mask->type == GGML_TYPE_F32 ? "flagos_soft_max_masked_broadcast_f32" : "flagos_soft_max_masked_f32_f16";
+}
+
 static bool amd_supports_soft_max(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_SOFT_MAX || op->src[0] == nullptr ||
@@ -3691,12 +3699,35 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
         return false;
     }
     const ggml_tensor * mask = op->src[1];
-    const char * kernel = mask == nullptr
-        ? "flagos_soft_max_unmasked_f32" : "flagos_soft_max_masked_f32_f16";
+    const char * kernel = amd_soft_max_kernel_name(mask);
+    const bool broadcast_f32 = mask != nullptr && mask->type == GGML_TYPE_F32;
+    if (broadcast_f32) {
+        if (!amd_env_enabled("FLAGOS_AMD_BROADCAST_SOFTMAX") || !ggml_is_contiguous(mask) ||
+            mask->ne[0] != op->ne[0] || mask->ne[1] < op->ne[1] || mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
+            op->ne[2] % mask->ne[2] != 0 || op->ne[3] % mask->ne[3] != 0 ||
+            ggml_nelements(mask) > INT32_MAX || !amd_tensor_element_offsets_fit_i32(mask, sizeof(float)) ||
+            !amd_tensor_data_is_aligned(op, sizeof(float)) ||
+            !amd_tensor_data_is_aligned(op->src[0], sizeof(float)) ||
+            !amd_tensor_data_is_aligned(mask, sizeof(float))) {
+            return false;
+        }
+        const auto * metadata = device->aot->find(kernel);
+        if (metadata == nullptr || metadata->argument_count != 12 || metadata->block_size != 512 ||
+            metadata->num_warps != 4 || metadata->warp_size != 32 || metadata->shared_memory != 16 ||
+            metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0) {
+            return false;
+        }
+        const auto * output_root = op->view_src == nullptr ? op : op->view_src;
+        const auto * mask_root = mask->view_src == nullptr ? mask : mask->view_src;
+        const auto * input_root = op->src[0]->view_src == nullptr ? op->src[0] : op->src[0]->view_src;
+        if ((output_root == input_root && op->view_offs != op->src[0]->view_offs) || output_root == mask_root) {
+            return false;
+        }
+    }
     if (device->aot->find(kernel) == nullptr) {
         return false;
     }
-    if (mask != nullptr &&
+    if (mask != nullptr && !broadcast_f32 &&
         (mask->type != GGML_TYPE_F16 ||
          mask->ne[0] != op->ne[0] || mask->ne[1] != op->ne[1] ||
          mask->ne[2] != op->ne[2] || mask->ne[3] != op->ne[3] ||
@@ -5730,8 +5761,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         }
         if (node->op == GGML_OP_SOFT_MAX && amd_supports_soft_max(backend_context->device, node)) {
             const ggml_tensor * mask = node->src[1];
-            const char * kernel_name = mask == nullptr
-                ? "flagos_soft_max_unmasked_f32" : "flagos_soft_max_masked_f32_f16";
+            const char * kernel_name = amd_soft_max_kernel_name(mask);
             int n_cols = static_cast<int>(node->ne[0]);
             int rows = static_cast<int>(ggml_nelements(node) / node->ne[0]);
             float scale = 1.0f;
@@ -5740,9 +5770,26 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             flagos_amd::kernel_arguments arguments = {
                 &node->src[0]->data, &mask_data, &node->data, &n_cols, &scale,
             };
-            const unsigned int grid_x = static_cast<unsigned int>(rows);
-            const bool launched = backend_context->device->aot->launch(
-                kernel_name, backend_context->stream, grid_x, 1, 1, arguments);
+            bool launched = false;
+            if (mask != nullptr && mask->type == GGML_TYPE_F32) {
+                int n_rows = static_cast<int>(node->ne[1]);
+                int n_heads = static_cast<int>(node->ne[2]);
+                int mask_heads = static_cast<int>(mask->ne[2]);
+                int mask_samples = static_cast<int>(mask->ne[3]);
+                int mask_stride_row = static_cast<int>(mask->nb[1] / sizeof(float));
+                int mask_stride_head = static_cast<int>(mask->nb[2] / sizeof(float));
+                int mask_stride_sample = static_cast<int>(mask->nb[3] / sizeof(float));
+                flagos_amd::kernel_arguments broadcast_arguments = {
+                    &node->src[0]->data, &mask_data, &node->data, &n_cols, &n_rows, &n_heads,
+                    &mask_heads, &mask_samples, &mask_stride_row, &mask_stride_head, &mask_stride_sample, &scale,
+                };
+                launched = backend_context->device->aot->launch(kernel_name, backend_context->stream,
+                    static_cast<unsigned int>(n_rows), static_cast<unsigned int>(n_heads),
+                    static_cast<unsigned int>(node->ne[3]), broadcast_arguments);
+            } else {
+                launched = backend_context->device->aot->launch(kernel_name, backend_context->stream,
+                    static_cast<unsigned int>(rows), 1, 1, arguments);
+            }
             if (!launched) {
                 return GGML_STATUS_FAILED;
             }
