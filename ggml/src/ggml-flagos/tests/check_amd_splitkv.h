@@ -14,20 +14,21 @@ struct splitkv_check_case {
     ggml_cgraph * graph = nullptr;
     std::vector<ggml_tensor *> tensors;
     std::vector<ggml_backend_buffer_t> buffers;
-    int width, heads, keys, group;
+    int width, heads, keys, group, kv_heads;
 
     splitkv_check_case(ggml_backend_t backend_, ggml_backend_dev_t dev,
-            ggml_backend_buffer_type_t buft, int width_, int group_, int keys_, bool padded):
-        backend(backend_), width(width_), heads(group_ * 2), keys(keys_), group(group_) {
+            ggml_backend_buffer_type_t buft, int width_, int group_, int keys_, bool padded, int heads_override = 0):
+        backend(backend_), width(width_), heads(heads_override > 0 ? heads_override : group_ * 2),
+        keys(keys_), group(group_), kv_heads(heads / group) {
         ctx = ggml_init({2u << 20, nullptr, true});
         CHECK(ctx);
         q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, heads);
-        k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, width, keys, 2);
-        v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, width, keys, 2);
+        k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, width, keys, kv_heads);
+        v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, width, keys, kv_heads);
         mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, keys);
         q->nb[1] = (width + (padded ? 4 : 0)) * heads * sizeof(float);
         q->nb[2] = (width + (padded ? 4 : 0)) * sizeof(float);
-        k->nb[1] = (2 * width + (padded ? 8 : 0)) * sizeof(ggml_fp16_t);
+        k->nb[1] = (kv_heads * width + (padded ? 8 : 0)) * sizeof(ggml_fp16_t);
         k->nb[2] = width * sizeof(ggml_fp16_t);
         v->nb[1] = k->nb[1];
         v->nb[2] = k->nb[2];
@@ -78,7 +79,7 @@ struct splitkv_check_case {
             }
         }
         for (int t = 0; t < keys; ++t) {
-            for (int h = 0; h < 2; ++h) {
+            for (int h = 0; h < kv_heads; ++h) {
                 for (int d = 0; d < width; ++d) {
                     k_host[t * kt + h * kh + d] = ggml_fp32_to_fp16(
                         0.5f * std::sin(float(d + 7 * t + h + state) * 0.113f));
@@ -174,5 +175,27 @@ static void check_amd_splitkv_decode(ggml_backend_t backend, ggml_backend_dev_t 
     }
     CHECK(cases == 108);
     std::printf("GGML_SPLITKV_COMPLETE cases=108 old_graph_after_growth=3 full_FP64=1 "
+        "guards_inputs_unchanged=1 eager_repeat_bitwise=1 max_error=%.9g\n", max_error);
+}
+
+static void check_amd_grouped_splitkv_decode(ggml_backend_t backend, ggml_backend_dev_t dev,
+        ggml_backend_buffer_type_t buft) {
+    int cases = 0;
+    double max_error = 0.0;
+    for (int width : {128, 256}) {
+        for (int group : {2, 4, 8}) {
+            for (int keys : {4096, 4097, 8192}) {
+                for (bool padded : {false, true}) {
+                    splitkv_check_case test(backend, dev, buft, width, group, keys, padded, 16);
+                    for (int state = 0; state < 3; ++state) {
+                        max_error = std::max(max_error, test.run(state));
+                        ++cases;
+                    }
+                }
+            }
+        }
+    }
+    CHECK(cases == 108);
+    std::printf("GGML_GROUPED_SPLITKV_COMPLETE cases=108 heads=16 full_FP64=1 "
         "guards_inputs_unchanged=1 eager_repeat_bitwise=1 max_error=%.9g\n", max_error);
 }

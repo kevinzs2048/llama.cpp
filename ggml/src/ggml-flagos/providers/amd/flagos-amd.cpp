@@ -290,6 +290,7 @@ struct amd_backend_context {
         std::atomic<uint64_t> flash_attn_decode { 0 };
         std::atomic<uint64_t> flash_attn_prefill { 0 };
         std::atomic<uint64_t> splitkv_decode { 0 };
+        std::atomic<uint64_t> splitkv_grouped_decode { 0 };
         std::atomic<uint64_t> splitkv_workspace_allocations { 0 };
         std::atomic<uint64_t> soft_max { 0 };
         std::atomic<uint64_t> host_to_device_copies { 0 };
@@ -495,6 +496,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
     add(std::getenv("FLAGOS_AMD_SPLITKV_DECODE"));
+    add(std::getenv("FLAGOS_AMD_GROUPED_SPLITKV_DECODE"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW"));
@@ -748,8 +750,9 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) s.graph_replays.load(),
         (unsigned long long) s.graph_replay_failures.load(),
         (unsigned long long) s.graph_capture_failures.load());
-    GGML_LOG_INFO("FlagOS AMD split-KV stats: decode_pairs=%llu workspace_allocations=%llu capacity=%zu generation=%llu\n",
+    GGML_LOG_INFO("FlagOS AMD split-KV stats: decode_pairs=%llu grouped_pairs=%llu workspace_allocations=%llu capacity=%zu generation=%llu\n",
         (unsigned long long) s.splitkv_decode.load(),
+        (unsigned long long) s.splitkv_grouped_decode.load(),
         (unsigned long long) s.splitkv_workspace_allocations.load(),
         context->splitkv_workspace_capacity,
         (unsigned long long) context->splitkv_workspace_generation);
@@ -3339,8 +3342,43 @@ static bool amd_supports_flash_attn_decode(const amd_device_context * device, co
         !amd_tensor_data_overlaps(op, v) && !amd_tensor_data_overlaps(op, mask);
 }
 
+static const flagos_amd::kernel_metadata * amd_grouped_splitkv_kernel(
+        const amd_device_context * device, const ggml_tensor * op) {
+    if (!amd_env_enabled("FLAGOS_AMD_GROUPED_SPLITKV_DECODE") || op->ne[1] != 16 ||
+        op->src[1] == nullptr || op->src[1]->ne[2] <= 0) {
+        return nullptr;
+    }
+    static const struct { int head; int group; const char * name; } profiles[] = {
+        {128, 2, "flagos_flash_decode_splitkv_grouped_f32_f16_h128_g2"},
+        {128, 4, "flagos_flash_decode_splitkv_grouped_f32_f16_h128_g4"},
+        {128, 8, "flagos_flash_decode_splitkv_grouped_f32_f16_h128_g8"},
+        {256, 8, "flagos_flash_decode_splitkv_grouped_f32_f16_h256_g8"},
+    };
+    const int64_t group = op->ne[1] / op->src[1]->ne[2];
+    for (const auto & profile : profiles) {
+        if (op->ne[0] != profile.head || group != profile.group) {
+            continue;
+        }
+        const auto * metadata = device->aot->find(profile.name);
+        if (metadata != nullptr && metadata->argument_count == 18 &&
+            metadata->symbol == "flagos_flash_decode_splitkv_grouped_partial_f32_f16" &&
+            metadata->tile_m == 16 && metadata->tile_n == 16 && metadata->tile_k == profile.head &&
+            metadata->block_size == 16 && metadata->num_warps == 4 && metadata->warp_size == 32 &&
+            metadata->shared_memory == (profile.head == 128 ? 4096 : 8192) &&
+            metadata->global_scratch_size == 0 && metadata->profile_scratch_size == 0) {
+            return metadata;
+        }
+    }
+    return nullptr;
+}
+
 static const flagos_amd::kernel_metadata * amd_splitkv_kernel(
         const amd_device_context * device, const ggml_tensor * op, bool merge) {
+    if (!merge) {
+        if (const auto * grouped = amd_grouped_splitkv_kernel(device, op)) {
+            return grouped;
+        }
+    }
     const char * name = merge
         ? (op->ne[0] == 256 ? "flagos_flash_decode_splitkv_merge_f32_h256" : "flagos_flash_decode_splitkv_merge_f32_h128")
         : (op->ne[0] == 256 ? "flagos_flash_decode_splitkv_partial_f32_f16_h256" : "flagos_flash_decode_splitkv_partial_f32_f16_h128");
@@ -3508,6 +3546,7 @@ static bool amd_launch_flash_attn(amd_backend_context * context, ggml_tensor * n
         }
         const auto * partial = amd_splitkv_kernel(context->device, node, false);
         const auto * merge = amd_splitkv_kernel(context->device, node, true);
+        const bool grouped = partial->tile_m == 16;
         void * partial_m = context->splitkv_workspace;
         void * partial_l = static_cast<float *>(partial_m) + geometry.partial_elements;
         void * partial_a = static_cast<float *>(partial_l) + geometry.partial_elements;
@@ -3516,7 +3555,8 @@ static bool amd_launch_flash_attn(amd_backend_context * context, ggml_tensor * n
             &stride_q_token, &stride_q_head, &stride_k_token, &stride_k_head,
             &stride_v_token, &stride_v_head, &scale);
         if (!context->device->aot->launch(partial->name, context->stream,
-                static_cast<unsigned int>(geometry.heads), static_cast<unsigned int>(geometry.splits), 1, arguments)) {
+                static_cast<unsigned int>(grouped ? geometry.heads / q_per_kv : geometry.heads),
+                static_cast<unsigned int>(geometry.splits), 1, arguments)) {
             return false;
         }
         arguments.assign(&partial_m, &partial_l, &partial_a, &output_data,
@@ -3526,8 +3566,11 @@ static bool amd_launch_flash_attn(amd_backend_context * context, ggml_tensor * n
             return false;
         }
         context->stats.splitkv_decode.fetch_add(1, std::memory_order_relaxed);
+        if (grouped) {
+            context->stats.splitkv_grouped_decode.fetch_add(1, std::memory_order_relaxed);
+        }
         context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
-        amd_trace_op(context, node, "flash_attn_decode_splitkv");
+        amd_trace_op(context, node, grouped ? "flash_attn_decode_grouped_splitkv" : "flash_attn_decode_splitkv");
         return true;
     }
     if (prefill) {
@@ -3916,6 +3959,9 @@ static flagos_lowering_choice amd_query_fusion(
             choice.supported = true;
             choice.capture_safe = true;
             choice.implementation_id = amd_splitkv_ready(context, attention) ? 20 : 3;
+            if (choice.implementation_id == 20 && amd_grouped_splitkv_kernel(context->device, attention) != nullptr) {
+                choice.implementation_id = 21;
+            }
         }
     } else if (candidate.id == flagos_pattern_id::flash_attn_prefill && candidate.node_indices.size() == 1) {
         const ggml_tensor * attention = cgraph->nodes[candidate.node_indices[0]];

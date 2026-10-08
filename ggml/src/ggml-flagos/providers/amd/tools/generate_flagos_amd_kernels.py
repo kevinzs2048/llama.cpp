@@ -2359,6 +2359,47 @@ def compile_splitkv_decode_package_without_launch(output_dir: Path, arch: str) -
     write_manifest(output_dir, arch, kernels)
 
 
+
+def compile_grouped_splitkv_decode_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the four independently qualified gfx1150 grouped profiles."""
+    global FLAGGEMS_AOT_EXPORTS
+    if arch != "gfx1150" or not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("flash-decode-grouped-splitkv requires gfx1150 and FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_flash_decode_splitkv_grouped_partial_f32_f16"
+    runtime = ("q", "k", "v", "mask", "partial_m", "partial_l", "partial_a",
+        "key_length", "q_per_kv", "split_count", "keys_per_split", "stride_q_token",
+        "stride_q_head", "stride_k_token", "stride_k_head", "stride_v_token", "stride_v_head", "scale")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.flash_decode_splitkv.grouped_partial_m_l_a.q_round_f16.kv_f16.p_tile_f16.dot_acc_f32.head128_256.gqa2_4_8.explicit_workspace.single_query.all_masked_zero.v1",
+        runtime_arguments=runtime, constexpr_arguments=("HEAD_DIM", "BLOCK_KV", "Q_PER_KV", "BLOCK_Q"))
+    if export.aot_divisibility:
+        raise RuntimeError("generic grouped split-KV must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    pointer_types = {"q": "*fp32", "k": "*fp16", "v": "*fp16", "mask": "*fp16",
+        "partial_m": "*fp32", "partial_l": "*fp32", "partial_a": "*fp32"}
+    signature = {argument: pointer_types.get(argument, "fp32" if argument == "scale" else "i32")
+        for argument in runtime}
+    signature.update({argument: "constexpr" for argument in export.constexpr_arguments})
+    kernels = []
+    for head, group in ((128, 2), (128, 4), (128, 8), (256, 8)):
+        constants = {"HEAD_DIM": head, "BLOCK_KV": 16, "Q_PER_KV": group, "BLOCK_Q": 16}
+        compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+            target=GPUTarget("hip", arch, 32),
+            options={"num_warps": 4, "num_stages": 1, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("grouped split-KV requires unsupported Triton scratch storage")
+        kernel_name = "flagos_flash_decode_splitkv_grouped_f32_f16_h" + str(head) + "_g" + str(group)
+        artifact = output_dir / (kernel_name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": kernel_name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 16, "tile_m": 16, "tile_n": 16, "tile_k": head,
+            "argument_count": 18, "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_ggml_rope_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the no-YaRN GGML frequency-recurrence RoPE export."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3365,7 +3406,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "flash-attention", "flash-decode-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3415,6 +3456,8 @@ def main() -> None:
             compile_flash_attention_package_without_launch(args.output_dir, args.arch, args.flash_attention_profile or "baseline")
         elif args.extension == "flash-decode-splitkv":
             compile_splitkv_decode_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "flash-decode-grouped-splitkv":
+            compile_grouped_splitkv_decode_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "ggml-rope":
             compile_ggml_rope_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "q6-gemv":

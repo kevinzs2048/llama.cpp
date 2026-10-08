@@ -36,6 +36,7 @@ int main(int argc, char ** argv) {
     bool require_gdn_gate_projections = false;
     bool require_generic_attention = false;
     bool require_splitkv_decode = false;
+    bool require_grouped_splitkv_decode = false;
     bool require_ggml_rope = false;
     bool require_view_alignment = false;
     for (int argument = 1; argument < argc; ++argument) {
@@ -49,6 +50,8 @@ int main(int argc, char ** argv) {
             require_view_alignment = true;
         } else if (std::strcmp(argv[argument], "--require-splitkv-decode") == 0) {
             require_splitkv_decode = true;
+        } else if (std::strcmp(argv[argument], "--require-grouped-splitkv-decode") == 0) {
+            require_grouped_splitkv_decode = true;
         } else if (std::strcmp(argv[argument], "--require-ggml-rope") == 0) {
             require_ggml_rope = true;
         } else if (std::strcmp(argv[argument], "--require-generic-attention") == 0) {
@@ -56,7 +59,7 @@ int main(int argc, char ** argv) {
         } else {
             std::fprintf(stderr,
                 "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate] "
-                "[--require-gdn-gate-projections] [--require-generic-attention] [--require-ggml-rope] [--require-view-alignment] [--require-splitkv-decode]\n",
+                "[--require-gdn-gate-projections] [--require-generic-attention] [--require-ggml-rope] [--require-view-alignment] [--require-splitkv-decode] [--require-grouped-splitkv-decode]\n",
                 argv[0]);
             return 2;
         }
@@ -2212,6 +2215,9 @@ int main(int argc, char ** argv) {
     if (require_splitkv_decode) {
         CHECK(!package_dir.empty());
         check_amd_splitkv_decode(backend, dev, buft);
+    }
+    if (require_grouped_splitkv_decode) {
+        check_amd_grouped_splitkv_decode(backend, dev, buft);
     }
 
     ggml_backend_free(backend);
