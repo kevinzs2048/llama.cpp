@@ -193,11 +193,17 @@ def main() -> int:
         action="store_true",
         help="print machine-readable status with --check-only",
     )
+    parser.add_argument(
+        "--continuous-health-guard", action="store_true",
+        help="continue healthy serialized runs without a per-boot count ceiling",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command and args.command[0] == "--" else args.command
     if args.timeout <= 0 or (args.max_processes_per_boot is not None and args.max_processes_per_boot <= 0):
         parser.error("limits must be positive")
+    if args.continuous_health_guard and args.max_processes_per_boot is not None:
+        parser.error("continuous health mode cannot be combined with a count limit")
     if args.check_only and command:
         parser.error("--check-only does not accept a command")
     if args.json and not args.check_only:
@@ -331,7 +337,8 @@ def main() -> int:
                     "commands_succeeded": succeeded,
                     "commands_failed": failed,
                     "limit": limit,
-                    "remaining": max(0, limit - started),
+                    "remaining": None if args.continuous_health_guard else max(0, limit - started),
+                    "count_limit_enforced": not args.continuous_health_guard,
                 }, separators=(",", ":")))
                 return 0
             if limit_recorded or args.max_processes_per_boot is not None:
@@ -344,7 +351,7 @@ def main() -> int:
                 f"{succeeded} succeeded, {failed} failed"
             )
             return 0
-        if started >= limit:
+        if not args.continuous_health_guard and started >= limit:
             print(
                 "FlagOS AMD guard: per-boot model-process limit reached; "
                 "use repetitions inside one process or reboot before another A/B pair",
@@ -406,7 +413,9 @@ def main() -> int:
 
             state.pop("processes_started", None)
             state["commands_started"] = started + 1
-            state["last_process_limit"] = limit
+            if not args.continuous_health_guard:
+                state["last_process_limit"] = limit
+            state["last_count_limit_mode"] = "continuous-health" if args.continuous_health_guard else "bounded"
             state["last_started_unix"] = int(time.time())
             state["last_command"] = command
             try:
