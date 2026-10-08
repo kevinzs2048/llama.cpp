@@ -2579,6 +2579,37 @@ def compile_rows_package_without_launch(output_dir: Path, arch: str) -> None:
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_softmax_broadcast_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile a separate F32-mask softmax package for GGML head broadcasts."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("softmax-broadcast requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    runtime = ("x", "mask_ptr", "output", "n_cols", "n_rows", "n_heads", "mask_heads", "mask_samples",
+        "mask_stride_row", "mask_stride_head", "mask_stride_sample", "scale")
+    export, _, _, _ = load_flaggems_aot_export(name="flagos_soft_max_masked_broadcast_f32",
+        semantic="ggml.soft_max.f32.mask_f32.head_sample_modulo.strides.scale.no_alibi_no_sinks.valid_row.v1",
+        runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("generic softmax must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "*fp32" if argument in ("x", "mask_ptr", "output") else
+        "fp32" if argument == "scale" else "i32" for argument in runtime}
+    signature["BLOCK"] = "constexpr"
+    with amd_hint_context():
+        compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 512}, attrs={}),
+            target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("softmax requires unsupported Triton scratch storage")
+    artifact = output_dir / (export.name + ".hsaco")
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": export.name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 512, "tile_m": 0, "tile_n": 0, "tile_k": 0, "argument_count": len(runtime),
+        "global_scratch_size": 0, "global_scratch_align": getattr(m, "global_scratch_align", 1),
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
 def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile generic and explicitly aligned GGUF GEMV library exports."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3534,7 +3565,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3598,6 +3629,8 @@ def main() -> None:
             compile_core_ops_package_without_launch(args.output_dir, args.arch, graph_ops=True)
         elif args.extension == "row-ops":
             compile_rows_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "softmax-broadcast":
+            compile_softmax_broadcast_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":
             compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "matrix-stage1":
