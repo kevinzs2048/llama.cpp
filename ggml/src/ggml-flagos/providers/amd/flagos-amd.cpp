@@ -1125,7 +1125,8 @@ static const char * amd_quantized_get_rows_kernel(flagos_quantized_matmul_kind k
 }
 
 static const char * amd_quantized_batched_kernel(const amd_device_context * device,
-                                                 flagos_quantized_matmul_kind kind) {
+                                                 flagos_quantized_matmul_kind kind,
+                                                 bool allow_f16) {
     if (kind == flagos_quantized_matmul_kind::q4_0) {
         return "flagos_mul_mat_q4_0_f32_batched";
     }
@@ -1141,7 +1142,7 @@ static const char * amd_quantized_batched_kernel(const amd_device_context * devi
         return nullptr;
     }
     const bool q4 = kind == flagos_quantized_matmul_kind::q4_k;
-    if (amd_quant_tiled_enabled()) {
+    if (allow_f16 && amd_quant_tiled_enabled()) {
         const char * tiled = q4 ? "flagos_mul_mat_q4_k_f32_tiled" :
             kind == flagos_quantized_matmul_kind::q5_k ? nullptr : "flagos_mul_mat_q6_k_f32_tiled";
         if (tiled != nullptr && device != nullptr && device->aot != nullptr &&
@@ -2687,7 +2688,7 @@ static bool amd_supports_quantized_mul_mat(const amd_device_context * device, co
     }
     const char * kernel = signature.columns == 1
         ? amd_quantized_gemv_kernel(signature.weight_kind)
-        : amd_quantized_batched_kernel(device, signature.weight_kind);
+        : amd_quantized_batched_kernel(device, signature.weight_kind, precision == GGML_PREC_DEFAULT);
     return kernel != nullptr && device->aot->find(kernel) != nullptr &&
         !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
@@ -5288,7 +5289,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                     ? "q5_matmul" : q4 ? "q4_matmul" : "q6_matmul");
             } else {
                 const char * kernel_name = amd_quantized_batched_kernel(
-                    backend_context->device, kind);
+                    backend_context->device, kind, amd_allows_f16_matmul(node));
                 // Execute must remain fail-closed even if a future kind or
                 // runtime policy diverges from the earlier supports_op query.
                 if (kernel_name == nullptr) {
