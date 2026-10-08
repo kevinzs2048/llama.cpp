@@ -956,8 +956,17 @@ static bool amd_prefill_f16_gemm_enabled(const amd_device_context * device) {
 }
 
 static bool amd_allows_f16_matmul(const ggml_tensor * op) {
-    return op != nullptr && op->op == GGML_OP_MUL_MAT &&
-        ggml_get_op_params_i32(op, 0) == GGML_PREC_DEFAULT;
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT ||
+        ggml_get_op_params_i32(op, 0) != GGML_PREC_DEFAULT) {
+        return false;
+    }
+#if GGML_BACKEND_API_VERSION >= 3
+    const int32_t source_precision = ggml_get_op_params_i32(op, 3);
+    return source_precision == GGML_PREC_DEFAULT || source_precision == GGML_PREC_F16 ||
+        source_precision == GGML_PREC_Q8 || source_precision == GGML_PREC_Q4;
+#else
+    return true;
+#endif
 }
 
 static bool amd_ffn_down_f16_enabled(const amd_device_context * device) {
@@ -2767,7 +2776,7 @@ static bool amd_supports_quantized_mul_mat(const amd_device_context * device, co
     }
     const char * kernel = signature.columns == 1
         ? amd_quantized_gemv_kernel(signature.weight_kind)
-        : amd_quantized_batched_kernel(device, signature.weight_kind, precision == GGML_PREC_DEFAULT);
+        : amd_quantized_batched_kernel(device, signature.weight_kind, amd_allows_f16_matmul(op));
     return kernel != nullptr && device->aot->find(kernel) != nullptr &&
         !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);

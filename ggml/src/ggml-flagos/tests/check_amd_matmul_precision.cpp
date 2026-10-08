@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "../../ggml-backend-impl.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -34,7 +35,7 @@ static void observe_policy_log(enum ggml_log_level, const char * text, void * us
 }
 
 static std::vector<float> run(bool forced_f32, bool prefill_f16, bool ffn = false, bool switch_policy = false,
-        ggml_type weight_type = GGML_TYPE_Q4_K, float activation_scale = 1.0013f) {
+        ggml_type weight_type = GGML_TYPE_Q4_K, float activation_scale = 1.0013f, int source_precision = 0) {
     constexpr int k = 1024, rows = 64, columns = 8;
     setenv("FLAGOS_AMD_PREFILL_F16_GEMM", prefill_f16 ? "1" : "0", 1);
     auto * backend = ggml_backend_init_by_name("FlagOS:AMD:0", nullptr);
@@ -49,6 +50,12 @@ static std::vector<float> run(bool forced_f32, bool prefill_f16, bool ffn = fals
     auto * up = ffn ? ggml_mul_mat(ec, up_weights, x) : nullptr;
     ggml_mul_mat_set_prec(out, forced_f32 ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
     if (up) ggml_mul_mat_set_prec(up, forced_f32 ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
+#if GGML_BACKEND_API_VERSION >= 3
+    require(ggml_prec_set_src(out, static_cast<ggml_prec>(source_precision), 1), "source precision");
+    if (up) require(ggml_prec_set_src(up, static_cast<ggml_prec>(source_precision), 1), "FFN source precision");
+#else
+    (void) source_precision;
+#endif
     require(ggml_backend_dev_supports_op(ggml_backend_get_device(backend), out), "supports matrix");
     if (ffn) out = ggml_swiglu_split(ec, out, up);
     if (switch_policy) {
@@ -245,6 +252,25 @@ int main(int argc, char ** argv) {
         const auto tiled_large = run(true, false, false, false, type, 100000.0f);
         require(same(large, tiled_large), "forced F32 large input changed with quantized tiled policy");
     }
+
+#if GGML_BACKEND_API_VERSION >= 3
+    setenv("FLAGOS_AMD_QUANT_TILED_GEMM", "1", 1);
+    for (const auto source_precision : {GGML_PREC_F32, GGML_PREC_BF16}) {
+        for (const auto weight_type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+            for (const bool ffn : {false, true}) {
+                const auto reference = run(true, false, ffn, false, weight_type);
+                const auto plain = run(false, false, ffn, false, weight_type, 1.0013f, source_precision);
+                const auto half = run(false, true, ffn, false, weight_type, 1.0013f, source_precision);
+                require(same(plain, reference), "source precision changed F32 direct output");
+                require(same(half, reference), "source precision allowed F16 activation conversion");
+            }
+            const auto large_reference = run(true, false, false, false, weight_type, 100000.0f);
+            const auto large = run(false, true, false, false, weight_type, 100000.0f, source_precision);
+            require(same(large, large_reference), "source precision overflowed F16 range");
+        }
+    }
+    std::puts("AMD API3 source precision contracts passed cases=12");
+#endif
     unsetenv("FLAGOS_AMD_QUANT_TILED_GEMM");
     std::puts("AMD quantized tiled forced F32 contracts passed");
     run(true, false, false, true);
