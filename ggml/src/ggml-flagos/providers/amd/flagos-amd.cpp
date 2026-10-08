@@ -497,6 +497,7 @@ static uint64_t amd_execution_policy_key() {
     add(std::getenv("FLAGOS_AMD_F16_COPY"));
     add(std::getenv("FLAGOS_AMD_BROADCAST_SOFTMAX"));
     add(std::getenv("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM"));
+    add(std::getenv("FLAGOS_AMD_DENSE_FLOAT_OPS"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
     add(std::getenv("FLAGOS_AMD_SPLITKV_DECODE"));
@@ -2768,6 +2769,40 @@ static bool amd_supports_dense_get_rows(const amd_device_context * device, const
                                 !amd_tensor_data_overlaps(op, op->src[1])));
 }
 
+static const char * amd_half_get_rows_kernel_name(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr) {
+        return nullptr;
+    }
+    return op->src[0]->type == GGML_TYPE_F16 ? "flagos_get_rows_f16_f32"
+        : op->src[0]->type == GGML_TYPE_BF16 ? "flagos_get_rows_bf16_bits_f32" : nullptr;
+}
+
+static bool amd_supports_half_get_rows(const amd_device_context * device, const ggml_tensor * op) {
+    flagos_amd::dense_gather_signature signature;
+    const char * kernel = amd_half_get_rows_kernel_name(op);
+    if (!amd_env_enabled("FLAGOS_AMD_DENSE_FLOAT_OPS") || device == nullptr ||
+        device->aot == nullptr || kernel == nullptr ||
+        !flagos_amd::describe_dense_gather_storage(op, &signature, op->src[0]->type) ||
+        (int64_t(signature.columns) + 255) / 256 > 65535 ||
+        !amd_tensor_data_is_aligned(op, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[0], sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t))) {
+        return false;
+    }
+    for (const auto * source : {op->src[0], op->src[1]}) {
+        const auto * output_root = op->view_src == nullptr ? op : op->view_src;
+        const auto * source_root = source->view_src == nullptr ? source : source->view_src;
+        if (output_root == source_root || amd_tensor_data_overlaps(op, source)) {
+            return false;
+        }
+    }
+    const auto * metadata = device->aot->find(kernel);
+    return metadata != nullptr && metadata->argument_count == 5 && metadata->block_size == 256 &&
+        metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == 0 &&
+        metadata->static_shared_memory == 0 && metadata->global_scratch_size == 0 &&
+        metadata->profile_scratch_size == 0;
+}
+
 static bool amd_supports_get_rows(const amd_device_context * device, const ggml_tensor * op) {
     const flagos_quantized_matmul_kind kind = op == nullptr || op->src[0] == nullptr
         ? flagos_quantized_matmul_kind::none : amd_quantized_kind(op->src[0]->type);
@@ -2811,7 +2846,7 @@ static bool amd_i32_matrix_offsets_fit(
         signature.rows <= limit / signature.columns;
 }
 
-static const char * amd_strided_batched_f16_kernel_name(const ggml_tensor * op) {
+static const char * amd_strided_batched_float_kernel_name(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_MUL_MAT) {
         return nullptr;
     }
@@ -2833,58 +2868,32 @@ static const char * amd_strided_batched_f16_kernel_name(const ggml_tensor * op) 
         preserve_src1 = preserve_src1 || minimum == GGML_PREC_F32 || minimum == GGML_PREC_BF16;
     }
 #endif
+    if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32) {
+        return "flagos_mul_mat_f32_f32_strided_batched_ieee";
+    }
     return preserve_src1 ? "flagos_mul_mat_f16_f32_strided_batched_ieee"
                          : "flagos_mul_mat_f16_f32_strided_batched";
 }
 
-static bool amd_supports_strided_batched_f16_mul_mat(
+static bool amd_supports_strided_batched_float_mul_mat(
         const amd_device_context * device, const ggml_tensor * op) {
-    if (!amd_env_enabled("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM") ||
-        device == nullptr || device->aot == nullptr || op == nullptr ||
-        op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr ||
-        op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F16 ||
-        op->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+    flagos_amd::strided_float_matmul_signature signature;
+    if (device == nullptr || device->aot == nullptr ||
+        !flagos_amd::describe_strided_float_matmul(op, &signature)) {
         return false;
     }
-    const char * kernel = amd_strided_batched_f16_kernel_name(op);
+    const bool f16_weights = op->src[0]->type == GGML_TYPE_F16;
+    if (!amd_env_enabled(f16_weights ? "FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM" : "FLAGOS_AMD_DENSE_FLOAT_OPS")) {
+        return false;
+    }
+    const char * kernel = amd_strided_batched_float_kernel_name(op);
     if (kernel == nullptr) {
         return false;
     }
     const auto * weights = op->src[0];
     const auto * input = op->src[1];
-    if (weights->ne[0] != input->ne[0] || op->ne[0] != weights->ne[1] ||
-        op->ne[1] != input->ne[1] || op->ne[2] != input->ne[2] ||
-        op->ne[3] != input->ne[3] || weights->nb[0] != sizeof(ggml_fp16_t) ||
-        input->nb[0] != sizeof(float)) {
-        return false;
-    }
-    int64_t output_elements = 1;
-    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
-        if (op->ne[dim] <= 0 || op->ne[dim] > INT32_MAX / output_elements) {
-            return false;
-        }
-        output_elements *= op->ne[dim];
-    }
-    if ((op->ne[1] + 15) / 16 > 65535 || op->ne[2] * op->ne[3] > 65535) {
-        return false;
-    }
-    // Check the sums that the kernel actually forms, without overflowing a
-    // size_t byte span or narrowing a large stride to an i32 launch argument.
     for (const auto * source : {weights, input}) {
-        const size_t element_size = source == weights ? sizeof(ggml_fp16_t) : sizeof(float);
-        int64_t last_element = 0;
-        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
-            if (source->ne[dim] <= 0 || source->ne[dim] > INT32_MAX ||
-                source->nb[dim] % element_size != 0 ||
-                source->nb[dim] / element_size > INT32_MAX) {
-                return false;
-            }
-            const int64_t stride = source->nb[dim] / element_size;
-            if (stride != 0 && source->ne[dim] - 1 > (INT32_MAX - last_element) / stride) {
-                return false;
-            }
-            last_element += (source->ne[dim] - 1) * stride;
-        }
+        const size_t element_size = source == weights ? signature.weight_element_size : sizeof(float);
         const auto * output_root = op->view_src == nullptr ? op : op->view_src;
         const auto * source_root = source->view_src == nullptr ? source : source->view_src;
         if (!amd_tensor_data_is_aligned(source, element_size) || output_root == source_root ||
@@ -2892,12 +2901,11 @@ static bool amd_supports_strided_batched_f16_mul_mat(
             return false;
         }
     }
-    if (input->ne[2] % weights->ne[2] != 0 || input->ne[3] % weights->ne[3] != 0 ||
-        !amd_tensor_data_is_aligned(op, sizeof(float))) {
+    if (!amd_tensor_data_is_aligned(op, sizeof(float))) {
         return false;
     }
     const auto * metadata = device->aot->find(kernel);
-    const size_t shared = std::strcmp(kernel, "flagos_mul_mat_f16_f32_strided_batched_ieee") == 0 ? 6144 : 4096;
+    const size_t shared = std::strcmp(kernel, "flagos_mul_mat_f16_f32_strided_batched") == 0 ? 4096 : 6144;
     return metadata != nullptr && metadata->argument_count == 15 && metadata->block_size == 32 &&
         metadata->tile_m == 32 && metadata->tile_n == 16 && metadata->tile_k == 32 &&
         metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == shared &&
@@ -5586,35 +5594,51 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, "get_rows");
             continue;
         }
-        if (amd_supports_strided_batched_f16_mul_mat(backend_context->device, node)) {
-            void * weights_data = node->src[0]->data;
-            void * input_data = node->src[1]->data;
-            void * output_data = node->data;
-            int k = static_cast<int>(node->src[0]->ne[0]);
-            int rows = static_cast<int>(node->ne[0]);
-            int columns = static_cast<int>(node->ne[1]);
-            int heads = static_cast<int>(node->ne[2]);
-            int head_ratio = heads / static_cast<int>(node->src[0]->ne[2]);
-            int sample_ratio = static_cast<int>(node->ne[3] / node->src[0]->ne[3]);
-            int sw1 = static_cast<int>(node->src[0]->nb[1] / sizeof(ggml_fp16_t));
-            int sw2 = static_cast<int>(node->src[0]->nb[2] / sizeof(ggml_fp16_t));
-            int sw3 = static_cast<int>(node->src[0]->nb[3] / sizeof(ggml_fp16_t));
-            int sx1 = static_cast<int>(node->src[1]->nb[1] / sizeof(float));
-            int sx2 = static_cast<int>(node->src[1]->nb[2] / sizeof(float));
-            int sx3 = static_cast<int>(node->src[1]->nb[3] / sizeof(float));
-            flagos_amd::kernel_arguments arguments = {
-                &weights_data, &input_data, &output_data, &k, &rows, &columns, &heads,
-                &head_ratio, &sample_ratio, &sw1, &sw2, &sw3, &sx1, &sx2, &sx3,
-            };
-            const char * kernel = amd_strided_batched_f16_kernel_name(node);
-            if (!backend_context->device->aot->launch(kernel,
-                    backend_context->stream, (rows + 31U) / 32U, (columns + 15U) / 16U,
-                    static_cast<unsigned int>(node->ne[2] * node->ne[3]), arguments)) {
+        if (amd_supports_half_get_rows(backend_context->device, node)) {
+            flagos_amd::dense_gather_signature signature;
+            if (!flagos_amd::describe_dense_gather_storage(node, &signature, node->src[0]->type)) {
+                return GGML_STATUS_FAILED;
+            }
+            void * table = node->src[0]->data;
+            void * indices = node->src[1]->data;
+            void * output = node->data;
+            int table_rows = static_cast<int>(node->src[0]->ne[1]);
+            flagos_amd::kernel_arguments arguments { &table, &indices, &output, &signature.columns, &table_rows };
+            const char * kernel = amd_half_get_rows_kernel_name(node);
+            if (!backend_context->device->aot->launch(kernel, backend_context->stream,
+                    static_cast<unsigned int>(signature.rows), (signature.columns + 255U) / 256U, 1, arguments)) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
-            backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, kernel);
+            continue;
+        }
+        if (amd_supports_strided_batched_float_mul_mat(backend_context->device, node)) {
+            void * weights_data = node->src[0]->data;
+            void * input_data = node->src[1]->data;
+            void * output_data = node->data;
+            flagos_amd::strided_float_matmul_signature signature;
+            if (!flagos_amd::describe_strided_float_matmul(node, &signature)) {
+                return GGML_STATUS_FAILED;
+            }
+            flagos_amd::kernel_arguments arguments = {
+                &weights_data, &input_data, &output_data, &signature.k, &signature.rows, &signature.columns,
+                &signature.heads, &signature.head_ratio, &signature.sample_ratio,
+                &signature.sw[0], &signature.sw[1], &signature.sw[2],
+                &signature.sx[0], &signature.sx[1], &signature.sx[2],
+            };
+            const char * kernel = amd_strided_batched_float_kernel_name(node);
+            if (!backend_context->device->aot->launch(kernel,
+                    backend_context->stream, (signature.rows + 31U) / 32U, (signature.columns + 15U) / 16U,
+                    signature.batches, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            if (node->src[0]->type == GGML_TYPE_F16) {
+                backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
+            }
             amd_trace_op(backend_context, node, kernel);
             continue;
         }
@@ -6321,10 +6345,11 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
           amd_supports_gated_delta_net(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_GET_ROWS &&
           (amd_supports_get_rows(amd_device_from_dev(dev), op) ||
-           amd_supports_dense_get_rows(amd_device_from_dev(dev), op))) ||
+           amd_supports_dense_get_rows(amd_device_from_dev(dev), op) ||
+           amd_supports_half_get_rows(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_MUL_MAT &&
           (amd_supports_quantized_mul_mat(amd_device_from_dev(dev), op) ||
-           amd_supports_strided_batched_f16_mul_mat(amd_device_from_dev(dev), op))) ||
+           amd_supports_strided_batched_float_mul_mat(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_ADD && amd_supports_add(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_MUL && amd_supports_mul(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_SCALE && amd_supports_scale(amd_device_from_dev(dev), op)) ||

@@ -211,7 +211,8 @@ struct dense_gather_signature {
 };
 
 // Runtime bindings and package availability are checked by the provider.
-inline bool describe_dense_gather(const ggml_tensor * op, dense_gather_signature * signature) {
+inline bool describe_dense_gather_storage(
+        const ggml_tensor * op, dense_gather_signature * signature, ggml_type table_type) {
     if (signature == nullptr) {
         return false;
     }
@@ -222,7 +223,8 @@ inline bool describe_dense_gather(const ggml_tensor * op, dense_gather_signature
     const auto * table = op->src[0];
     const auto * indices = op->src[1];
     const int64_t max_elements = std::numeric_limits<int32_t>::max() / sizeof(float);
-    if (op->type != GGML_TYPE_F32 || table->type != GGML_TYPE_F32 || indices->type != GGML_TYPE_I32 ||
+    if ((table_type != GGML_TYPE_F32 && table_type != GGML_TYPE_F16 && table_type != GGML_TYPE_BF16) ||
+        op->type != GGML_TYPE_F32 || table->type != table_type || indices->type != GGML_TYPE_I32 ||
         table->ne[0] <= 0 || table->ne[0] > max_elements || table->ne[1] <= 0 ||
         table->ne[1] > max_elements / table->ne[0] || table->ne[2] != 1 || table->ne[3] != 1 ||
         indices->ne[0] < 0 || indices->ne[0] > max_elements / table->ne[0] ||
@@ -233,6 +235,81 @@ inline bool describe_dense_gather(const ggml_tensor * op, dense_gather_signature
     }
     signature->columns = static_cast<int32_t>(op->ne[0]);
     signature->rows = static_cast<int32_t>(op->ne[1]);
+    return true;
+}
+
+inline bool describe_dense_gather(const ggml_tensor * op, dense_gather_signature * signature) {
+    return describe_dense_gather_storage(op, signature, GGML_TYPE_F32);
+}
+
+struct strided_float_matmul_signature {
+    int32_t k = 0, rows = 0, columns = 0, heads = 0;
+    int32_t head_ratio = 0, sample_ratio = 0;
+    int32_t sw[3] = {}, sx[3] = {};
+    uint32_t batches = 0;
+    size_t weight_element_size = 0;
+};
+
+// Geometry shared by support checks and launch argument construction. Policy,
+// precision, runtime bindings and module profiles remain provider decisions.
+inline bool describe_strided_float_matmul(
+        const ggml_tensor * op, strided_float_matmul_signature * signature) {
+    if (signature == nullptr) {
+        return false;
+    }
+    *signature = {};
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr ||
+        op->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
+        (op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    const auto * weights = op->src[0];
+    const auto * input = op->src[1];
+    const size_t weight_element_size = ggml_type_size(weights->type);
+    int64_t output_elements = 1;
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        if (op->ne[dim] <= 0 || op->ne[dim] > INT32_MAX / output_elements) {
+            return false;
+        }
+        output_elements *= op->ne[dim];
+    }
+    if (!ggml_is_contiguous(op) || weights->ne[0] != input->ne[0] ||
+        op->ne[0] != weights->ne[1] || op->ne[1] != input->ne[1] ||
+        op->ne[2] != input->ne[2] || op->ne[3] != input->ne[3] ||
+        weights->nb[0] != weight_element_size || input->nb[0] != sizeof(float) ||
+        (op->ne[1] + 15) / 16 > 65535 || op->ne[2] * op->ne[3] > 65535) {
+        return false;
+    }
+    for (const auto * source : {weights, input}) {
+        const size_t element_size = source == weights ? weight_element_size : sizeof(float);
+        int64_t last_element = 0;
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            if (source->ne[dim] <= 0 || source->ne[dim] > INT32_MAX ||
+                source->nb[dim] % element_size != 0 || source->nb[dim] / element_size > INT32_MAX) {
+                return false;
+            }
+            const int64_t stride = source->nb[dim] / element_size;
+            if (stride != 0 && source->ne[dim] - 1 > (INT32_MAX - last_element) / stride) {
+                return false;
+            }
+            last_element += (source->ne[dim] - 1) * stride;
+        }
+    }
+    if (input->ne[2] % weights->ne[2] != 0 || input->ne[3] % weights->ne[3] != 0) {
+        return false;
+    }
+    signature->k = static_cast<int32_t>(weights->ne[0]);
+    signature->rows = static_cast<int32_t>(op->ne[0]);
+    signature->columns = static_cast<int32_t>(op->ne[1]);
+    signature->heads = static_cast<int32_t>(op->ne[2]);
+    signature->head_ratio = static_cast<int32_t>(input->ne[2] / weights->ne[2]);
+    signature->sample_ratio = static_cast<int32_t>(input->ne[3] / weights->ne[3]);
+    signature->batches = static_cast<uint32_t>(op->ne[2] * op->ne[3]);
+    signature->weight_element_size = weight_element_size;
+    for (int dim = 0; dim < 3; ++dim) {
+        signature->sw[dim] = static_cast<int32_t>(weights->nb[dim + 1] / weight_element_size);
+        signature->sx[dim] = static_cast<int32_t>(input->nb[dim + 1] / sizeof(float));
+    }
     return true;
 }
 
