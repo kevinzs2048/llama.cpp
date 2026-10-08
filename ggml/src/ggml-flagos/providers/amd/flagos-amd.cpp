@@ -3228,18 +3228,14 @@ static const flagos_amd::kernel_metadata * amd_flash_attn_kernel(
         ? (op->ne[0] == 256 ? "flagos_flash_attn_prefill_f32_f16_generic_h256" : "flagos_flash_attn_prefill_f32_f16_generic_h128")
         : (op->ne[0] == 256 ? "flagos_flash_attn_decode_f32_f16_generic_h256" : "flagos_flash_attn_decode_f32_f16_generic_h128");
     const auto * metadata = device->aot->find(name);
-    if (metadata != nullptr) {
-        if (metadata->argument_count != (prefill ? 19 : 16) || metadata->tile_k != op->ne[0] ||
-            metadata->tile_m != 16 || metadata->tile_n < 16 || metadata->tile_n > 64 ||
-            (metadata->tile_n & (metadata->tile_n - 1)) != 0 ||
-            metadata->block_size != (prefill ? metadata->tile_m : metadata->tile_n)) {
-            return nullptr;
-        }
-        return metadata;
+    if (metadata == nullptr || metadata->argument_count != (prefill ? 19 : 16) ||
+        metadata->tile_k != op->ne[0] || metadata->tile_m != 16 ||
+        metadata->tile_n < 16 || metadata->tile_n > 64 ||
+        (metadata->tile_n & (metadata->tile_n - 1)) != 0 ||
+        metadata->block_size != (prefill ? metadata->tile_m : metadata->tile_n)) {
+        return nullptr;
     }
-    // Old h256 symbols do not promise zero outputs for fully masked rows.
-    return op->ne[0] == 128 ? device->aot->find(prefill
-        ? "flagos_flash_attn_prefill_f32_f16" : "flagos_flash_attn_decode_f32_f16") : nullptr;
+    return metadata;
 }
 
 static bool amd_supports_flash_attn_decode(const amd_device_context * device, const ggml_tensor * op) {

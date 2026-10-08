@@ -1873,9 +1873,13 @@ int main(int argc, char ** argv) {
             package_metadata.find("flagos_flash_attn_prefill_f32_f16_generic_h256") != nullptr;
         CHECK(!require_generic_attention || generic_attention);
         for (const int64_t attn_dim : {128, 256}) {
-            if (attn_dim == 256 && !generic_attention) {
-                continue;
-            }
+            const bool generic_head =
+                package_metadata.find(attn_dim == 256
+                    ? "flagos_flash_attn_decode_f32_f16_generic_h256"
+                    : "flagos_flash_attn_decode_f32_f16_generic_h128") != nullptr &&
+                package_metadata.find(attn_dim == 256
+                    ? "flagos_flash_attn_prefill_f32_f16_generic_h256"
+                    : "flagos_flash_attn_prefill_f32_f16_generic_h128") != nullptr;
             const int64_t attn_q_heads = 4;
             const int64_t attn_kv_heads = 2;
             const int64_t attn_keys = 37;
@@ -1896,6 +1900,11 @@ int main(int argc, char ** argv) {
             ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, attn_q, attn_k, attn_v, attn_mask,
                 attn_scale, 0.0f, 0.0f);
             CHECK(attn_out != nullptr);
+            if (!generic_head) {
+                CHECK(!ggml_backend_dev_supports_op(dev, attn_out));
+                continue;
+            }
+            CHECK(ggml_backend_dev_supports_op(dev, attn_out));
             ggml_backend_buffer_t attn_q_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_q));
             ggml_backend_buffer_t attn_k_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_k));
             ggml_backend_buffer_t attn_v_buffer = ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(attn_v));
@@ -1990,7 +1999,7 @@ int main(int argc, char ** argv) {
             for (size_t i = 0; i < attn_output.size(); ++i) {
                 CHECK(std::fabs(attn_output[i] - attn_expected[i]) < 4e-3f);
             }
-            if (generic_attention) {
+            if (generic_head) {
                 std::fill(attn_mask_host.begin(), attn_mask_host.end(), ggml_fp32_to_fp16(-INFINITY));
                 ggml_backend_tensor_set(attn_mask, attn_mask_host.data(), 0, ggml_nbytes(attn_mask));
                 CHECK(ggml_backend_graph_compute(backend, &attn_graph) == GGML_STATUS_SUCCESS);
@@ -2155,7 +2164,7 @@ int main(int argc, char ** argv) {
             for (size_t i = 0; i < prefill_output_host.size(); ++i) {
                 CHECK(std::fabs(prefill_output_host[i] - prefill_expected[i]) < 1e-2f);
             }
-            if (generic_attention) {
+            if (generic_head) {
                 std::fill(prefill_mask_host.begin(), prefill_mask_host.end(), ggml_fp32_to_fp16(-INFINITY));
                 ggml_backend_tensor_set(prefill_mask, prefill_mask_host.data(), 0, ggml_nbytes(prefill_mask));
                 CHECK(ggml_backend_graph_compute(backend, &prefill_graph) == GGML_STATUS_SUCCESS);
