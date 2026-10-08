@@ -3374,8 +3374,14 @@ static bool amd_splitkv_ready(const amd_backend_context * context, const ggml_te
 }
 
 static bool amd_prepare_splitkv_workspace(amd_backend_context * context, const ggml_cgraph * graph) {
+    if (!amd_env_enabled("FLAGOS_AMD_SPLITKV_DECODE")) {
+        return true;
+    }
     size_t required = 0;
     for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] == nullptr || graph->nodes[i]->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
         flagos_amd::splitkv_decode_geometry geometry;
         if (amd_describe_splitkv(context, graph->nodes[i], &geometry)) {
             required = std::max(required, geometry.workspace_bytes);
