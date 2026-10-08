@@ -2462,6 +2462,56 @@ def compile_q6_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
 
 
 
+def compile_core_ops_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile generic contiguous F32 library exports as a separate package."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("core-ops requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    contracts = (
+        ("add", "ggml.add.same_shape.contiguous_f32.tail.v1", ("x", "y", "output", "n_elements")),
+        ("add_repeat", "ggml.add.leading_vector_repeat.contiguous_f32.tail.v1", ("x", "y", "output", "n_elements", "y_elements")),
+        ("mul", "ggml.mul.flat_repeat.contiguous_f32.tail.v1", ("x", "y", "output", "n_elements", "y_elements")),
+        ("scale", "ggml.scale.f32.multiply_add.profile_fp_fusion.tail.v1", ("x", "output", "scale", "bias", "n_elements")),
+        ("sigmoid", "ggml.sigmoid.contiguous_f32.tail.v1", ("x", "output", "n_elements")),
+        ("softplus", "ggml.softplus.f32.threshold20.tail.v1", ("x", "output", "n_elements")),
+        ("swiglu_split", "ggml.swiglu.split_gate_silu_times_up.contiguous_f32.tail.v1", ("gate", "up", "output", "n_elements")),
+        ("rms_norm", "ggml.rms_norm.f32.rowwise_eps_inside_sqrt.tail.v1", ("output", "x", "n_cols", "eps")),
+        ("silu", "ggml.silu.contiguous_f32.tail.v1", ("x", "output", "n_elements")),
+    )
+    exports = []
+    for operation, semantic, runtime in contracts:
+        name = "flagos_" + operation + "_f32"
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError("generic core operations must not require extra divisibility")
+        exports.append((operation, export))
+    kernels = []
+    with amd_hint_context():
+        for operation, export in exports:
+            FLAGGEMS_AOT_EXPORTS += (export,)
+            block = 4096 if operation == "rms_norm" else 256
+            signature = {argument: "fp32" if argument in ("scale", "bias", "eps") else
+                "i32" if argument in ("n_elements", "y_elements", "n_cols") else "*fp32"
+                for argument in export.runtime_arguments}
+            signature["BLOCK"] = "constexpr"
+            compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": block}, attrs={}),
+                target=GPUTarget("hip", arch, 32),
+                options={"num_warps": 4, "enable_fp_fusion": operation != "scale"})
+            metadata = compiled.metadata
+            if getattr(metadata, "global_scratch_size", 0) or metadata.profile_scratch_size:
+                raise RuntimeError("core operations require unsupported Triton scratch storage")
+            artifact = output_dir / (export.name + ".hsaco")
+            artifact.write_bytes(compiled.asm["hsaco"])
+            kernels.append({"name": export.name, "symbol": metadata.name, "file": artifact.name,
+                "shared": metadata.shared, "num_warps": metadata.num_warps, "warp_size": metadata.warp_size,
+                "block_size": block, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+                "argument_count": len(export.runtime_arguments), "global_scratch_size": 0,
+                "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+                "profile_scratch_size": 0, "profile_scratch_align": metadata.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile generic and explicitly aligned GGUF GEMV library exports."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3417,7 +3467,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3475,6 +3525,8 @@ def main() -> None:
             compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gguf-gemv":
             compile_gguf_gemv_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "core-ops":
+            compile_core_ops_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":
             compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "matrix-stage1":
