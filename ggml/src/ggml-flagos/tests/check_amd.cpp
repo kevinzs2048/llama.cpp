@@ -1873,13 +1873,13 @@ int main(int argc, char ** argv) {
             package_metadata.find("flagos_flash_attn_prefill_f32_f16_generic_h256") != nullptr;
         CHECK(!require_generic_attention || generic_attention);
         for (const int64_t attn_dim : {128, 256}) {
-            const bool generic_head =
-                package_metadata.find(attn_dim == 256
-                    ? "flagos_flash_attn_decode_f32_f16_generic_h256"
-                    : "flagos_flash_attn_decode_f32_f16_generic_h128") != nullptr &&
-                package_metadata.find(attn_dim == 256
-                    ? "flagos_flash_attn_prefill_f32_f16_generic_h256"
-                    : "flagos_flash_attn_prefill_f32_f16_generic_h128") != nullptr;
+            const bool generic_decode = package_metadata.find(attn_dim == 256
+                ? "flagos_flash_attn_decode_f32_f16_generic_h256"
+                : "flagos_flash_attn_decode_f32_f16_generic_h128") != nullptr;
+            const bool generic_prefill = package_metadata.find(attn_dim == 256
+                ? "flagos_flash_attn_prefill_f32_f16_generic_h256"
+                : "flagos_flash_attn_prefill_f32_f16_generic_h128") != nullptr;
+            const bool generic_head = generic_decode && generic_prefill;
             const int64_t attn_q_heads = 4;
             const int64_t attn_kv_heads = 2;
             const int64_t attn_keys = 37;
@@ -1901,7 +1901,14 @@ int main(int argc, char ** argv) {
                 attn_scale, 0.0f, 0.0f);
             CHECK(attn_out != nullptr);
             if (!generic_head) {
-                CHECK(!ggml_backend_dev_supports_op(dev, attn_out));
+                CHECK(ggml_backend_dev_supports_op(dev, attn_out) == generic_decode);
+                ggml_tensor * probe_q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, attn_dim, 2, attn_q_heads);
+                ggml_tensor * probe_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, attn_keys, 2);
+                CHECK(probe_q != nullptr && probe_mask != nullptr);
+                ggml_tensor * probe_out = ggml_flash_attn_ext(ctx, probe_q, attn_k, attn_v,
+                    probe_mask, attn_scale, 0.0f, 0.0f);
+                CHECK(probe_out != nullptr);
+                CHECK(ggml_backend_dev_supports_op(dev, probe_out) == generic_prefill);
                 continue;
             }
             CHECK(ggml_backend_dev_supports_op(dev, attn_out));
