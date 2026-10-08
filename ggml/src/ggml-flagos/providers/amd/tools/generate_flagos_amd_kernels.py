@@ -2527,6 +2527,58 @@ def compile_core_ops_package_without_launch(
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_rows_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile GGUF gather, KV scatter, and bitwise F16 copy exports."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("row-ops requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    copy_arguments = ("x", "output", "xe0", "xe1", "xe2", "xe3", "ye0", "ye1", "ye2", "ye3",
+        "sx0", "sx1", "sx2", "sx3", "sy0", "sy1", "sy2", "sy3", "n_elements")
+    contracts = (
+        ("flagos_get_rows_q4_k_f32", "ggml.get_rows.gguf_q4_k.contiguous.i32_indices.in_range.packed256.acc_f32.v1",
+            ("weights_u8", "weights_f16", "row_index", "output", "n_cols"), ()),
+        ("flagos_get_rows_q6_k_f32", "ggml.get_rows.gguf_q6_k.contiguous.i32_indices.in_range.packed256.acc_f32.v1",
+            ("weights_u8", "weights_f16", "row_index", "output", "n_cols"), ()),
+        ("flagos_set_rows_f32_f16", "ggml.set_rows.contiguous_f32_to_f16.i64_indices.in_range.unique_rows.state_write.v1",
+            ("x", "row_index", "output", "n_cols", "n_rows", "n_dst_rows"), ("BLOCK",)),
+        ("flagos_copy_strided_f16_bits", "ggml.copy.f16_bits.flat_order.independent_shapes.element_strides.disjoint.v1",
+            copy_arguments, ("BLOCK",)),
+    )
+    exports = []
+    for name, semantic, runtime, constexpr in contracts:
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=runtime, constexpr_arguments=constexpr)
+        if export.aot_divisibility:
+            raise RuntimeError("generic row operations must not require extra divisibility")
+        exports.append(export)
+    kernels = []
+    with amd_hint_context():
+        for export in exports:
+            FLAGGEMS_AOT_EXPORTS += (export,)
+            copy_bits = export.name == "flagos_copy_strided_f16_bits"
+            scatter = export.name == "flagos_set_rows_f32_f16"
+            pointer_types = {"weights_u8": "*u8", "weights_f16": "*fp16",
+                "row_index": "*i64" if scatter else "*i32", "x": "*u16" if copy_bits else "*fp32",
+                "output": "*u16" if copy_bits else "*fp16" if scatter else "*fp32"}
+            signature = {argument: pointer_types.get(argument, "i32") for argument in export.runtime_arguments}
+            constants = {argument: 256 for argument in export.constexpr_arguments}
+            signature.update({argument: "constexpr" for argument in constants})
+            compiled = triton.compile(ASTSource(export.function, signature, constants, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+            m = compiled.metadata
+            if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+                raise RuntimeError("row operations require unsupported Triton scratch storage")
+            artifact = output_dir / (export.name + ".hsaco")
+            artifact.write_bytes(compiled.asm["hsaco"])
+            kernels.append({"name": export.name, "symbol": m.name, "file": artifact.name,
+                "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+                "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+                "argument_count": len(export.runtime_arguments), "global_scratch_size": 0,
+                "global_scratch_align": getattr(m, "global_scratch_align", 1),
+                "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile generic and explicitly aligned GGUF GEMV library exports."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3482,7 +3534,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "gdn-value-tile", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3544,6 +3596,8 @@ def main() -> None:
             compile_core_ops_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "graph-ops":
             compile_core_ops_package_without_launch(args.output_dir, args.arch, graph_ops=True)
+        elif args.extension == "row-ops":
+            compile_rows_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gdn-value-tile":
             compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "matrix-stage1":
