@@ -27,6 +27,7 @@ static void check(bool condition, const char * expression, int line) {
 #define CHECK(expression) check((expression), #expression, __LINE__)
 
 #include "check_amd_rope.h"
+#include "check_amd_gdn_alignment.h"
 
 int main(int argc, char ** argv) {
     bool require_ssm_conv_silu = false;
@@ -34,6 +35,7 @@ int main(int argc, char ** argv) {
     bool require_gdn_gate_projections = false;
     bool require_generic_attention = false;
     bool require_ggml_rope = false;
+    bool require_view_alignment = false;
     for (int argument = 1; argument < argc; ++argument) {
         if (std::strcmp(argv[argument], "--require-ssm-conv-silu") == 0) {
             require_ssm_conv_silu = true;
@@ -41,6 +43,8 @@ int main(int argc, char ** argv) {
             require_attention_output_gate = true;
         } else if (std::strcmp(argv[argument], "--require-gdn-gate-projections") == 0) {
             require_gdn_gate_projections = true;
+        } else if (std::strcmp(argv[argument], "--require-view-alignment") == 0) {
+            require_view_alignment = true;
         } else if (std::strcmp(argv[argument], "--require-ggml-rope") == 0) {
             require_ggml_rope = true;
         } else if (std::strcmp(argv[argument], "--require-generic-attention") == 0) {
@@ -48,7 +52,7 @@ int main(int argc, char ** argv) {
         } else {
             std::fprintf(stderr,
                 "usage: %s [--require-ssm-conv-silu] [--require-attention-output-gate] "
-                "[--require-gdn-gate-projections] [--require-generic-attention] [--require-ggml-rope]\n",
+                "[--require-gdn-gate-projections] [--require-generic-attention] [--require-ggml-rope] [--require-view-alignment]\n",
                 argv[0]);
             return 2;
         }
@@ -117,6 +121,9 @@ int main(int argc, char ** argv) {
     // The backend owns a stream; synchronize before checking asynchronous copies.
     ggml_backend_t backend = ggml_backend_flagos_init(0);
     CHECK(backend != nullptr);
+    if (require_view_alignment) {
+        check_amd_gdn_view_alignment(dev);
+    }
     if (require_ggml_rope) {
         check_rope_layout_contracts(ctx, dev);
         check_ggml_rope_device(backend, dev, buft, ctx);

@@ -1997,12 +1997,25 @@ static bool amd_tensor_element_strides_are_aligned(
 
 static bool amd_tensor_data_is_aligned(
         const ggml_tensor * tensor, size_t alignment) {
-    // supports_op can run before scheduler allocation. Revalidate the same
-    // condition during execution, when data is bound, without rejecting an
-    // otherwise supported unallocated graph.
-    return tensor != nullptr && alignment != 0 &&
-        (tensor->data == nullptr ||
-         reinterpret_cast<uintptr_t>(tensor->data) % alignment == 0);
+    // supports_op runs before allocation, but GGML has already flattened
+    // view offsets to their root. Device buffers provide aligned roots;
+    // reject offsets that cannot satisfy the kernel's address contract.
+    if (tensor == nullptr || alignment == 0) {
+        return false;
+    }
+    if (tensor->data != nullptr) {
+        return reinterpret_cast<uintptr_t>(tensor->data) % alignment == 0;
+    }
+    if (tensor->view_src == nullptr) {
+        return true;
+    }
+    const size_t offset = tensor->view_offs % alignment;
+    if (tensor->view_src->data != nullptr) {
+        // Compare residues without overflowing root_address + view_offs.
+        return reinterpret_cast<uintptr_t>(tensor->view_src->data) % alignment ==
+            (alignment - offset) % alignment;
+    }
+    return offset == 0;
 }
 
 static bool amd_tensor_bindings_ready(const ggml_tensor * tensor) {
