@@ -3350,6 +3350,7 @@ static const flagos_amd::kernel_metadata * amd_splitkv_kernel(
         metadata->tile_k != op->ne[0] || metadata->tile_m != 0 ||
         metadata->tile_n != (merge ? 16 : 32) || metadata->block_size != (merge ? 16 : 32) ||
         metadata->num_warps != 4 || metadata->warp_size != 32 ||
+        metadata->shared_memory != (merge ? 0 : 512) ||
         metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0) {
         return nullptr;
     }
