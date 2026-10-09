@@ -26,7 +26,7 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t f,unsigned gx,unsigned
   case GGML_TYPE_Q4_0:kernel="flagos_mul_mat_id_q4_0_f32";break;
   case GGML_TYPE_Q4_K:kernel="flagos_mul_mat_id_q4_k_f32";break;
   case GGML_TYPE_Q4_1:kernel="flagos_mul_mat_id_q4_1_f32";break;
-  case GGML_TYPE_Q8_0:kernel="flagos_mul_mat_id_q8_0_f32";break;
+  case GGML_TYPE_Q8_0:kernel="flagos_mul_mat_id_q8_0_f32_finite_compensation";break;
   default:check(false,"expected packed weight dtype");
  }
  check(symbols.at(reinterpret_cast<uintptr_t>(f))==kernel,"dtype-specific symbol");check(gx==unsigned(expected->ne[0])&&gy==unsigned(expected->ne[1]*expected->ne[2])&&gz==1&&bx==128&&by==1&&bz==1,"independent grid and workgroup");check(*static_cast<const void**>(args[0])==expected->src[0]->data&&*static_cast<const void**>(args[1])==expected->src[0]->data,"aliased packed weight views");for(int i=1;i<3;++i)check(*static_cast<const void**>(args[i+1])==expected->src[i]->data,"activation and ID pointers");check(*static_cast<void**>(args[4])==expected->data,"output pointer order");
@@ -35,8 +35,12 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t f,unsigned gx,unsigned
  const auto*metadata=static_cast<amd_device_context*>(expected->extra)->aot->find(kernel);check(shared==unsigned(metadata->shared_memory),"LDS request");std::fill_n(static_cast<float*>(expected->data),ggml_nelements(expected),-321.f);++launches;return fail_launch?hipErrorUnknown:hipSuccess;
 }
 int main(int argc,char**argv){
- check(argc==2,"package");setenv("FLAGOS_AMD_MOE","1",1);setenv("FLAGOS_AMD_GRAPH_CAPTURE","0",1);setenv("FLAGOS_AMD_FUSIONS","none",1);
+ check(argc==2||(argc==3&&std::strcmp(argv[2],"--stale-q8")==0),"package");setenv("FLAGOS_AMD_MOE","1",1);setenv("FLAGOS_AMD_GRAPH_CAPTURE","0",1);setenv("FLAGOS_AMD_FUSIONS","none",1);
  amd_device_context device;device.arch="gfx1150";device.device_iface.context=&device;hipGetDeviceProperties(&device.props,0);device.aot=std::make_unique<flagos_amd::kernel_registry>();check(device.aot->initialize(argv[1],0,"gfx1150",true),"package initialization");
+ if(argc==3){
+  auto *ctx=ggml_init({1048576,nullptr,true});auto *w=ggml_new_tensor_3d(ctx,GGML_TYPE_Q8_0,64,3,4);auto *x=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,64,1,2);auto *ids=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,2,2);auto *out=ggml_mul_mat_id(ctx,w,x,ids);
+  check(device.aot->find("flagos_mul_mat_id_q8_0_f32")!=nullptr,"old unsafe implementation present");check(device.aot->find("flagos_mul_mat_id_q8_0_f32_finite_compensation")==nullptr,"safe implementation absent");check(!amd_device_supports_op(&device.device_iface,out),"old Q8 package rejected at placement");check(launches==0,"no stale kernel submission");ggml_free(ctx);device.aot->reset();check(loaded==unloaded,"stale package module teardown");std::printf("STALE_Q8_PACKAGE_REJECTED checks=%d mock_submissions=%d actual_GPU_calls=0\n",checks,launches);return 0;
+ }
  for(int kind=0;kind<4;++kind)for(int padded=0;padded<2;++padded){
   ggml_init_params params={4*1024*1024,nullptr,true};auto*ctx=ggml_init(params);int k=kind==1?768:96;auto*w=ggml_new_tensor_3d(ctx,kind==1?GGML_TYPE_Q4_K:kind==2?GGML_TYPE_Q4_1:kind==3?GGML_TYPE_Q8_0:GGML_TYPE_Q4_0,k,7,4);auto*x=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,k,2,3);auto*ids=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,2,3);size_t row_bytes=ggml_row_size(w->type,k);
   if(padded){w->nb[1]=row_bytes+6;w->nb[2]=w->nb[1]*7+10;w->nb[3]=w->nb[2]*4;x->nb[1]=(k+7)*4;x->nb[2]=x->nb[1]*2+9*4;x->nb[3]=x->nb[2]*3;ids->nb[0]=8;ids->nb[1]=28;ids->nb[2]=ids->nb[3]=84;}
