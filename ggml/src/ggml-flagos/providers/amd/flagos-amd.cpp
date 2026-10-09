@@ -500,6 +500,7 @@ static uint64_t amd_execution_policy_key() {
     add(std::getenv("FLAGOS_AMD_PADDED_BROADCAST_SOFTMAX"));
     add(std::getenv("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_DENSE_FLOAT_OPS"));
+    add(std::getenv("FLAGOS_AMD_REPEAT_OPS"));
     add(std::getenv("FLAGOS_AMD_ROPE_NEOX_RECURRENCE"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
@@ -5202,6 +5203,8 @@ static bool amd_supports_mul(const amd_device_context * device, const ggml_tenso
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
+#include "flagos-amd-repeat.inc"
+
 static bool amd_supports_scale(const amd_device_context * device, const ggml_tensor * op) {
     return device != nullptr && device->aot != nullptr && op != nullptr &&
         op->op == GGML_OP_SCALE && op->src[0] != nullptr &&
@@ -6011,6 +6014,16 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, "set_rows");
             continue;
         }
+        amd_repeat_operation repeat_operation;
+        if (amd_describe_repeat_operation(backend_context->device, node, &repeat_operation)) {
+            if (!amd_launch_repeat_operation(backend_context, node, repeat_operation)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, repeat_operation.kernel);
+            continue;
+        }
         if (node->op == GGML_OP_ADD && amd_supports_add(backend_context->device, node)) {
             const bool same_shape = ggml_are_same_shape(node->src[0], node->src[1]);
             const char * kernel_name = same_shape ? "flagos_add_f32" : "flagos_add_repeat_f32";
@@ -6438,13 +6451,14 @@ static ggml_backend_buffer_type_t amd_device_buffer_type(ggml_backend_dev_t dev)
 
 static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     // Only advertise compute nodes with a validated AOT lowering.  Standalone
-    // MUL is intentionally restricted to the exact contiguous/vector-repeat
-    // layouts implemented by flagos_mul_f32; all other broadcasts stay on CPU.
+    // The optional repeat path proves per-dimension addressing separately
+    // from the baseline contiguous/vector-repeat modules.
     if (amd_tensor_is_view_op(op)) {
         return true;
     }
     return op != nullptr &&
-        (amd_supports_copy(amd_device_from_dev(dev), op) ||
+        (amd_supports_repeat_operation(amd_device_from_dev(dev), op) ||
+         amd_supports_copy(amd_device_from_dev(dev), op) ||
          (op->op == GGML_OP_CONCAT && amd_supports_concat(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_SSM_CONV && amd_supports_ssm_conv(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_L2_NORM && amd_supports_l2_norm(amd_device_from_dev(dev), op)) ||

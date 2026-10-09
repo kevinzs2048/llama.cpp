@@ -13,6 +13,62 @@
 
 namespace flagos_amd {
 
+struct repeat_f32_geometry {
+    int dimensions[4] = {};
+    int repeat[4] = {};
+    int source_strides[4] = {};
+    int repeat_strides[4] = {};
+    int elements = 0;
+};
+
+inline bool describe_repeat_f32(const ggml_tensor * op, repeat_f32_geometry * geometry) {
+    if (geometry == nullptr) {
+        return false;
+    }
+    *geometry = {};
+    if (op == nullptr || (op->op != GGML_OP_ADD && op->op != GGML_OP_MUL && op->op != GGML_OP_DIV) ||
+        op->src[0] == nullptr || op->src[1] == nullptr || op->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(op) || !ggml_are_same_shape(op, op->src[0])) {
+        return false;
+    }
+    int64_t elements = 1;
+    for (int dim = 0; dim < 4; ++dim) {
+        if (op->ne[dim] <= 0 || op->ne[dim] > INT32_MAX || elements > INT32_MAX / op->ne[dim]) {
+            return false;
+        }
+        elements *= op->ne[dim];
+        geometry->dimensions[dim] = static_cast<int>(op->ne[dim]);
+    }
+    for (int input = 0; input < 2; ++input) {
+        const auto * source = op->src[input];
+        if (source->type != GGML_TYPE_F32 || source->nb[0] != sizeof(float)) {
+            return false;
+        }
+        int64_t last = 0;
+        for (int dim = 0; dim < 4; ++dim) {
+            if (source->ne[dim] <= 0 || source->ne[dim] > INT32_MAX ||
+                (input == 1 && op->ne[dim] % source->ne[dim] != 0) ||
+                source->nb[dim] == 0 || source->nb[dim] % sizeof(float) != 0 ||
+                source->nb[dim] / sizeof(float) > INT32_MAX) {
+                return false;
+            }
+            const int stride = static_cast<int>(source->nb[dim] / sizeof(float));
+            if (source->ne[dim] > 1 && stride > (INT32_MAX - last) / (source->ne[dim] - 1)) {
+                return false;
+            }
+            last += (source->ne[dim] - 1) * stride;
+            if (input == 0) {
+                geometry->source_strides[dim] = stride;
+            } else {
+                geometry->repeat[dim] = static_cast<int>(source->ne[dim]);
+                geometry->repeat_strides[dim] = stride;
+            }
+        }
+    }
+    geometry->elements = static_cast<int>(elements);
+    return true;
+}
+
 struct splitkv_decode_geometry {
     int heads = 0;
     int splits = 0;
