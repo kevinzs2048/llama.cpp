@@ -60,7 +60,7 @@ list(APPEND FLAGOS_PRIVATE_LIBRARIES hip::host ${CMAKE_DL_LIBS})
 list(APPEND FLAGOS_PRIVATE_DEFINITIONS ${FLAGOS_AMD_PRIVATE_DEFINITIONS} GGML_FLAGOS_HAVE_AMD)
 
 if (UNIX)
-    foreach(FLAGOS_AMD_CHECK_NAME IN ITEMS policy-preflight repeat-operations tanh gemv f16-projection ffn-fusion-resources batched-gather)
+    foreach(FLAGOS_AMD_CHECK_NAME IN ITEMS policy-preflight repeat-operations tanh gemv f16-projection ffn-fusion-resources batched-gather regular-ffn packed-ffn-preflight)
         string(REPLACE "-" "_" FLAGOS_AMD_CHECK_SOURCE "${FLAGOS_AMD_CHECK_NAME}")
         add_executable(flagos-check-amd-${FLAGOS_AMD_CHECK_NAME} EXCLUDE_FROM_ALL
             "${CMAKE_CURRENT_LIST_DIR}/tests/check_${FLAGOS_AMD_CHECK_SOURCE}.cpp"

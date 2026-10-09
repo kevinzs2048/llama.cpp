@@ -3229,6 +3229,8 @@ static bool amd_supports_gdn_gate_projections(
     return true;
 }
 
+#include "flagos-amd-f16-ffn.inc"
+
 // The FFN fusion consumes the same quantized projections accepted by the
 // opt-in F16 dequant-cache path, but combines both projections and the
 // terminal split SwiGLU into one launch.  Keep this capability deliberately
@@ -3269,7 +3271,11 @@ static bool amd_supports_ffn_swiglu_f16_layout(const amd_device_context * device
         gate->ne[0] != gate_signature.rows || gate->ne[1] != gate_signature.columns ||
         up->ne[0] != up_signature.rows || up->ne[1] != up_signature.columns ||
         activation->ne[0] != gate_signature.k || activation->ne[1] != gate_signature.columns ||
-        activation->ne[2] != 1 || activation->ne[3] != 1) {
+        activation->ne[2] != 1 || activation->ne[3] != 1 ||
+        reinterpret_cast<uintptr_t>(gate_weights->data) % sizeof(uint16_t) != 0 ||
+        reinterpret_cast<uintptr_t>(up_weights->data) % sizeof(uint16_t) != 0 ||
+        reinterpret_cast<uintptr_t>(activation->data) % sizeof(float) != 0 ||
+        reinterpret_cast<uintptr_t>(glu->data) % sizeof(float) != 0) {
         return false;
     }
     const auto has_dequant = [device](flagos_quantized_matmul_kind kind) {
@@ -3307,10 +3313,18 @@ static bool amd_supports_ffn_swiglu_f16(const amd_device_context * device,
                                         const ggml_tensor * gate,
                                         const ggml_tensor * up,
                                         const ggml_tensor * glu) {
-    return device != nullptr && device->aot != nullptr &&
-        amd_fusion_enabled(device, "ffn_swiglu") && amd_prefill_f16_gemm_enabled(device) &&
-        device->aot->find("flagos_ffn_swiglu_f16_f32_batched") != nullptr &&
-        amd_supports_ffn_swiglu_f16_layout(device, gate, up, glu);
+    if (!amd_supports_ffn_swiglu_f16_layout(device, gate, up, glu) ||
+        !amd_fusion_enabled(device, "ffn_swiglu") || !amd_prefill_f16_gemm_enabled(device)) {
+        return false;
+    }
+    flagos_quantized_matmul_signature signature;
+    amd_f16_ffn_launch launch;
+    // Cached weights are allocated at aligned arena boundaries; graph bindings
+    // may be unknown here and are rechecked with their final addresses later.
+    return flagos_describe_quantized_matmul(gate, &signature) &&
+        amd_describe_f16_ffn(device, nullptr, nullptr, gate->src[1]->data, glu->data,
+            static_cast<int>(signature.k), static_cast<int>(signature.rows),
+            static_cast<int>(signature.columns), &launch);
 }
 
 // Store the graph-private GLU result as F16 scratch for the down projection.
@@ -3349,6 +3363,8 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
         !amd_i32_matrix_offsets_fit(up_signature) ||
         !amd_i32_matrix_offsets_fit(down_signature) ||
         down->ne[0] != down_signature.rows || down->ne[1] != down_signature.columns ||
+        reinterpret_cast<uintptr_t>(down->data) % sizeof(float) != 0 ||
+        reinterpret_cast<uintptr_t>(down->src[0]->data) % sizeof(uint16_t) != 0 ||
         !ggml_is_contiguous(down) || !ggml_is_contiguous(down->src[0]) ||
         !amd_grouped_f16_ffn_enabled(device, static_cast<int>(gate_signature.columns))) {
         return false;
@@ -4918,83 +4934,46 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             gate_projection->src[1] == nullptr || glu->data == nullptr) {
             return false;
         }
-        const bool grouped = amd_grouped_f16_ffn_enabled(context->device,
-                static_cast<int>(first_signature.columns)) &&
-            context->device->aot->find("flagos_ffn_swiglu_f16_f32_grouped") != nullptr;
-        const auto * tiled_metadata = context->device->aot->find("flagos_ffn_swiglu_f16_f32_batched_tiled");
-        const bool tiled = !grouped && amd_env_enabled("FLAGOS_AMD_TILED_F16_FFN") &&
-            tiled_metadata != nullptr && tiled_metadata->argument_count == 7 &&
-            tiled_metadata->tile_m == 32 && tiled_metadata->tile_n == 128 &&
-            tiled_metadata->tile_k == 32 && tiled_metadata->block_size == 128 &&
-            tiled_metadata->num_warps == 4 && tiled_metadata->warp_size == 32 &&
-            flagos_amd::supports_tiled_f16_ffn_launch(
-                first_weights, second_weights, gate_projection->src[1]->data, glu->data,
-                static_cast<int>(first_signature.k), static_cast<int>(first_signature.rows));
-        const char * kernel_name = grouped ? "flagos_ffn_swiglu_f16_f32_grouped" :
-            tiled ? "flagos_ffn_swiglu_f16_f32_batched_tiled" : "flagos_ffn_swiglu_f16_f32_batched";
-        auto * metadata = context->device->aot->find(kernel_name);
-        if (metadata == nullptr) {
-            return false;
-        }
         int k = static_cast<int>(first_signature.k);
         int rows = static_cast<int>(first_signature.rows);
         int columns = static_cast<int>(first_signature.columns);
         void * activation_data = gate_projection->src[1]->data;
         void * output_data = glu->data;
-        if (activation_data == nullptr) {
+        amd_f16_ffn_launch launch;
+        if (activation_data == nullptr || !amd_describe_f16_ffn(context->device,
+                first_weights, second_weights, activation_data, output_data, k, rows, columns, &launch)) {
             return false;
         }
-        bool packed = false;
-        if (tiled && amd_env_enabled("FLAGOS_AMD_PACKED_F16_FFN") &&
-            !amd_graph_capture_enabled() && columns == 512 &&
-            ((k == 2048 && rows == 6144) || (k == 2560 && rows == 9216))) {
-            const char * packed_name = "flagos_ffn_swiglu_f16_packed_activation";
-            const auto * packed_metadata = context->device->aot->find(packed_name);
-            const auto * pack_metadata = context->device->aot->find("flagos_pack_f32_f16");
-            if (packed_metadata != nullptr && pack_metadata != nullptr &&
-                packed_metadata->argument_count == 7 && packed_metadata->tile_m == 32 &&
-                packed_metadata->tile_n == 128 && packed_metadata->tile_k == 32 &&
-                packed_metadata->block_size == 32 && packed_metadata->num_warps == 4 &&
-                packed_metadata->warp_size == 32 && pack_metadata->argument_count == 3 &&
-                pack_metadata->block_size == 256 && pack_metadata->num_warps == 4 &&
-                pack_metadata->warp_size == 32) {
-                void * workspace = amd_packed_ffn_workspace(context);
-                if (workspace != nullptr) {
-                    int count = k * columns;
-                    flagos_amd::kernel_arguments pack_arguments { &activation_data, &workspace, &count };
-                    if (!context->device->aot->launch("flagos_pack_f32_f16", context->stream,
-                            static_cast<unsigned int>((count + 255) / 256), 1, 1, pack_arguments)) {
-                        return false;
-                    }
-                    context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
-                    activation_data = workspace;
-                    kernel_name = packed_name;
-                    metadata = packed_metadata;
-                    packed = true;
+        amd_f16_ffn_launch packed_launch;
+        if (amd_describe_packed_f16_ffn(context->device, first_weights, second_weights,
+                activation_data, output_data, nullptr, k, rows, columns, launch, &packed_launch)) {
+            void * workspace = amd_packed_ffn_workspace(context);
+            if (workspace != nullptr && amd_describe_packed_f16_ffn(context->device,
+                    first_weights, second_weights, activation_data, output_data, workspace,
+                    k, rows, columns, launch, &packed_launch)) {
+                int count = k * columns;
+                flagos_amd::kernel_arguments pack_arguments { &activation_data, &workspace, &count };
+                if (!context->device->aot->launch("flagos_pack_f32_f16", context->stream,
+                        packed_launch.pack_grid, 1, 1, pack_arguments)) {
+                    return false;
                 }
+                context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                activation_data = workspace;
+                launch = packed_launch;
             }
         }
         flagos_amd::kernel_arguments arguments = {
             &first_weights, &second_weights, &activation_data, &output_data,
             &k, &rows, &columns,
         };
-        const unsigned int tile_m = metadata->tile_m > 0
-            ? static_cast<unsigned int>(metadata->tile_m) : AMD_F16_MATMUL_BLOCK_M;
-        const unsigned int tile_n = metadata->tile_n > 0
-            ? static_cast<unsigned int>(metadata->tile_n) : AMD_F16_MATMUL_BLOCK_N;
-        const unsigned int blocks_m = (static_cast<unsigned int>(rows) + tile_m - 1) / tile_m;
-        const unsigned int blocks_n = (static_cast<unsigned int>(columns) + tile_n - 1) / tile_n;
-        const unsigned int grid_x = grouped ? blocks_m * blocks_n : blocks_m;
-        const unsigned int grid_y = grouped ? 1U : blocks_n;
         const bool launched = context->device->aot->launch(
-            kernel_name, context->stream,
-            grid_x, grid_y, 1, arguments);
+            launch.kernel, context->stream, launch.grid_x, launch.grid_y, 1, arguments);
         if (launched) {
             context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_ffn_swiglu.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(context, glu,
-                packed ? "ffn_swiglu_f16_packed_activation" : grouped ? "ffn_swiglu_f16_grouped" : tiled ? "ffn_swiglu_f16_tiled" : "ffn_swiglu_f16");
+                launch.packed ? "ffn_swiglu_f16_packed_activation" : launch.grouped ? "ffn_swiglu_f16_grouped" : launch.tiled ? "ffn_swiglu_f16_tiled" : "ffn_swiglu_f16");
         }
         return launched;
     }
