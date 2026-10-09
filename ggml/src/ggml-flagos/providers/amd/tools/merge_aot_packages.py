@@ -20,6 +20,8 @@ MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_HSACO_BYTES = 256 * 1024 * 1024
 MAX_PACKAGE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_KERNELS = 4096
+MAX_CONSTANT_ASSETS = 16
+MAX_CONSTANT_ASSET_BYTES = 16 * 1024 * 1024
 MAX_SIZE_T = (1 << 64) - 1
 
 KNOWN_KERNEL_ABIS = {}
@@ -161,6 +163,31 @@ def load_manifest(package_dir: Path, artifacts: dict[str, tuple[int, str]] | Non
     names = set()
     files = set()
     package_bytes = 0
+    assets = manifest.get("assets", [])
+    if not isinstance(assets, list) or len(assets) > MAX_CONSTANT_ASSETS:
+        raise RuntimeError(f"invalid constant asset list in {package_dir}")
+    asset_names = set()
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise RuntimeError(f"invalid constant asset in {package_dir}")
+        name, filename, digest, size = (asset.get(field) for field in
+                                       ("name", "file", "sha256", "binary_size"))
+        if (not isinstance(name, str) or not name or len(name.encode("utf-8")) > 256 or
+                "\0" in name or not isinstance(filename, str) or not filename or
+                filename in (".", "..") or any(c in filename for c in ("/", "\\", "\0")) or
+                not isinstance(digest, str) or len(digest) != 64 or
+                any(c not in "0123456789abcdef" for c in digest) or
+                type(size) is not int or not 0 < size <= MAX_CONSTANT_ASSET_BYTES or
+                name in asset_names or filename in files):
+            raise RuntimeError(f"invalid or duplicate constant asset in {package_dir}")
+        actual_size, actual_digest = file_integrity(package_dir / filename)
+        if (actual_size, actual_digest) != (size, digest):
+            raise RuntimeError(f"constant asset integrity mismatch: {filename}")
+        asset_names.add(name)
+        files.add(filename)
+        package_bytes += size
+        if artifacts is not None:
+            artifacts[filename] = (size, digest)
     for kernel in manifest["kernels"]:
         if not isinstance(kernel, dict):
             raise RuntimeError(f"invalid kernel entry in {package_dir}")
@@ -360,6 +387,30 @@ def main() -> None:
             raise RuntimeError(
                 f"kernel artifact collision: {kernel['file']} belongs to {owner}, not {kernel['name']}")
 
+    merged_assets = list(base.get("assets", []))
+    asset_names = {asset["name"]: asset for asset in merged_assets}
+    artifact_owners = {asset["file"]: ("asset", asset["name"]) for asset in merged_assets}
+    for kernel in base["kernels"] + additional["kernels"]:
+        owner = artifact_owners.get(kernel["file"])
+        if owner is not None:
+            raise RuntimeError(f"kernel and constant asset file collision: {kernel['file']}")
+        artifact_owners[kernel["file"]] = ("kernel", kernel["name"])
+    additional_assets = []
+    for asset in additional.get("assets", []):
+        previous = asset_names.get(asset["name"])
+        if previous is not None:
+            if previous != asset:
+                raise RuntimeError(f"conflicting constant asset: {asset['name']}")
+            continue
+        if asset["file"] in artifact_owners:
+            raise RuntimeError(f"constant asset file collision: {asset['file']}")
+        asset_names[asset["name"]] = asset
+        artifact_owners[asset["file"]] = ("asset", asset["name"])
+        merged_assets.append(asset)
+        additional_assets.append(asset)
+    if len(merged_assets) > MAX_CONSTANT_ASSETS:
+        raise RuntimeError("merged constant asset count exceeds limit")
+
     if args.output_dir.exists():
         raise RuntimeError(f"output directory already exists: {args.output_dir}")
     if not args.output_dir.parent.is_dir():
@@ -390,6 +441,16 @@ def main() -> None:
         # Only declared artifacts cross the package boundary.  Copying the
         # entire source tree would preserve stale HSACOs, symlinks, or other
         # unrelated files that are outside the validated manifest.
+        for asset in base.get("assets", []):
+            size, digest = base_artifacts[asset["file"]]
+            copy_validated_artifact(args.base_dir / asset["file"],
+                                    staging_dir / asset["file"], size, digest)
+        for asset in additional_assets:
+            size, digest = additional_artifacts[asset["file"]]
+            copy_validated_artifact(args.additional_dir / asset["file"],
+                                    staging_dir / asset["file"], size, digest)
+        if merged_assets:
+            base["assets"] = merged_assets
         for kernel in base["kernels"]:
             size, digest = base_artifacts[kernel["file"]]
             copy_validated_artifact(
@@ -414,7 +475,7 @@ def main() -> None:
             raise RuntimeError(
                 f"merged package contains {len(base['kernels'])} kernels; maximum is {MAX_KERNELS}")
         merged_files = set()
-        merged_bytes = 0
+        merged_bytes = sum(asset["binary_size"] for asset in merged_assets)
         for kernel in base["kernels"]:
             filename = kernel["file"]
             if filename in merged_files:
