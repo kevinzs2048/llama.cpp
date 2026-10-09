@@ -2985,6 +2985,8 @@ static bool amd_supports_strided_batched_float_mul_mat(
         metadata->profile_scratch_size == 0;
 }
 
+#include "flagos-amd-gemv.inc"
+
 static bool amd_supports_quantized_mul_mat(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr || op->op != GGML_OP_MUL_MAT) {
         return false;
@@ -2998,9 +3000,19 @@ static bool amd_supports_quantized_mul_mat(const amd_device_context * device, co
         !amd_i32_matrix_offsets_fit(signature)) {
         return false;
     }
-    const char * kernel = signature.columns == 1
-        ? amd_quantized_gemv_kernel(signature.weight_kind)
-        : amd_quantized_batched_kernel(device, signature.weight_kind, amd_allows_f16_matmul(op));
+    if (!amd_tensor_data_is_aligned(op, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[0], sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(op->src[1], sizeof(float))) {
+        return false;
+    }
+    if (signature.columns == 1) {
+        amd_quantized_gemv_launch launch;
+        return amd_describe_quantized_gemv(device, op, signature.weight_kind,
+            signature.k, signature.rows, &launch) &&
+            !amd_tensor_data_overlaps(op, op->src[0]) &&
+            !amd_tensor_data_overlaps(op, op->src[1]);
+    }
+    const char * kernel = amd_quantized_batched_kernel(device, signature.weight_kind, amd_allows_f16_matmul(op));
     const auto * metadata = kernel == nullptr ? nullptr : device->aot->find(kernel);
     if (metadata == nullptr) {
         return false;
@@ -5820,44 +5832,19 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 }
             }
             if (columns == 1) {
-                const unsigned int requested_narrow_tile =
-                    amd_q4_gemv_narrow_row_tile(backend_context->device);
-                const unsigned int requested_q40_narrow_tile =
-                    amd_q40_gemv_narrow_row_tile(backend_context->device);
-                const unsigned int requested_q5_narrow_tile =
-                    amd_q5_gemv_narrow_row_tile(backend_context->device);
-                const bool narrow_q4 = q4 && requested_narrow_tile > 1U;
-                const char * narrow_kernel = nullptr;
-                unsigned int row_tile = 1U;
-                if (kind == flagos_quantized_matmul_kind::q4_0 &&
-                    requested_q40_narrow_tile > 1U &&
-                    rows % requested_q40_narrow_tile == 0) {
-                    narrow_kernel = "flagos_mul_mat_q4_0_f32_narrow";
-                    row_tile = requested_q40_narrow_tile;
-                } else if (kind == flagos_quantized_matmul_kind::q5_k &&
-                           requested_q5_narrow_tile == 16U && rows % 16 == 0) {
-                    narrow_kernel = "flagos_mul_mat_q5_k_f32_narrow16";
-                    row_tile = 16U;
-                } else if (narrow_q4 && requested_narrow_tile >= 8U && rows % 8 == 0 &&
-                    backend_context->device->aot->find("flagos_mul_mat_q4_k_f32_narrow8") != nullptr) {
-                    narrow_kernel = "flagos_mul_mat_q4_k_f32_narrow8";
-                    row_tile = 8U;
-                } else if (narrow_q4 && rows % 4 == 0 &&
-                           backend_context->device->aot->find("flagos_mul_mat_q4_k_f32_narrow") != nullptr) {
-                    // An 8-row request safely falls back to the validated
-                    // four-row symbol when an older package is loaded.
-                    narrow_kernel = "flagos_mul_mat_q4_k_f32_narrow";
-                    row_tile = 4U;
+                amd_quantized_gemv_launch gemv;
+                if (!amd_describe_quantized_gemv(backend_context->device, node, kind, k, rows, &gemv)) {
+                    return GGML_STATUS_FAILED;
                 }
-                const char * aligned_kernel = narrow_kernel == nullptr
-                    ? amd_aligned_quantized_gemv_kernel(backend_context->device, node, kind, k, rows) : nullptr;
-                const char * kernel_name = narrow_kernel != nullptr ? narrow_kernel : aligned_kernel != nullptr ? aligned_kernel
-                    : amd_quantized_gemv_kernel(kind);
+                const char * kernel_name = gemv.kernel;
+                const unsigned int row_tile = gemv.row_tile;
+                const char * narrow_kernel = row_tile > 1 ? kernel_name : nullptr;
+                const char * aligned_kernel = std::strstr(kernel_name, "_model_aligned") != nullptr ? kernel_name : nullptr;
                 flagos_amd::kernel_arguments arguments = {
                     &weights_u8, &weights_f16, &activation_data, &output_data, &k, &rows,
                 };
                 const bool launched = backend_context->device->aot->launch(kernel_name, backend_context->stream,
-                    (static_cast<unsigned int>(rows) + row_tile - 1) / row_tile, 1, 1, arguments);
+                    gemv.grid_x, 1, 1, arguments);
                 if (!launched) {
                     return GGML_STATUS_FAILED;
                 }
