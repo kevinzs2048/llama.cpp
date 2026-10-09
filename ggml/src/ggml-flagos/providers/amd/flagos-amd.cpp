@@ -3350,17 +3350,16 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
         return false;
     }
 
-    const auto grid_fits = [](int64_t rows, int64_t columns,
-                              int tile_m, int tile_n) {
-        const uint64_t blocks_m = (static_cast<uint64_t>(rows) + tile_m - 1) / tile_m;
-        const uint64_t blocks_n = (static_cast<uint64_t>(columns) + tile_n - 1) / tile_n;
-        return blocks_m != 0 && blocks_n != 0 &&
-            blocks_m <= std::numeric_limits<unsigned int>::max() / blocks_n;
+    const auto grid_fits = [device](int64_t rows, int64_t columns,
+            const flagos_amd::kernel_metadata * metadata, size_t arguments, size_t pointers) {
+        const uint64_t blocks_m = (static_cast<uint64_t>(rows) + metadata->tile_m - 1) / metadata->tile_m;
+        const uint64_t blocks_n = (static_cast<uint64_t>(columns) + metadata->tile_n - 1) / metadata->tile_n;
+        return amd_kernel_launch_contract_fits(device, metadata, arguments, pointers,
+            blocks_m * blocks_n, 1, 1);
     };
-    if (!grid_fits(gate_signature.rows, gate_signature.columns,
-                   ffn_metadata->tile_m, ffn_metadata->tile_n) ||
-        !grid_fits(down_signature.rows, down_signature.columns,
-                   down_metadata->tile_m, down_metadata->tile_n)) {
+    // Both launches must be legal before the first one can write private scratch.
+    if (!grid_fits(gate_signature.rows, gate_signature.columns, ffn_metadata, 7, 4) ||
+        !grid_fits(down_signature.rows, down_signature.columns, down_metadata, 6, 3)) {
         return false;
     }
 
@@ -3465,6 +3464,15 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
         up->ne[0] != up_signature.rows || up->ne[1] != 1 ||
         activation->ne[0] != gate_signature.k || activation->ne[1] != 1 ||
         activation->ne[2] != 1 || activation->ne[3] != 1) {
+        return false;
+    }
+
+    if (!amd_kernel_launch_contract_fits(device, metadata, 8, 6,
+            (static_cast<uint64_t>(gate_signature.rows) + row_tile - 1) / row_tile, 1, 1) ||
+        !amd_tensor_data_is_aligned(gate_weights, sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(up_weights, sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(activation, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(glu, sizeof(float))) {
         return false;
     }
 
