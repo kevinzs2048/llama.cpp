@@ -496,6 +496,8 @@ static uint64_t amd_execution_policy_key() {
     add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
     add(std::getenv("FLAGOS_AMD_F16_COPY"));
     add(std::getenv("FLAGOS_AMD_BROADCAST_SOFTMAX"));
+    add(std::getenv("FLAGOS_AMD_WIDE_BROADCAST_SOFTMAX"));
+    add(std::getenv("FLAGOS_AMD_PADDED_BROADCAST_SOFTMAX"));
     add(std::getenv("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_DENSE_FLOAT_OPS"));
     add(std::getenv("FLAGOS_AMD_ROPE_NEOX_RECURRENCE"));
@@ -2928,7 +2930,7 @@ static bool amd_supports_strided_batched_float_mul_mat(
         return false;
     }
     const auto * metadata = device->aot->find(kernel);
-    const size_t shared = std::strcmp(kernel, "flagos_mul_mat_f16_f32_strided_batched") == 0 ? 4096 : 6144;
+    const int shared = std::strcmp(kernel, "flagos_mul_mat_f16_f32_strided_batched") == 0 ? 4096 : 6144;
     return metadata != nullptr && metadata->argument_count == 15 && metadata->block_size == 32 &&
         metadata->tile_m == 32 && metadata->tile_n == 16 && metadata->tile_k == 32 &&
         metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == shared &&
@@ -3798,9 +3800,17 @@ static bool amd_launch_flash_attn(amd_backend_context * context, ggml_tensor * n
         static_cast<unsigned int>(q->ne[2]), grid_y, 1, arguments);
 }
 
-static const char * amd_soft_max_kernel_name(const ggml_tensor * mask) {
+static const char * amd_soft_max_kernel_name(const ggml_tensor * op) {
+    const ggml_tensor * mask = op->src[1];
     if (mask == nullptr) {
         return "flagos_soft_max_unmasked_f32";
+    }
+    if (mask->type == GGML_TYPE_F32 && op->ne[0] > 512) {
+        if (op->ne[0] <= 1024) { return "flagos_soft_max_masked_broadcast_f32_b1024_w4"; }
+        if (op->ne[0] <= 2048) { return "flagos_soft_max_masked_broadcast_f32_b2048_w4"; }
+        if (op->ne[0] <= 4096) { return "flagos_soft_max_masked_broadcast_f32_b4096_w4"; }
+        if (op->ne[0] <= 8192) { return "flagos_soft_max_masked_broadcast_f32_b8192_w8"; }
+        return nullptr;
     }
     return mask->type == GGML_TYPE_F32 ? "flagos_soft_max_masked_broadcast_f32" : "flagos_soft_max_masked_f32_f16";
 }
@@ -3815,14 +3825,6 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
         ggml_nelements(op) > INT32_MAX || op->src[2] != nullptr) {
         return false;
     }
-    // The current AMD Triton reduction is validated for power-of-two row
-    // widths.  Non-power-of-two masked reductions can produce materially wrong
-    // results on gfx1150 due to the backend's masked warp-reduction lowering;
-    // keep those shapes on the reference scheduler until a dedicated kernel
-    // variant is available.
-    if ((op->ne[0] & (op->ne[0] - 1)) != 0) {
-        return false;
-    }
     float scale = 1.0f;
     float max_bias = 0.0f;
     std::memcpy(&scale, op->op_params, sizeof(scale));
@@ -3832,8 +3834,15 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
         return false;
     }
     const ggml_tensor * mask = op->src[1];
-    const char * kernel = amd_soft_max_kernel_name(mask);
+    const char * kernel = amd_soft_max_kernel_name(op);
     const bool broadcast_f32 = mask != nullptr && mask->type == GGML_TYPE_F32;
+    const bool wide = broadcast_f32 && op->ne[0] > 512;
+    // Keep the observed gfx1150 non-power-of-two reduction failure gated.
+    if (kernel == nullptr || (wide && !amd_env_enabled("FLAGOS_AMD_WIDE_BROADCAST_SOFTMAX")) ||
+        ((op->ne[0] & (op->ne[0] - 1)) != 0 &&
+         (!wide || !amd_env_enabled("FLAGOS_AMD_PADDED_BROADCAST_SOFTMAX")))) {
+        return false;
+    }
     if (broadcast_f32) {
         if (!amd_env_enabled("FLAGOS_AMD_BROADCAST_SOFTMAX") || !ggml_is_contiguous(mask) ||
             mask->ne[0] != op->ne[0] || mask->ne[1] < op->ne[1] || mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
@@ -3844,9 +3853,19 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
             !amd_tensor_data_is_aligned(mask, sizeof(float))) {
             return false;
         }
+        for (int dimension = 0; dimension < 3; ++dimension) {
+            if (device->props.maxGridSize[dimension] > 0 && op->ne[dimension + 1] > device->props.maxGridSize[dimension]) {
+                return false;
+            }
+        }
         const auto * metadata = device->aot->find(kernel);
-        if (metadata == nullptr || metadata->argument_count != 12 || metadata->block_size != 512 ||
-            metadata->num_warps != 4 || metadata->warp_size != 32 || metadata->shared_memory != 16 ||
+        int block = 512;
+        while (block < op->ne[0]) { block *= 2; }
+        const int warps = block == 8192 ? 8 : 4;
+        if (metadata == nullptr || metadata->argument_count != 12 || metadata->block_size != block ||
+            metadata->num_warps != warps || metadata->warp_size != 32 || metadata->shared_memory != warps * 4 ||
+            metadata->tile_m != 0 || metadata->tile_n != 0 || metadata->tile_k != 0 ||
+            metadata->static_shared_memory != 0 ||
             metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0) {
             return false;
         }
@@ -5955,7 +5974,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         }
         if (node->op == GGML_OP_SOFT_MAX && amd_supports_soft_max(backend_context->device, node)) {
             const ggml_tensor * mask = node->src[1];
-            const char * kernel_name = amd_soft_max_kernel_name(mask);
+            const char * kernel_name = amd_soft_max_kernel_name(node);
             int n_cols = static_cast<int>(node->ne[0]);
             int rows = static_cast<int>(ggml_nelements(node) / node->ne[0]);
             float scale = 1.0f;
