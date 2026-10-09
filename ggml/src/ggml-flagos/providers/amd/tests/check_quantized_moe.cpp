@@ -23,7 +23,8 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t f,unsigned gx,unsigned
  check(expected!=nullptr,"submission expectation");amd_moe_launch l;check(amd_describe_moe(static_cast<amd_device_context*>(expected->extra),expected,&l),"launch description");
  check(symbols.at(reinterpret_cast<uintptr_t>(f)).find(l.kernel)==0,"symbol");check(gx==l.grid_x&&gy==l.grid_y&&gz==1&&bx==128&&by==1&&bz==1,"grid and workgroup");
  check(l.quantized,"quantized description");check(*static_cast<const void**>(args[0])==expected->src[0]->data&&*static_cast<const void**>(args[1])==expected->src[0]->data,"aliased packed weight views");for(int i=1;i<3;++i)check(*static_cast<const void**>(args[i+1])==expected->src[i]->data,"activation and ID pointers");check(*static_cast<void**>(args[4])==expected->data,"output pointer order");
- const int values[]={l.k,l.rows,l.picks,l.tokens,l.input_picks,l.experts,l.sw1,l.sw2,l.sx1,l.sx2,l.si0,l.si1};for(int i=0;i<12;++i)check(*static_cast<int*>(args[i+5])==values[i],"scalar argument order");
+ const auto*w=expected->src[0];const auto*x=expected->src[1];const auto*id=expected->src[2];
+ const int values[]={int(w->ne[0]),int(w->ne[1]),int(id->ne[0]),int(id->ne[1]),int(x->ne[1]),int(w->ne[2]),int(w->nb[1]),int(w->nb[2]),int(x->nb[1]/4),int(x->nb[2]/4),int(id->nb[0]/4),int(id->nb[1]/4)};for(int i=0;i<12;++i)check(*static_cast<int*>(args[i+5])==values[i],"scalar argument order");
  const auto*metadata=static_cast<amd_device_context*>(expected->extra)->aot->find(l.kernel);check(shared==unsigned(metadata->shared_memory),"LDS request");std::fill_n(static_cast<float*>(expected->data),ggml_nelements(expected),-321.f);++launches;return fail_launch?hipErrorUnknown:hipSuccess;
 }
 int main(int argc,char**argv){
@@ -47,6 +48,16 @@ int main(int argc,char**argv){
   reject("wrong output rows",[&]{out->ne[0]=8;},[&]{*out=copy_out;});
   reject("unsupported outer weights dimension",[&]{w->ne[3]=2;},[&]{*w=copy_w;});
   reject("unknown op parameters",[&]{out->op_params[0]=1;},[&]{*out=copy_out;});
+#if GGML_BACKEND_API_VERSION >= 3
+  check(ggml_prec_set_acc(out,GGML_PREC_F32),"set actual accumulator precision API");check(amd_device_supports_op(&device.device_iface,out),"F32 accumulator contract");*out=copy_out;
+  check(ggml_prec_set_src(out,GGML_PREC_F32,1),"set actual activation precision API");check(amd_device_supports_op(&device.device_iface,out),"Q4 preserves F32 activation");
+  expected=out;amd_backend_context precision_context(&device,reinterpret_cast<hipStream_t>(uintptr_t(1)));check(amd_launch_moe(&precision_context,out),"F32 precision uses qualified Q4 ABI");*out=copy_out;
+#else
+  reject("API2 reserved accumulator precision",[&]{out->op_params[0]=GGML_PREC_F32;},[&]{*out=copy_out;});
+  reject("API2 reserved activation precision",[&]{out->op_params[3]=GGML_PREC_F32;},[&]{*out=copy_out;});
+#endif
+  reject("unknown activation precision",[&]{out->op_params[3]=12345;},[&]{*out=copy_out;});
+
   reject("overlapping weight rows",[&]{w->nb[1]=row_bytes-2;},[&]{*w=copy_w;});
   reject("odd packed row stride",[&]{w->nb[1]+=1;},[&]{*w=copy_w;});
   reject("odd packed expert stride",[&]{w->nb[2]+=1;},[&]{*w=copy_w;});
@@ -61,8 +72,8 @@ int main(int argc,char**argv){
   reject("wrong tile M",[&]{m->tile_m=8;},[&]{*m=saved;});reject("wrong tile K",[&]{m->tile_k=512;},[&]{*m=saved;});reject("wrong block",[&]{m->block_size=512;},[&]{*m=saved;});
   reject("wrong ABI scalar width",[&]{m->argument_abi[5].size=8;},[&]{*m=saved;});reject("wrong ABI pointer kind",[&]{m->argument_abi[2].kind=flagos_amd::kernel_argument_kind::by_value;},[&]{*m=saved;});reject("scratch requirement",[&]{m->global_scratch_size=4;},[&]{*m=saved;});
   auto saved_props=device.props;reject("grid capacity",[&]{device.props.maxGridSize[1]=5;},[&]{device.props=saved_props;});if(m->shared_memory+m->static_shared_memory>0)reject("LDS capacity",[&]{device.props.sharedMemPerBlock=1;},[&]{device.props=saved_props;});
-  amd_backend_context context(&device,reinterpret_cast<hipStream_t>(uintptr_t(1)));ggml_backend backend{};backend.context=&context;backend.device=&device.device_iface;auto*g=ggml_new_graph_custom(ctx,16,false);ggml_build_forward_expand(g,out);check(amd_backend_graph_compute(&backend,g)==GGML_STATUS_SUCCESS,"direct graph execution");check(launches==kind*2+padded+1,"one launch per op");check(ob[5]==-321.f&&ob[4]==13579.25f&&ob[5+ggml_nelements(out)]==13579.25f,"bounded destination");
-  if(kind==1&&padded==1){fail_launch=true;check(amd_backend_graph_compute(&backend,g)==GGML_STATUS_FAILED,"post-write submission error");check(launches==5,"no backend retry after write");fail_launch=false;}
+  amd_backend_context context(&device,reinterpret_cast<hipStream_t>(uintptr_t(1)));ggml_backend backend{};backend.context=&context;backend.device=&device.device_iface;auto*g=ggml_new_graph_custom(ctx,16,false);ggml_build_forward_expand(g,out);check(amd_backend_graph_compute(&backend,g)==GGML_STATUS_SUCCESS,"direct graph execution");check(launches==(kind*2+padded+1)*(GGML_BACKEND_API_VERSION>=3?2:1),"one launch per requested op");check(ob[5]==-321.f&&ob[4]==13579.25f&&ob[5+ggml_nelements(out)]==13579.25f,"bounded destination");
+  if(kind==1&&padded==1){fail_launch=true;check(amd_backend_graph_compute(&backend,g)==GGML_STATUS_FAILED,"post-write submission error");check(launches==(GGML_BACKEND_API_VERSION>=3?9:5),"no backend retry after write");fail_launch=false;}
   ggml_free(ctx);
  }
  device.aot->reset();check(loaded==unloaded,"module teardown");std::printf("QUANTIZED_MOE_HOST_COMPLETE checks=%d mock_submissions=%d actual_GPU_calls=0\n",checks,launches);

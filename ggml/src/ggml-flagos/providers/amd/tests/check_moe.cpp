@@ -23,21 +23,22 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t f,unsigned gx,unsigned
  check(expected!=nullptr,"submission expectation");amd_moe_launch l;check(amd_describe_moe(static_cast<amd_device_context*>(expected->extra),expected,&l),"launch description");
  check(symbols.at(reinterpret_cast<uintptr_t>(f)).find(l.kernel)==0,"symbol");check(gx==l.grid_x&&gy==l.grid_y&&gz==1&&bx==128&&by==1&&bz==1,"grid and workgroup");
  for(int i=0;i<3;++i)check(*static_cast<const void**>(args[i])==expected->src[i]->data,"source pointer order");check(*static_cast<void**>(args[3])==expected->data,"output pointer order");
- const int values[]={l.k,l.rows,l.picks,l.tokens,l.input_picks,l.experts,l.sw1,l.sw2,l.sx1,l.sx2,l.si0,l.si1};for(int i=0;i<12;++i)check(*static_cast<int*>(args[i+4])==values[i],"scalar argument order");
+ const auto*w=expected->src[0];const auto*x=expected->src[1];const auto*id=expected->src[2];const size_t unit=w->type==GGML_TYPE_F32?4:2;
+ const int values[]={int(w->ne[0]),int(w->ne[1]),int(id->ne[0]),int(id->ne[1]),int(x->ne[1]),int(w->ne[2]),int(w->nb[1]/unit),int(w->nb[2]/unit),int(x->nb[1]/4),int(x->nb[2]/4),int(id->nb[0]/4),int(id->nb[1]/4)};for(int i=0;i<12;++i)check(*static_cast<int*>(args[i+4])==values[i],"scalar argument order");
  const auto*metadata=static_cast<amd_device_context*>(expected->extra)->aot->find(l.kernel);check(shared==unsigned(metadata->shared_memory),"LDS request");std::fill_n(static_cast<float*>(expected->data),ggml_nelements(expected),-321.f);++launches;return fail_launch?hipErrorUnknown:hipSuccess;
 }
 int main(int argc,char**argv){
  check(argc==2,"package");setenv("FLAGOS_AMD_MOE","1",1);setenv("FLAGOS_AMD_GRAPH_CAPTURE","0",1);setenv("FLAGOS_AMD_FUSIONS","none",1);
  amd_device_context device;device.arch="gfx1150";device.device_iface.context=&device;hipGetDeviceProperties(&device.props,0);device.aot=std::make_unique<flagos_amd::kernel_registry>();check(device.aot->initialize(argv[1],0,"gfx1150",true),"package initialization");
- for(int kind=0;kind<2;++kind)for(int padded=0;padded<2;++padded){
-  ggml_init_params params={4*1024*1024,nullptr,true};auto*ctx=ggml_init(params);auto*w=ggml_new_tensor_3d(ctx,kind?GGML_TYPE_F32:GGML_TYPE_F16,32,7,4);auto*x=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,32,2,3);auto*ids=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,2,3);int unit=kind?4:2;
+ for(int kind=0;kind<3;++kind)for(int padded=0;padded<2;++padded){
+  ggml_init_params params={4*1024*1024,nullptr,true};auto*ctx=ggml_init(params);auto*w=ggml_new_tensor_3d(ctx,kind==2?GGML_TYPE_BF16:kind?GGML_TYPE_F32:GGML_TYPE_F16,32,7,4);auto*x=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,32,2,3);auto*ids=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,2,3);int unit=kind==1?4:2;
   if(padded){w->nb[1]=35*unit;w->nb[2]=w->nb[1]*7+5*unit;w->nb[3]=w->nb[2]*4;x->nb[1]=39*4;x->nb[2]=x->nb[1]*2+9*4;x->nb[3]=x->nb[2]*3;ids->nb[0]=8;ids->nb[1]=28;ids->nb[2]=ids->nb[3]=84;}
   auto*out=ggml_mul_mat_id(ctx,w,x,ids);out->extra=&device;check(amd_device_supports_op(&device.device_iface,out),"unbound placement");
   std::vector<uint8_t>wb(ggml_nbytes(w)+64);std::vector<float>xb(ggml_nbytes(x)/4+32),ob(ggml_nelements(out)+32,13579.25f);std::vector<int32_t>ib(ggml_nbytes(ids)/4+32);
-  w->data=wb.data()+(kind?12:6);x->data=xb.data()+5;ids->data=ib.data()+5;out->data=ob.data()+5;check(amd_device_supports_op(&device.device_iface,out),"bound placement");expected=out;
+  w->data=wb.data()+(kind==1?12:6);x->data=xb.data()+5;ids->data=ib.data()+5;out->data=ob.data()+5;check(amd_device_supports_op(&device.device_iface,out),"bound placement");expected=out;
   auto reject=[&](const char*name,const std::function<void()>&modify,const std::function<void()>&restore){modify();check(!amd_device_supports_op(&device.device_iface,out),name);restore();check(amd_device_supports_op(&device.device_iface,out),"restored valid contract");};
   auto copy_w=*w;auto copy_x=*x;auto copy_ids=*ids;auto copy_out=*out;
-  reject("wrong weight dtype",[&]{w->type=GGML_TYPE_Q4_0;},[&]{*w=copy_w;});
+  reject("wrong weight dtype",[&]{w->type=GGML_TYPE_Q5_K;},[&]{*w=copy_w;});
   reject("wrong activation dtype",[&]{x->type=GGML_TYPE_F16;},[&]{*x=copy_x;});
   reject("wrong ID dtype",[&]{ids->type=GGML_TYPE_I64;},[&]{*ids=copy_ids;});
   reject("wrong output dtype",[&]{out->type=GGML_TYPE_F16;},[&]{*out=copy_out;});
@@ -47,6 +48,15 @@ int main(int argc,char**argv){
   reject("wrong output rows",[&]{out->ne[0]=8;},[&]{*out=copy_out;});
   reject("unsupported outer weights dimension",[&]{w->ne[3]=2;},[&]{*w=copy_w;});
   reject("unknown op parameters",[&]{out->op_params[0]=1;},[&]{*out=copy_out;});
+#if GGML_BACKEND_API_VERSION >= 3
+  check(ggml_prec_set_acc(out,GGML_PREC_F32),"set actual accumulator precision API");check(amd_device_supports_op(&device.device_iface,out),"F32 accumulator contract");*out=copy_out;
+  check(ggml_prec_set_src(out,GGML_PREC_F32,1),"set actual activation precision API");check(amd_device_supports_op(&device.device_iface,out)==(kind==1),"F16 and BF16 rounding reject preserve-F32 request");*out=copy_out;
+#else
+  reject("API2 reserved accumulator precision",[&]{out->op_params[0]=GGML_PREC_F32;},[&]{*out=copy_out;});
+  reject("API2 reserved activation precision",[&]{out->op_params[3]=GGML_PREC_F32;},[&]{*out=copy_out;});
+#endif
+  reject("unknown activation precision",[&]{out->op_params[3]=12345;},[&]{*out=copy_out;});
+
   reject("overlapping weight rows",[&]{w->nb[1]=size_t(31*unit);},[&]{*w=copy_w;});
   reject("misaligned stride",[&]{x->nb[1]+=1;},[&]{*x=copy_x;});
   reject("misaligned pointer",[&]{ids->data=static_cast<uint8_t*>(ids->data)+1;},[&]{*ids=copy_ids;});
@@ -57,7 +67,7 @@ int main(int argc,char**argv){
   reject("wrong ABI scalar width",[&]{m->argument_abi[4].size=8;},[&]{*m=saved;});reject("wrong ABI pointer kind",[&]{m->argument_abi[2].kind=flagos_amd::kernel_argument_kind::by_value;},[&]{*m=saved;});reject("scratch requirement",[&]{m->global_scratch_size=4;},[&]{*m=saved;});
   auto saved_props=device.props;reject("grid capacity",[&]{device.props.maxGridSize[1]=5;},[&]{device.props=saved_props;});reject("LDS capacity",[&]{device.props.sharedMemPerBlock=1;},[&]{device.props=saved_props;});
   amd_backend_context context(&device,reinterpret_cast<hipStream_t>(uintptr_t(1)));ggml_backend backend{};backend.context=&context;backend.device=&device.device_iface;auto*g=ggml_new_graph_custom(ctx,16,false);ggml_build_forward_expand(g,out);check(amd_backend_graph_compute(&backend,g)==GGML_STATUS_SUCCESS,"direct graph execution");check(launches==kind*2+padded+1,"one launch per op");check(ob[5]==-321.f&&ob[4]==13579.25f&&ob[5+ggml_nelements(out)]==13579.25f,"bounded destination");
-  if(kind==1&&padded==1){fail_launch=true;check(amd_backend_graph_compute(&backend,g)==GGML_STATUS_FAILED,"post-write submission error");check(launches==5,"no backend retry after write");fail_launch=false;}
+  if(kind==2&&padded==1){fail_launch=true;check(amd_backend_graph_compute(&backend,g)==GGML_STATUS_FAILED,"post-write submission error");check(launches==7,"no backend retry after write");fail_launch=false;}
   ggml_free(ctx);
  }
  device.aot->reset();check(loaded==unloaded,"module teardown");std::printf("MOE_HOST_COMPLETE checks=%d mock_submissions=%d actual_GPU_calls=0\n",checks,launches);

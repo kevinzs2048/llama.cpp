@@ -35,6 +35,12 @@ class ExportProfileTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):validate_profile(p,self.export)
     def test_duplicate_json_field_is_rejected(self):
         with self.assertRaises(RuntimeError):json.loads('{"a":1,"a":2}',object_pairs_hook=unique_object)
+    def test_unsigned_bf16_storage_pointer_is_not_half_float(self):
+        self.profile["signature"]["source"]="*u16"
+        self.export.runtime_types=("*u16","i32")
+        self.assertEqual(validate_profile(self.profile,self.export)[1]["source"],"*u16")
+        self.profile["signature"]["source"]="*fp16"
+        with self.assertRaisesRegex(RuntimeError,"runtime type mismatch"):validate_profile(self.profile,self.export)
     def test_legacy_untyped_descriptor_still_works(self):
         self.export.runtime_types=()
         self.assertEqual(validate_profile(self.profile,self.export)[0],"example")

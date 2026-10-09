@@ -1,0 +1,40 @@
+{
+  "format": 1,
+  "arch": "gfx1150",
+  "warp_size": 32,
+  "profiles": [
+    {
+      "export": "flagos_mul_mat_id_bf16_bits_f32",
+      "semantic": "ggml.mul_mat_id.bf16_bits.round_activation_bf16_rne.strides.in_range_ids.pick_modulo.v1",
+      "signature": {
+        "weights": "*u16",
+        "x": "*fp32",
+        "ids": "*i32",
+        "output": "*fp32",
+        "k": "i32",
+        "rows": "i32",
+        "picks": "i32",
+        "tokens": "i32",
+        "input_picks": "i32",
+        "n_experts": "i32",
+        "sw1": "i32",
+        "sw2": "i32",
+        "sx1": "i32",
+        "sx2": "i32",
+        "si0": "i32",
+        "si1": "i32"
+      },
+      "constants": {
+        "BLOCK_M": 4,
+        "BLOCK_K": 64
+      },
+      "geometry": {
+        "block_size": "BLOCK_K",
+        "tile_m": "BLOCK_M",
+        "tile_n": 1,
+        "tile_k": "BLOCK_K"
+      },
+      "num_warps": 4
+    }
+  ]
+}

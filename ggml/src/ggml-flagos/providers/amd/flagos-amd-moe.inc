@@ -23,7 +23,7 @@ static bool amd_describe_moe(const amd_device_context * device,
     const auto * input = op->src[1];
     const auto * ids = op->src[2];
     const bool quantized = weights->type == GGML_TYPE_Q4_0 || weights->type == GGML_TYPE_Q4_K;
-    if ((weights->type != GGML_TYPE_F16 && weights->type != GGML_TYPE_F32 && !quantized) ||
+    if ((weights->type != GGML_TYPE_F16 && weights->type != GGML_TYPE_F32 && weights->type != GGML_TYPE_BF16 && !quantized) ||
         input->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
         weights->ne[3] != 1 || input->ne[3] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
         op->ne[3] != 1) {
@@ -47,7 +47,7 @@ static bool amd_describe_moe(const amd_device_context * device,
         op->ne[2] != ids->ne[1]) {
         return false;
     }
-    const size_t weight_size = weights->type == GGML_TYPE_F16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t weight_size = (weights->type == GGML_TYPE_F16 || weights->type == GGML_TYPE_BF16) ? sizeof(uint16_t) : sizeof(float);
     const size_t weight_stride_unit = quantized ? 1 : weight_size;
     const int block = weights->type == GGML_TYPE_Q4_K ? 256 : 32;
     if (quantized && weights->ne[0] % block != 0) return false;
@@ -80,7 +80,16 @@ static bool amd_describe_moe(const amd_device_context * device,
     if (!amd_tensor_data_is_aligned(op, sizeof(float))) {
         return false;
     }
-    for (const auto value : op->op_params) {
+    for (size_t index = 0; index < sizeof(op->op_params) / sizeof(op->op_params[0]); ++index) {
+        const auto value = op->op_params[index];
+#if GGML_BACKEND_API_VERSION >= 3
+        // API 3 precision contracts: slot 0 is accumulator; slot 3 is src1.
+        // Every profile accumulates in F32; only these profiles preserve F32 src1.
+        const bool preserves_f32 = quantized || weights->type == GGML_TYPE_F32;
+        if (value == GGML_PREC_F32 && (index == 0 || (index == 3 && preserves_f32))) {
+            continue;
+        }
+#endif
         if (value != 0) {
             return false;
         }
@@ -88,6 +97,7 @@ static bool amd_describe_moe(const amd_device_context * device,
     launch->quantized = quantized;
     launch->kernel = weights->type == GGML_TYPE_F16 ? "flagos_mul_mat_id_f16_f32" :
         weights->type == GGML_TYPE_F32 ? "flagos_mul_mat_id_f32_f32" :
+        weights->type == GGML_TYPE_BF16 ? "flagos_mul_mat_id_bf16_bits_f32" :
         weights->type == GGML_TYPE_Q4_K ? "flagos_mul_mat_id_q4_k_f32" : "flagos_mul_mat_id_q4_0_f32";
     launch->k = static_cast<int>(weights->ne[0]);
     launch->rows = static_cast<int>(weights->ne[1]);

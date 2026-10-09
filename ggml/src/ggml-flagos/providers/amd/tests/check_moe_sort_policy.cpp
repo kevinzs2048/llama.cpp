@@ -31,7 +31,7 @@ extern "C" hipError_t hipGraphLaunch(hipGraphExec_t e,hipStream_t){for(const aut
 extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t f,unsigned gx,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,hipStream_t,void**a,void**){
  auto name=symbols.at(reinterpret_cast<uintptr_t>(f));call c{};
  if(name.find("flagos_copy_strided_f16_bits")==0)c={0,*static_cast<const uint16_t**>(a[0]),*static_cast<void**>(a[1]),size_t(*static_cast<int*>(a[18]))};
- else if(name.find("flagos_mul_mat_id_f16_f32")==0)c={1,nullptr,*static_cast<void**>(a[3]),size_t(*static_cast<int*>(a[5]))*size_t(*static_cast<int*>(a[6]))*size_t(*static_cast<int*>(a[7]))};
+ else if((name.find("flagos_mul_mat_id_f16_f32")==0||name.find("flagos_mul_mat_id_f32_f32")==0||name.find("flagos_mul_mat_id_bf16_bits_f32")==0))c={1,nullptr,*static_cast<void**>(a[3]),size_t(*static_cast<int*>(a[5]))*size_t(*static_cast<int*>(a[6]))*size_t(*static_cast<int*>(a[7]))};
  else if(name.find("flagos_mul_mat_id_q4_")==0)c={1,nullptr,*static_cast<void**>(a[4]),size_t(*static_cast<int*>(a[6]))*size_t(*static_cast<int*>(a[7]))*size_t(*static_cast<int*>(a[8]))};
  else if(name.find("flagos_argsort_f32_i32")==0)c={2,nullptr,*static_cast<void**>(a[1]),size_t(gx)*size_t(*static_cast<int*>(a[2]))};
  else check(false,"unexpected kernel");
@@ -39,12 +39,12 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t f,unsigned gx,unsigned
 }
 int main(int argc,char**argv){
  check(argc==2,"package");setenv("FLAGOS_AMD_F16_COPY","1",1);setenv("FLAGOS_AMD_FUSIONS","none",1);setenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS","0",1);amd_device_context device;device.arch="gfx1150";device.device_iface.context=&device;hipGetDeviceProperties(&device.props,0);device.aot=std::make_unique<flagos_amd::kernel_registry>();check(device.aot->initialize(argv[1],0,"gfx1150",true),"package");
- for(int kind:{1,2,3,4})for(int capture:{0,1}){
+ for(int kind:{1,2,3,4,5,6})for(int capture:{0,1}){
   const char*flag=kind==2?"FLAGOS_AMD_ARGSORT":"FLAGOS_AMD_MOE";const char*other=kind==2?"FLAGOS_AMD_MOE":"FLAGOS_AMD_ARGSORT";setenv(flag,"1",1);setenv(other,"0",1);setenv("FLAGOS_AMD_GRAPH_CAPTURE",capture?"all":"0",1);
   auto*ctx=ggml_init({1048576,nullptr,true});auto*source=ggml_new_tensor_2d(ctx,GGML_TYPE_F16,32,2);std::vector<uint16_t>source_data(64,0x3c00);source->data=source_data.data();std::vector<std::vector<uint16_t>>states(3,std::vector<uint16_t>(64,0x7c00));ggml_tensor*nodes[4];
   for(int i=0;i<3;++i){auto*s=ggml_new_tensor_2d(ctx,GGML_TYPE_F16,32,2);s->data=states[i].data();nodes[i]=ggml_cpy(ctx,source,s);nodes[i]->data=s->data;}
   std::vector<uint16_t>wdata(32*7*4*6,0x3c00);std::vector<float>xdata(kind==4?768:96,1.f),fout(42,-99.f);std::vector<int32_t>iddata(6,0),iout(96,-99);
-  if(kind!=2){int k=kind==4?256:32;auto*w=ggml_new_tensor_3d(ctx,kind==4?GGML_TYPE_Q4_K:kind==3?GGML_TYPE_Q4_0:GGML_TYPE_F16,k,7,4);auto*x=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,k,1,3);auto*ids=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,2,3);w->data=wdata.data();x->data=xdata.data();ids->data=iddata.data();nodes[3]=ggml_mul_mat_id(ctx,w,x,ids);nodes[3]->data=fout.data();}
+  if(kind!=2){int k=kind==4?256:32;auto*w=ggml_new_tensor_3d(ctx,kind==4?GGML_TYPE_Q4_K:kind==3?GGML_TYPE_Q4_0:kind==5?GGML_TYPE_BF16:kind==6?GGML_TYPE_F32:GGML_TYPE_F16,k,7,4);auto*x=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,k,1,3);auto*ids=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,2,3);w->data=wdata.data();x->data=xdata.data();ids->data=iddata.data();nodes[3]=ggml_mul_mat_id(ctx,w,x,ids);nodes[3]->data=fout.data();}
   else{auto*x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,32,3);x->data=xdata.data();nodes[3]=ggml_argsort(ctx,x,GGML_SORT_ORDER_DESC);nodes[3]->data=iout.data();}
   ggml_cgraph graph{};graph.nodes=nodes;graph.n_nodes=4;
   {

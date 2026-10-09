@@ -15,7 +15,7 @@ from flagos_amd_hsaco import validate_hsaco
 from merge_aot_packages import (copy_validated_artifact, file_integrity, load_manifest,
                                MAX_CONSTANT_ASSET_BYTES, read_manifest, reject_json_constant)
 
-RUNTIME_TYPES = {"i32", "i64", "fp32", "fp64", "*u8", "*i8", "*i32", "*i64", "*fp16", "*bf16", "*fp32", "*fp64"}
+RUNTIME_TYPES = {"i32", "i64", "fp32", "fp64", "*u8", "*u16", "*i8", "*i32", "*i64", "*fp16", "*bf16", "*fp32", "*fp64"}
 
 
 def unique_object(pairs):
