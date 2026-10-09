@@ -3689,7 +3689,8 @@ static bool amd_supports_swiglu(const amd_device_context * device, const ggml_te
         ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
         ggml_nelements(op) > 0 && ggml_nelements(op) <= INT32_MAX &&
         amd_tensor_output_can_reuse_input(op, op->src[0]) &&
-        amd_tensor_output_can_reuse_input(op, op->src[1]);
+        amd_tensor_output_can_reuse_input(op, op->src[1]) &&
+        amd_elementwise_launch_contract_fits(device, op, "flagos_swiglu_split_f32", 4, 3);
 }
 
 static bool amd_flash_attn_tensor_is_aligned(const ggml_tensor * tensor, size_t element_size) {
