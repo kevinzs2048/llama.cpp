@@ -2049,15 +2049,24 @@ def compile_q4_dequant_package_without_launch(output_dir: Path, arch: str) -> No
 
 def compile_dense_gather_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile contiguous F32 gather without GPU initialization or launch."""
-    if not arch:
-        raise RuntimeError("--compile-only requires --arch")
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("dense-gather requires FLAGOS_FLAGGEMS_AOT_SOURCE")
     name = "flagos_get_rows_f32"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.get_rows.contiguous_f32.i32_indices.in_range.bitwise.v1",
+        runtime_arguments=("table", "row_index", "output", "n_cols"),
+        constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("generic F32 gather must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
     block_size = 256
     source = ASTSource(
-        common.flagos_get_rows_f32,
+        export.function,
         {"table": "*fp32", "row_index": "*i32", "output": "*fp32",
          "n_cols": "i32", "BLOCK": "constexpr"},
         {"BLOCK": block_size},
+        attrs=export.aot_attributes,
     )
     compiled = triton.compile(source, target=GPUTarget("hip", arch, 32),
                               options={"num_warps": NUM_WARPS})
