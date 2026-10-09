@@ -2872,7 +2872,15 @@ static bool amd_supports_set_rows(const amd_device_context * device, const ggml_
         op->data != op->src[2]->data) {
         return false;
     }
-    return !amd_tensor_data_overlaps(op, op->src[0]) &&
+    const auto * metadata = device->aot->find("flagos_set_rows_f32_f16");
+    return metadata->block_size == 256 && metadata->num_warps == 4 && metadata->warp_size == 32 &&
+        metadata->shared_memory == 0 && metadata->static_shared_memory == 0 &&
+        amd_tensor_data_is_aligned(op, sizeof(uint16_t)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int64_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 6, 3,
+            (static_cast<uint64_t>(ggml_nelements(op->src[0])) + 255) / 256, 1, 1) &&
+        !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
@@ -5303,7 +5311,12 @@ static bool amd_supports_strided_rms_norm(const amd_device_context * device, con
     const auto * metadata = device->aot->find("flagos_rms_norm_ggml_strided_f32");
     return metadata != nullptr && metadata->argument_count == 9 &&
         metadata->block_size == 256 && metadata->num_warps == 4 && metadata->warp_size == 32 &&
-        flagos_amd::supports_strided_rms_norm_layout(op, metadata->block_size);
+        flagos_amd::supports_strided_rms_norm_layout(op, metadata->block_size) &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        !amd_tensor_data_overlaps(op, op->src[0]) &&
+        amd_kernel_launch_contract_fits(device, metadata, 9, 2,
+            static_cast<uint64_t>(ggml_nelements(op)) / op->ne[0], 1, 1);
 }
 
 static bool amd_supports_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
@@ -5332,7 +5345,11 @@ static bool amd_supports_rms_norm(const amd_device_context * device, const ggml_
     // A package may choose a wider block than the model's hidden size, but it
     // must never be narrower or the masked load/store would be incomplete.
     const auto * metadata = device->aot->find("flagos_rms_norm_f32");
-    return metadata->block_size >= op->ne[0];
+    return metadata->block_size >= op->ne[0] &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 4, 2,
+            static_cast<uint64_t>(ggml_nelements(op)) / op->ne[0], 1, 1);
 }
 
 static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
