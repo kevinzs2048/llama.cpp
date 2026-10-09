@@ -35,7 +35,8 @@ extern "C" hipError_t hipModuleGetFunction(hipFunction_t * f, hipModule_t, const
 extern "C" hipError_t hipStreamSynchronize(hipStream_t) { return hipSuccess; }
 extern "C" hipError_t hipMalloc(void ** ptr, size_t size) { *ptr = std::malloc(size); ++allocations; return *ptr ? hipSuccess : hipErrorOutOfMemory; }
 extern "C" hipError_t hipFree(void * ptr) { std::free(ptr); ++releases; return hipSuccess; }
-static int pack_writes = 0, regular_writes = 0;
+static int pack_writes = 0, regular_writes = 0, packed_attempts = 0;
+static bool reject_packed_after_write = false;
 extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function, unsigned gx, unsigned, unsigned,
         unsigned, unsigned, unsigned, unsigned, hipStream_t, void ** args, void **) {
     const auto & name = symbols.at(reinterpret_cast<uintptr_t>(function)); ++launches;
@@ -48,6 +49,10 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function, unsigned gx,
     } else if (name == "flagos_ffn_swiglu_f16_f32_batched_tiled") {
         auto * output = *static_cast<float **>(args[3]);
         std::fill_n(output, *static_cast<int *>(args[5]) * *static_cast<int *>(args[6]), 42.f); ++regular_writes;
+    } else if (name == "flagos_ffn_swiglu_f16_packed_activation" && reject_packed_after_write) {
+        ++packed_attempts;
+        auto * output = *static_cast<float **>(args[3]); output[0] = -1.f;
+        return hipErrorInvalidValue;
     } else check(false, "unexpected kernel in packed host fixture");
     return hipSuccess;
 }
@@ -79,7 +84,7 @@ int main(int argc, char ** argv) {
     check(amd_get_dequantized_weight(&context,w0,signature)!=nullptr,"warm gate cache");
     check(amd_get_dequantized_weight(&context,w1,signature)!=nullptr,"warm up cache");
     auto * packed=const_cast<flagos_amd::kernel_metadata *>(device.aot->find("flagos_ffn_swiglu_f16_packed_activation"));
-    check(packed!=nullptr,"packed metadata");packed->shared_memory=70000;
+    check(packed!=nullptr,"packed metadata");const auto valid_packed=*packed;packed->shared_memory=70000;
     ggml_tensor * nodes[]={gate,up,glu};ggml_cgraph graph{};graph.nodes=nodes;graph.n_nodes=3;
     flagos_plan_step step;step.candidate.id=flagos_pattern_id::ffn_swiglu;
     step.candidate.node_indices={0,1,2};step.candidate.required_output_node_indices={2};step.implementation_id=6;
@@ -88,9 +93,20 @@ int main(int argc, char ** argv) {
     check(pack_writes==(after?0:1)&&regular_writes==(after?1:0),"submission order and fallback");
     check(allocations-allocations_before==(after?0:1),"illegal packed kernel avoids workspace allocation");
     check(std::all_of(output.begin(),output.end(),[&](float v){return v==(after?42.f:-99.f);}),"terminal output");
+    const int initial_pack_writes=pack_writes, initial_regular_writes=regular_writes;
+    const int initial_workspace_allocations=allocations-allocations_before;
+    if (after) {
+        *packed=valid_packed;reject_packed_after_write=true;
+        check(!amd_execute_fusion(&context,&graph,step), "submitted packed failure remains a failure");
+        check(pack_writes==1&&packed_attempts==1&&regular_writes==initial_regular_writes,
+            "no alternate FFN launch after packed output was modified");
+        check(output[0]==-1.f&&output[1]==42.f,"preserve evidence of partial output write");
+        std::printf("PACKED_FFN_POST_SUBMISSION_FAILED API=%d pack_writes=%d packed_attempts=%d alternate_launches_after_failure=0 actual_GPU_calls=0\n",
+            GGML_BACKEND_API_VERSION,pack_writes,packed_attempts);
+    }
     amd_release_dequant_cache(&context);
     if(context.packed_ffn_workspace!=nullptr){hipFree(context.packed_ffn_workspace);context.packed_ffn_workspace=nullptr;}
     ggml_backend_buffer_free(storage);device.aot.reset();ggml_free(ctx);
     check(loaded==unloaded&&allocations==releases,"balanced module and allocation lifecycle");
-    std::printf("PACKED_FFN_REPRO API=%d stage=%s pack_writes=%d regular_writes=%d workspace_allocations=%d actual_GPU_calls=0\n",GGML_BACKEND_API_VERSION,after?"after":"before",pack_writes,regular_writes,allocations-allocations_before);
+    std::printf("PACKED_FFN_REPRO API=%d stage=%s pack_writes=%d regular_writes=%d workspace_allocations=%d actual_GPU_calls=0\n",GGML_BACKEND_API_VERSION,after?"after":"before",initial_pack_writes,initial_regular_writes,initial_workspace_allocations);
 }
