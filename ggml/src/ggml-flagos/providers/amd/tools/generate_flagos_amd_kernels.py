@@ -2744,6 +2744,39 @@ def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> Non
     write_manifest(output_dir, arch, kernels)
 
 
+def compile_gguf_prefill_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile GGUF multi-column F32 kernels from the operator library."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("gguf-prefill requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    runtime = ("weights_u8", "weights_f16", "x", "output", "k", "rows", "columns")
+    signature = {"weights_u8": "*u8", "weights_f16": "*fp16", "x": "*fp32",
+        "output": "*fp32", "k": "i32", "rows": "i32", "columns": "i32", "COLS_PER_BLOCK": "constexpr"}
+    for kind in ("q4_0", "q4_1", "q8_0", "q4_k", "q5_k", "q6_k"):
+        name = "flagos_mul_mat_" + kind + "_f32_batched"
+        export, _, _, _ = load_flaggems_aot_export(name=name,
+            semantic="ggml.gguf_" + kind + "_prefill_dense_f32_acc_f32.ptr2_packed.clamp_tail.v1",
+            runtime_arguments=runtime, constexpr_arguments=("COLS_PER_BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError("generic GGUF prefill must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {"COLS_PER_BLOCK": 16}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("GGUF prefill requires unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 16, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
 def compile_gdn_value_tile_package_without_launch(output_dir: Path, arch: str, *, baseline: bool = False) -> None:
     """Compile the GDN value-axis tile with the legacy packed output contract."""
     global FLAGGEMS_AOT_EXPORTS
@@ -3658,7 +3691,7 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
-    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "softmax-broadcast-wide", "strided-batched-gemm", "strided-batched-gemm-ieee", "dense-f32-gemm", "half-gather", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "ggml-neox-rope", "gdn-value-tile", "gdn-scalar", "matrix-stage1", "ffn-waves"),
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "gguf-prefill", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "softmax-broadcast-wide", "strided-batched-gemm", "strided-batched-gemm-ieee", "dense-f32-gemm", "half-gather", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "ggml-neox-rope", "gdn-value-tile", "gdn-scalar", "matrix-stage1", "ffn-waves"),
                         help="compile an optional ABI extension as a separate package")
     parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
                         help="optional offline attention profile; runtime dispatch and defaults are unchanged")
@@ -3718,6 +3751,8 @@ def main() -> None:
             compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "gguf-gemv":
             compile_gguf_gemv_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "gguf-prefill":
+            compile_gguf_prefill_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "core-ops":
             compile_core_ops_package_without_launch(args.output_dir, args.arch)
         elif args.extension == "graph-ops":
