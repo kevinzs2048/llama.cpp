@@ -55,6 +55,7 @@ list(APPEND FLAGOS_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/flagos-amd-hsaco.h"
     "${CMAKE_CURRENT_LIST_DIR}/flagos-amd-hsaco.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/flagos-amd-aot.h"
+    "${CMAKE_CURRENT_LIST_DIR}/flagos-amd-attention.inc"
     "${CMAKE_CURRENT_LIST_DIR}/flagos-amd-aot.cpp")
 list(APPEND FLAGOS_PRIVATE_LIBRARIES hip::host ${CMAKE_DL_LIBS})
 list(APPEND FLAGOS_PRIVATE_DEFINITIONS ${FLAGOS_AMD_PRIVATE_DEFINITIONS} GGML_FLAGOS_HAVE_AMD)
