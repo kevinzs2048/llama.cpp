@@ -500,6 +500,7 @@ static uint64_t amd_execution_policy_key() {
     add(std::getenv("FLAGOS_AMD_PADDED_BROADCAST_SOFTMAX"));
     add(std::getenv("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_DENSE_FLOAT_OPS"));
+    add(std::getenv("FLAGOS_AMD_BATCHED_GATHER"));
     add(std::getenv("FLAGOS_AMD_REPEAT_OPS"));
     add(std::getenv("FLAGOS_AMD_TANH"));
     add(std::getenv("FLAGOS_AMD_ROPE_NEOX_RECURRENCE"));
@@ -2846,6 +2847,13 @@ static bool amd_supports_set_rows(const amd_device_context * device, const ggml_
     }
     return !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
+}
+
+#include "flagos-amd-batched-gather.inc"
+
+static bool amd_supports_batched_gather(const amd_device_context * device, const ggml_tensor * op) {
+    amd_batched_gather_launch launch;
+    return amd_describe_batched_gather(device, op, &launch);
 }
 
 static bool amd_supports_dense_get_rows(const amd_device_context * device, const ggml_tensor * op) {
@@ -5794,6 +5802,24 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, kernel);
             continue;
         }
+        if (node->op == GGML_OP_GET_ROWS) {
+            amd_batched_gather_launch gather;
+            if (amd_describe_batched_gather(backend_context->device, node, &gather)) {
+                void * table = node->src[0]->data;
+                void * indices = node->src[1]->data;
+                void * output = node->data;
+                flagos_amd::kernel_arguments arguments = { &table, &indices, &output };
+                for (int & value : gather.values) arguments.push_back(&value);
+                if (!backend_context->device->aot->launch(gather.kernel, backend_context->stream,
+                        gather.grid_x, 1, 1, arguments)) {
+                    return GGML_STATUS_FAILED;
+                }
+                backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+                amd_trace_op(backend_context, node, "get_rows_batched");
+                continue;
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT && amd_supports_quantized_mul_mat(backend_context->device, node)) {
             const flagos_quantized_matmul_kind kind = amd_quantized_kind(node->src[0]->type);
             const bool q4 = kind == flagos_quantized_matmul_kind::q4_k;
@@ -6474,7 +6500,8 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
          (op->op == GGML_OP_GET_ROWS &&
           (amd_supports_get_rows(amd_device_from_dev(dev), op) ||
            amd_supports_dense_get_rows(amd_device_from_dev(dev), op) ||
-           amd_supports_half_get_rows(amd_device_from_dev(dev), op))) ||
+           amd_supports_half_get_rows(amd_device_from_dev(dev), op) ||
+           amd_supports_batched_gather(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_MUL_MAT &&
           (amd_supports_quantized_mul_mat(amd_device_from_dev(dev), op) ||
            amd_supports_strided_batched_float_mul_mat(amd_device_from_dev(dev), op))) ||
