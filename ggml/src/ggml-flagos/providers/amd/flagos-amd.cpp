@@ -3087,7 +3087,10 @@ static bool amd_supports_strided_batched_float_mul_mat(
         metadata->tile_m == 32 && metadata->tile_n == 16 && metadata->tile_k == 32 &&
         metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == shared &&
         metadata->static_shared_memory == 0 && metadata->global_scratch_size == 0 &&
-        metadata->profile_scratch_size == 0;
+        metadata->profile_scratch_size == 0 &&
+        amd_kernel_launch_contract_fits(device, metadata, 15, 3,
+            (static_cast<uint64_t>(signature.rows) + 31) / 32,
+            (static_cast<uint64_t>(signature.columns) + 15) / 16, signature.batches);
 }
 
 #include "flagos-amd-gemv.inc"
