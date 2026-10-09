@@ -101,7 +101,7 @@ static bool amd_describe_moe(const amd_device_context * device,
         weights->type == GGML_TYPE_BF16 ? "flagos_mul_mat_id_bf16_bits_f32" :
         weights->type == GGML_TYPE_Q4_K ? "flagos_mul_mat_id_q4_k_f32" :
         weights->type == GGML_TYPE_Q4_1 ? "flagos_mul_mat_id_q4_1_f32" :
-        weights->type == GGML_TYPE_Q8_0 ? "flagos_mul_mat_id_q8_0_f32_finite_compensation" : "flagos_mul_mat_id_q4_0_f32";
+        weights->type == GGML_TYPE_Q8_0 ? "flagos_mul_mat_id_q8_0_f32_finite_compensation" : "flagos_mul_mat_id_q4_0_f32_decoded_compensation";
     launch->k = static_cast<int>(weights->ne[0]);
     launch->rows = static_cast<int>(weights->ne[1]);
     launch->picks = static_cast<int>(ids->ne[0]);

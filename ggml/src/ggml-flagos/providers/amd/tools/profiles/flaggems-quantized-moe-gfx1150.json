@@ -4,9 +4,9 @@
   "warp_size": 32,
   "profiles": [
     {
-      "export": "flagos_mul_mat_id_q4_0_f32",
-      "name": "flagos_mul_mat_id_q4_0_f32",
-      "semantic": "ggml.mul_mat_id.gguf_q4_0.preserve_f32_activation.byte_weight_strides.in_range_ids.pick_modulo.v1",
+      "export": "flagos_mul_mat_id_q4_0_f32_decoded_compensation",
+      "name": "flagos_mul_mat_id_q4_0_f32_decoded_compensation",
+      "semantic": "ggml.mul_mat_id.gguf_q4_0.preserve_f32_activation.byte_weight_strides.in_range_ids.pick_modulo.decoded_weight_f32.kahan_block_acc_f32.nonfinite_compensation_reset.v1",
       "signature": {
         "weights_u8": "*u8",
         "weights_f16": "*fp16",
