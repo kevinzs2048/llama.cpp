@@ -2279,12 +2279,18 @@ static const ggml_tensor * amd_attention_output_gate_other(
     return nullptr;
 }
 
-static const char * amd_attention_output_gate_kernel(const ggml_tensor * activation) {
+static const char * amd_attention_output_gate_kernel(
+        const amd_device_context * device, const ggml_tensor * activation) {
     if (activation == nullptr || activation->op != GGML_OP_UNARY) {
         return nullptr;
     }
     switch (ggml_get_unary_op(activation)) {
-        case GGML_UNARY_OP_SILU:     return "flagos_silu_mul_f32";
+        case GGML_UNARY_OP_SILU:
+            // Keep dedicated packages compatible; the baseline library already
+            // exports the same F32 arithmetic under its SwiGLU semantic.
+            return device != nullptr && device->aot != nullptr &&
+                device->aot->find("flagos_silu_mul_f32") != nullptr
+                ? "flagos_silu_mul_f32" : "flagos_swiglu_split_f32";
         case GGML_UNARY_OP_SIGMOID:  return "flagos_sigmoid_mul_f32";
         case GGML_UNARY_OP_SOFTPLUS: return "flagos_softplus_mul_f32";
         default:                     return nullptr;
@@ -2296,7 +2302,7 @@ static bool amd_supports_attention_output_gate(
         const ggml_tensor * activation,
         const ggml_tensor * mul) {
     const ggml_tensor * other = amd_attention_output_gate_other(activation, mul);
-    const char * kernel_name = amd_attention_output_gate_kernel(activation);
+    const char * kernel_name = amd_attention_output_gate_kernel(device, activation);
     if (device == nullptr || device->aot == nullptr || activation == nullptr ||
         activation->src[0] == nullptr || other == nullptr ||
         kernel_name == nullptr || device->aot->find(kernel_name) == nullptr ||
@@ -2311,7 +2317,10 @@ static bool amd_supports_attention_output_gate(
     // The fused elementwise kernel may overwrite either live input only at
     // the exact same base and size. Reject partial overlap just as the direct
     // unary and MUL paths do.
-    return amd_tensor_output_can_reuse_input(mul, activation->src[0]) &&
+    return amd_elementwise_launch_contract_fits(device, mul, kernel_name, 4, 3) &&
+        amd_tensor_data_is_aligned(activation->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(other, sizeof(float)) &&
+        amd_tensor_output_can_reuse_input(mul, activation->src[0]) &&
         amd_tensor_output_can_reuse_input(mul, other);
 }
 
@@ -4644,7 +4653,7 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             other == nullptr) {
             return false;
         }
-        const char * kernel_name = amd_attention_output_gate_kernel(activation);
+        const char * kernel_name = amd_attention_output_gate_kernel(context->device, activation);
         if (kernel_name == nullptr) {
             return false;
         }
