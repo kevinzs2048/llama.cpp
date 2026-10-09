@@ -2999,8 +2999,22 @@ static bool amd_supports_quantized_mul_mat(const amd_device_context * device, co
     const char * kernel = signature.columns == 1
         ? amd_quantized_gemv_kernel(signature.weight_kind)
         : amd_quantized_batched_kernel(device, signature.weight_kind, amd_allows_f16_matmul(op));
-    return kernel != nullptr && device->aot->find(kernel) != nullptr &&
-        !amd_tensor_data_overlaps(op, op->src[0]) &&
+    const auto * metadata = kernel == nullptr ? nullptr : device->aot->find(kernel);
+    if (metadata == nullptr) {
+        return false;
+    }
+    if (signature.columns > 1) {
+        const bool tiled = std::strstr(kernel, "_tiled") != nullptr;
+        const int tile_m = tiled ? metadata->tile_m : 1;
+        const int tile_n = tiled ? metadata->tile_n : metadata->block_size;
+        if (tile_m <= 0 || tile_n <= 0 ||
+            !amd_kernel_launch_contract_fits(device, metadata, 7, 4,
+                (static_cast<uint64_t>(signature.rows) + tile_m - 1) / tile_m,
+                (static_cast<uint64_t>(signature.columns) + tile_n - 1) / tile_n, 1)) {
+            return false;
+        }
+    }
+    return !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
