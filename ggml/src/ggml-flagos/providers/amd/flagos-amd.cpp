@@ -507,6 +507,8 @@ static uint64_t amd_execution_policy_key() {
     add(std::getenv("FLAGOS_AMD_REPEAT_OPS"));
     add(std::getenv("FLAGOS_AMD_TANH"));
     add(std::getenv("FLAGOS_AMD_GEGLU_LUT"));
+    add(std::getenv("FLAGOS_AMD_MOE"));
+    add(std::getenv("FLAGOS_AMD_ARGSORT"));
     add(std::getenv("FLAGOS_AMD_ROPE_NEOX_RECURRENCE"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
