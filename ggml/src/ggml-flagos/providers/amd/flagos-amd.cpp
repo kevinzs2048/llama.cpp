@@ -1560,7 +1560,7 @@ static void * amd_get_dequantized_weight(
     const uint64_t elements = static_cast<uint64_t>(signature.k) * static_cast<uint64_t>(signature.rows);
     const uint64_t blocks = elements / static_cast<uint64_t>(block_size);
     if (metadata == nullptr || metadata->block_size != block_size ||
-        ggml_nbytes(weight) > INT32_MAX || reinterpret_cast<uintptr_t>(weight->data) % sizeof(uint16_t) != 0 ||
+        elements > INT32_MAX || ggml_nbytes(weight) > INT32_MAX || reinterpret_cast<uintptr_t>(weight->data) % sizeof(uint16_t) != 0 ||
         !amd_kernel_launch_contract_fits(context->device, metadata, 3, 3, blocks, 1, 1)) {
         return nullptr;
     }

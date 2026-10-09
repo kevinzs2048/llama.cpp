@@ -142,6 +142,16 @@ int main(int argc, char ** argv) {
     check(quantized_writes == (after ? 1 : 0), "quantized fallback submissions");
     check(std::all_of(result.begin(), result.end(), [after](float v) { return v == (after ? 42.f : -99.f); }), "output contents");
     amd_release_dequant_cache(&context); context.graph_plans.clear();
+    if (after) {
+        // Packed bytes can fit i32 while dequantized element offsets do not.
+        const int previous_allocations = allocations;
+        const int64_t previous_k = weights->ne[0], previous_rows = weights->ne[1];
+        weights->ne[0] = 16384; weights->ne[1] = 131073;
+        auto oversized = signature; oversized.k = 16384; oversized.rows = 131073;
+        check(amd_get_dequantized_weight(&context, weights, oversized) == nullptr && allocations == previous_allocations, "dequant i32 output indexing");
+        weights->ne[0] = previous_k; weights->ne[1] = previous_rows; ++contract_checks;
+    }
+
     // An impossible dequant grid should decline before private allocation.
     device.props.sharedMemPerBlock = 65536; device.props.maxGridSize[0] = 128; reject_dequant_grid = true;
     const int before_allocations = allocations;
