@@ -30,6 +30,8 @@ static constexpr uintmax_t MAX_MANIFEST_BYTES = 4ULL * 1024 * 1024;
 static constexpr uintmax_t MAX_HSACO_BYTES = 256ULL * 1024 * 1024;
 static constexpr uint64_t MAX_PACKAGE_BYTES = 4ULL * 1024 * 1024 * 1024;
 static constexpr size_t MAX_KERNELS = 4096;
+static constexpr size_t MAX_CONSTANT_ASSETS = 16;
+static constexpr size_t MAX_CONSTANT_ASSET_BYTES = 16 * 1024 * 1024;
 
 static bool hip_check(hipError_t result, const char * expression) {
     if (result == hipSuccess) {
@@ -491,6 +493,7 @@ void kernel_registry::reset() {
         }
     }
     kernel_index_.clear();
+    assets_.clear();
     tuning_profile_.clear();
     for (auto & pair : kernels_) {
         if (pair.second.module != nullptr) {
@@ -656,6 +659,47 @@ bool kernel_registry::initialize(
             return false;
         }
 
+        uint64_t package_binary_bytes = 0;
+        std::unordered_set<std::string> artifact_files;
+        artifact_files.reserve(manifest.at("kernels").size() + MAX_CONSTANT_ASSETS);
+        if (manifest.contains("assets")) {
+            const auto & assets = manifest.at("assets");
+            if (!assets.is_array() || assets.size() > MAX_CONSTANT_ASSETS) {
+                GGML_LOG_ERROR("FlagOS AMD AOT: invalid constant asset list\n");
+                reset();
+                return false;
+            }
+            for (const auto & item : assets) {
+                constant_asset asset;
+                int binary_size = 0;
+                if (!item.is_object() || !item.contains("name") || !item.at("name").is_string() ||
+                    !item.contains("file") || !item.at("file").is_string() ||
+                    !item.contains("sha256") || !item.at("sha256").is_string() ||
+                    !read_integer(item, "binary_size", 0, binary_size) || binary_size <= 0 ||
+                    static_cast<size_t>(binary_size) > MAX_CONSTANT_ASSET_BYTES) {
+                    GGML_LOG_ERROR("FlagOS AMD AOT: invalid constant asset metadata\n");
+                    reset();
+                    return false;
+                }
+                asset.name = item.at("name").get<std::string>();
+                asset.sha256 = item.at("sha256").get<std::string>();
+                const auto file = item.at("file").get<std::string>();
+                if (asset.name.empty() || asset.name.size() > 256 ||
+                    asset.name.find('\0') != std::string::npos || !is_sha256(asset.sha256) ||
+                    !is_safe_relative_path(fs::u8path(file)) ||
+                    !artifact_files.insert(file).second || find_asset(asset.name) != nullptr ||
+                    !read_regular_file(directory / fs::u8path(file), binary_size,
+                        MAX_CONSTANT_ASSET_BYTES, "constant asset", asset.bytes) ||
+                    asset.sha256 != sha256_hex(asset.bytes)) {
+                    GGML_LOG_ERROR("FlagOS AMD AOT: invalid or duplicate constant asset\n");
+                    reset();
+                    return false;
+                }
+                package_binary_bytes += asset.bytes.size();
+                assets_.push_back(std::move(asset));
+            }
+        }
+
         if (load_modules) {
             hipDeviceProp_t properties {};
             if (!hip_check(hipSetDevice(device), "hipSetDevice") ||
@@ -688,9 +732,6 @@ bool kernel_registry::initialize(
             profile_enabled_ = false;
             GGML_LOG_WARN("FlagOS AMD AOT: kernel profiling disabled because reusable events could not be created\n");
         }
-        uint64_t package_binary_bytes = 0;
-        std::unordered_set<std::string> artifact_files;
-        artifact_files.reserve(manifest.at("kernels").size());
         for (const auto & item : manifest.at("kernels")) {
             kernel_metadata metadata;
             if (!parse_metadata(item, directory, manifest_arch, metadata) ||
@@ -813,6 +854,15 @@ bool kernel_registry::initialize(
         return false;
     }
     return !kernels_.empty();
+}
+
+const constant_asset * kernel_registry::find_asset(std::string_view name) const {
+    for (const auto & asset : assets_) {
+        if (asset.name == name) {
+            return &asset;
+        }
+    }
+    return nullptr;
 }
 
 const kernel_metadata * kernel_registry::find(std::string_view name) const {

@@ -103,6 +103,12 @@ struct kernel_metadata {
     std::vector<kernel_argument_abi> argument_abi;
 };
 
+struct constant_asset {
+    std::string name;
+    std::string sha256;
+    std::vector<uint8_t> bytes;
+};
+
 // Kernel argument vectors are tiny and are rebuilt for every AOT launch.  A
 // fixed-capacity stack representation avoids a host heap allocation for each
 // decode token while retaining the same packed-pointer ABI as std::vector.
@@ -179,6 +185,7 @@ public:
 
     const kernel_metadata * find(std::string_view name) const;
     size_t size() const;
+    const constant_asset * find_asset(std::string_view name) const;
     const std::string & tuning_profile() const;
 
     bool launch(std::string_view name, hipStream_t stream,
@@ -204,6 +211,7 @@ private:
 
     std::unordered_map<std::string, loaded_kernel> kernels_;
     std::unordered_map<std::string_view, loaded_kernel *> kernel_index_;
+    std::vector<constant_asset> assets_;
     std::string tuning_profile_;
     int device_ = -1;
     std::array<unsigned int, 3> max_grid_size_ {};
