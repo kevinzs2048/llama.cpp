@@ -2388,7 +2388,7 @@ static bool amd_supports_gdn_alpha_gate(
         !ggml_are_same_shape(add, add->src[0]) ||
         !ggml_are_same_shape(activation, add) || !ggml_are_same_shape(mul, activation) ||
         !ggml_can_repeat(add->src[1], add->src[0]) || !ggml_can_repeat(scale, activation) ||
-        add->ne[0] <= 0 || add->ne[0] > INT32_MAX ||
+        add->ne[0] <= 0 || add->ne[0] > INT32_MAX || metadata->block_size <= 0 ||
         metadata->tile_n != add->ne[0] ||
         add->src[1]->ne[0] != add->ne[0] || add->src[1]->ne[1] != 1 ||
         add->src[1]->ne[2] != 1 || add->src[1]->ne[3] != 1 ||
@@ -2397,7 +2397,13 @@ static bool amd_supports_gdn_alpha_gate(
         ggml_nelements(mul) <= 0 || ggml_nelements(mul) > INT32_MAX) {
         return false;
     }
-    return amd_tensor_output_can_reuse_input(mul, add->src[0]) &&
+    return amd_kernel_launch_contract_fits(device, metadata, 5, 4,
+        (static_cast<uint64_t>(ggml_nelements(mul)) + metadata->block_size - 1) / metadata->block_size,
+        1, 1) &&
+        amd_tensor_data_is_aligned(add->src[0], 16) &&
+        amd_tensor_data_is_aligned(add->src[1], 16) &&
+        amd_tensor_data_is_aligned(scale, 16) && amd_tensor_data_is_aligned(mul, 16) &&
+        amd_tensor_output_can_reuse_input(mul, add->src[0]) &&
         amd_tensor_output_can_reuse_input(mul, add->src[1]) &&
         amd_tensor_output_can_reuse_input(mul, scale);
 }
@@ -3301,13 +3307,18 @@ static bool amd_supports_gdn_gate_projections(
         return false;
     }
     for (const ggml_tensor * output : outputs) {
+        if (!amd_tensor_data_is_aligned(output, 16)) {
+            return false;
+        }
         for (const ggml_tensor * input : inputs) {
-            if (amd_tensor_data_overlaps(output, input)) {
+            if (!amd_tensor_data_is_aligned(input, 16) || amd_tensor_data_overlaps(output, input)) {
                 return false;
             }
         }
     }
-    return true;
+    return amd_kernel_launch_contract_fits(device, metadata, 11, 9,
+        (static_cast<uint64_t>(alpha_signature.rows) + metadata->block_size - 1) / metadata->block_size,
+        1, 1);
 }
 
 #include "flagos-amd-f16-ffn.inc"
