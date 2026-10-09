@@ -60,7 +60,7 @@ inline bool describe_splitkv_decode(const ggml_tensor * op, splitkv_decode_geome
     return true;
 }
 
-inline bool supports_ggml_rope_layout(const ggml_tensor * op, int block_pairs) {
+inline bool supports_ggml_rope_layout(const ggml_tensor * op, int block_pairs, bool allow_neox = false) {
     if (op == nullptr || op->op != GGML_OP_ROPE || op->src[0] == nullptr ||
         op->src[1] == nullptr ||
         op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
@@ -107,7 +107,8 @@ inline bool supports_ggml_rope_layout(const ggml_tensor * op, int block_pairs) {
     }
     const auto * params = static_cast<const int32_t *>(op->op_params);
     const int mode = params[2];
-    if ((mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_IMROPE) ||
+    if ((mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_IMROPE &&
+         (!allow_neox || mode != GGML_ROPE_TYPE_NEOX)) ||
         params[1] <= 0 || params[1] % 2 != 0 || params[1] > op->ne[0] ||
         op->src[1]->ne[0] != op->ne[2] * (mode == GGML_ROPE_TYPE_IMROPE ? 4 : 1)) {
         return false;
@@ -127,7 +128,8 @@ inline bool supports_ggml_rope_layout(const ggml_tensor * op, int block_pairs) {
     }
     const ggml_tensor * factors = op->src[2];
     if (factors != nullptr && (factors->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(factors) || factors->ne[0] < op->ne[0] / 2 ||
+        !ggml_is_contiguous(factors) || factors->ne[0] <
+            (mode == GGML_ROPE_TYPE_NEOX ? params[1] : op->ne[0]) / 2 ||
         factors->ne[1] != 1 || factors->ne[2] != 1 || factors->ne[3] != 1)) {
         return false;
     }

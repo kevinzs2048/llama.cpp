@@ -498,6 +498,7 @@ static uint64_t amd_execution_policy_key() {
     add(std::getenv("FLAGOS_AMD_BROADCAST_SOFTMAX"));
     add(std::getenv("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_DENSE_FLOAT_OPS"));
+    add(std::getenv("FLAGOS_AMD_ROPE_NEOX_RECURRENCE"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
     add(std::getenv("FLAGOS_AMD_SPLITKV_DECODE"));
@@ -2610,13 +2611,28 @@ static bool amd_supports_gated_delta_net_cache(
     return true;
 }
 
+static const char * amd_ggml_rope_kernel_name(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_ROPE) {
+        return nullptr;
+    }
+    if (op->op_params[2] == GGML_ROPE_TYPE_NEOX) {
+        return amd_env_enabled("FLAGOS_AMD_ROPE_NEOX_RECURRENCE")
+            ? "flagos_rope_ggml_neox_recurrence_f32" : nullptr;
+    }
+    return "flagos_rope_ggml_recurrence_f32";
+}
+
 static bool amd_supports_ggml_rope(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr) {
         return false;
     }
-    const auto * metadata = device->aot->find("flagos_rope_ggml_recurrence_f32");
+    const char * kernel_name = amd_ggml_rope_kernel_name(op);
+    if (kernel_name == nullptr) {
+        return false;
+    }
+    const auto * metadata = device->aot->find(kernel_name);
     if (metadata == nullptr || metadata->argument_count != 20 ||
-        !flagos_amd::supports_ggml_rope_layout(op, metadata->block_size) ||
+        !flagos_amd::supports_ggml_rope_layout(op, metadata->block_size, true) ||
         !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
         !amd_tensor_data_is_aligned(op, sizeof(float)) ||
         !amd_tensor_data_is_aligned(op->src[0], sizeof(float)) ||
@@ -2624,6 +2640,13 @@ static bool amd_supports_ggml_rope(const amd_device_context * device, const ggml
         (op->src[2] != nullptr && !amd_tensor_data_is_aligned(op->src[2], sizeof(float))) ||
         amd_tensor_data_overlaps(op, op->src[1]) ||
         (op->src[2] != nullptr && amd_tensor_data_overlaps(op, op->src[2]))) {
+        return false;
+    }
+    if (op->op_params[2] == GGML_ROPE_TYPE_NEOX &&
+        (metadata->num_warps != 4 || metadata->warp_size != 32 ||
+         metadata->shared_memory != 0 || metadata->static_shared_memory != 0 ||
+         metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0 ||
+         metadata->tile_m != 0 || metadata->tile_n != 0 || metadata->tile_k != 0)) {
         return false;
     }
     return !amd_tensor_data_overlaps(op, op->src[0]) ||
@@ -6034,7 +6057,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 &sections[0], &sections[1], &sections[2], &sections[3],
                 &theta_scale, &frequency[1], &frequency[3],
             };
-            if (!backend_context->device->aot->launch("flagos_rope_ggml_recurrence_f32", backend_context->stream,
+            if (!backend_context->device->aot->launch(amd_ggml_rope_kernel_name(node), backend_context->stream,
                     static_cast<unsigned int>(ggml_nrows(node)), 1, 1, arguments)) {
                 return GGML_STATUS_FAILED;
             }
