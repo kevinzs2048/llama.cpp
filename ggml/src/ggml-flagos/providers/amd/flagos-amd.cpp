@@ -2721,7 +2721,8 @@ static bool amd_supports_gated_delta_net_cache(
             return false;
         }
     }
-    return true;
+    return amd_kernel_launch_contract_fits(device, metadata, 26, 8, heads, sequences,
+        (static_cast<uint64_t>(state_size) + metadata->tile_n - 1) / metadata->tile_n);
 }
 
 static const char * amd_ggml_rope_kernel_name(const ggml_tensor * op) {
