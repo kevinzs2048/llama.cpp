@@ -2856,15 +2856,35 @@ static bool amd_supports_batched_gather(const amd_device_context * device, const
     return amd_describe_batched_gather(device, op, &launch);
 }
 
+// Called only after the corresponding tensor layout contract is established.
+// Keep grid calculation and the complete launch contract common to placement
+// and dispatch; the table may be F32, F16/BF16 or packed GGUF with an F16 alias.
+static bool amd_gather_launch_contract_fits(const amd_device_context * device,
+        const ggml_tensor * op, const char * kernel, int block_size, bool quantized) {
+    const auto * metadata = device->aot->find(kernel);
+    const uint64_t columns = static_cast<uint64_t>(op->ne[0]);
+    const uint64_t grid_y = (columns + block_size - 1) / block_size;
+    const size_t table_alignment = op->src[0]->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    const size_t arguments = quantized || op->src[0]->type != GGML_TYPE_F32 ? 5 : 4;
+    const size_t pointers = quantized ? 4 : 3;
+    return metadata != nullptr && metadata->block_size == block_size &&
+        metadata->num_warps == 4 && metadata->warp_size == 32 &&
+        metadata->shared_memory == 0 && metadata->static_shared_memory == 0 &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], table_alignment) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, arguments, pointers,
+            std::max<uint64_t>(1, op->ne[1]), grid_y, 1);
+}
+
 static bool amd_supports_dense_get_rows(const amd_device_context * device, const ggml_tensor * op) {
     flagos_amd::dense_gather_signature signature;
     if (device == nullptr || device->aot == nullptr ||
         !flagos_amd::describe_dense_gather(op, &signature)) {
         return false;
     }
-    const auto * metadata = device->aot->find("flagos_get_rows_f32");
-    return metadata != nullptr && metadata->argument_count == 4 &&
-        metadata->block_size == flagos_amd::dense_gather_block_size &&
+    return amd_gather_launch_contract_fits(device, op, "flagos_get_rows_f32",
+            flagos_amd::dense_gather_block_size, false) &&
         (signature.rows == 0 || (!amd_tensor_data_overlaps(op, op->src[0]) &&
                                 !amd_tensor_data_overlaps(op, op->src[1])));
 }
@@ -2896,11 +2916,7 @@ static bool amd_supports_half_get_rows(const amd_device_context * device, const 
             return false;
         }
     }
-    const auto * metadata = device->aot->find(kernel);
-    return metadata != nullptr && metadata->argument_count == 5 && metadata->block_size == 256 &&
-        metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == 0 &&
-        metadata->static_shared_memory == 0 && metadata->global_scratch_size == 0 &&
-        metadata->profile_scratch_size == 0;
+    return amd_gather_launch_contract_fits(device, op, kernel, 256, false);
 }
 
 static bool amd_supports_get_rows(const amd_device_context * device, const ggml_tensor * op) {
@@ -2931,7 +2947,7 @@ static bool amd_supports_get_rows(const amd_device_context * device, const ggml_
     if (!amd_tensor_element_offsets_fit_i32(op->src[0], 1)) {
         return false;
     }
-    return device->aot->find(kernel) != nullptr &&
+    return amd_gather_launch_contract_fits(device, op, kernel, static_cast<int>(block_size), true) &&
         !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
