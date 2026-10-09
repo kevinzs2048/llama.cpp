@@ -2752,8 +2752,10 @@ static bool amd_supports_ggml_rope(const amd_device_context * device, const ggml
          metadata->tile_m != 0 || metadata->tile_n != 0 || metadata->tile_k != 0)) {
         return false;
     }
-    return !amd_tensor_data_overlaps(op, op->src[0]) ||
-        (op->data == op->src[0]->data && ggml_is_contiguous(op->src[0]));
+    return amd_kernel_launch_contract_fits(device, metadata, 20, 4,
+            static_cast<uint64_t>(ggml_nrows(op)), 1, 1) &&
+        (!amd_tensor_data_overlaps(op, op->src[0]) ||
+         (amd_tensor_output_can_reuse_input(op, op->src[0]) && ggml_is_contiguous(op->src[0])));
 }
 
 static bool amd_supports_rope_neox(const amd_device_context * device, const ggml_tensor * op) {
@@ -2786,7 +2788,15 @@ static bool amd_supports_rope_neox(const amd_device_context * device, const ggml
     std::memcpy(&freq_scale, params + 6, sizeof(freq_scale));
     std::memcpy(&ext_factor, params + 7, sizeof(ext_factor));
     std::memcpy(&attn_factor, params + 8, sizeof(attn_factor));
-    return params[2] == GGML_ROPE_TYPE_NEOX &&
+    const auto * metadata = device->aot->find("flagos_rope_neox_f32");
+    return metadata->block_size > 0 &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 10, 3,
+            (static_cast<uint64_t>(ggml_nelements(op)) / 2 + metadata->block_size - 1) /
+                metadata->block_size, 1, 1) &&
+        params[2] == GGML_ROPE_TYPE_NEOX &&
         params[1] > 0 && params[1] % 2 == 0 && params[1] == op->ne[0] &&
         std::isfinite(freq_base) && freq_base > 0.0f &&
         std::isfinite(freq_scale) && freq_scale == 1.0f &&
@@ -2804,6 +2814,7 @@ static bool amd_supports_mrope(const amd_device_context * device, const ggml_ten
         !ggml_is_contiguous(op->src[1]) ||
         !amd_tensor_element_offsets_fit_i32(op, sizeof(float)) ||
         !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
+        !amd_tensor_element_offsets_fit_i32(op->src[1], sizeof(int32_t)) ||
         op->src[1]->ne[0] != op->ne[2] * 4 ||
         op->src[1]->ne[1] != 1 || op->src[1]->ne[2] != 1 || op->src[1]->ne[3] != 1 ||
         op->ne[0] <= 0 || op->ne[0] > INT32_MAX || op->ne[0] % 2 != 0 ||
@@ -2834,6 +2845,11 @@ static bool amd_supports_mrope(const amd_device_context * device, const ggml_ten
     return params[2] == GGML_ROPE_TYPE_MROPE &&
         params[1] > 0 && params[1] <= op->ne[0] && params[1] % 2 == 0 &&
         section_total == params[1] / 2 && metadata->block_size >= op->ne[0] &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 20, 3,
+            static_cast<uint64_t>(ggml_nrows(op)), 1, 1) &&
         std::isfinite(freq_base) && freq_base > 0.0f &&
         std::isfinite(freq_scale) && freq_scale == 1.0f &&
         std::isfinite(ext_factor) && ext_factor == 0.0f &&
