@@ -3947,6 +3947,12 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
     }
     const auto * metadata = device->aot->find(kernel);
     return metadata != nullptr && metadata->block_size >= op->ne[0] &&
+        amd_kernel_launch_contract_fits(device, metadata, broadcast_f32 ? 12 : 5, 3,
+            broadcast_f32 ? op->ne[1] : ggml_nelements(op) / op->ne[0],
+            broadcast_f32 ? op->ne[2] : 1, broadcast_f32 ? op->ne[3] : 1) &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        (mask == nullptr || amd_tensor_data_is_aligned(mask, mask->type == GGML_TYPE_F16 ? sizeof(uint16_t) : sizeof(float))) &&
         amd_tensor_output_can_reuse_input(op, op->src[0]) &&
         (mask == nullptr || !amd_tensor_data_overlaps(op, mask));
 }
