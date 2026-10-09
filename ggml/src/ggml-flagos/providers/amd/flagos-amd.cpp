@@ -2490,16 +2490,20 @@ static bool amd_supports_copy(const amd_device_context * device, const ggml_tens
         op->src[1]->type != op->type || op->data != op->src[1]->data)) {
         return false;
     }
+    const auto * metadata = device->aot->find(amd_copy_kernel_name(op));
+    const uint64_t grid = std::max<uint64_t>(1,
+        (static_cast<uint64_t>(ggml_nelements(op)) + 255) / 256);
+    if (metadata->block_size != 256 || metadata->num_warps != 4 || metadata->warp_size != 32 ||
+        metadata->shared_memory != 0 || metadata->static_shared_memory != 0 ||
+        !amd_tensor_data_is_aligned(op, element_size) ||
+        !amd_tensor_data_is_aligned(op->src[0], element_size) ||
+        !amd_kernel_launch_contract_fits(device, metadata, 19, 2, grid, 1, 1)) {
+        return false;
+    }
     if (f16) {
-        const auto * metadata = device->aot->find(amd_copy_kernel_name(op));
         const auto * output_root = op->view_src == nullptr ? op : op->view_src;
         const auto * input_root = op->src[0]->view_src == nullptr ? op->src[0] : op->src[0]->view_src;
-        if (metadata->argument_count != 19 || metadata->block_size != 256 ||
-            metadata->num_warps != 4 || metadata->warp_size != 32 || metadata->shared_memory != 0 ||
-            metadata->static_shared_memory != 0 || metadata->global_scratch_size != 0 ||
-            metadata->profile_scratch_size != 0 ||
-            !amd_tensor_data_is_aligned(op, element_size) ||
-            !amd_tensor_data_is_aligned(op->src[0], element_size) || output_root == input_root) {
+        if (output_root == input_root) {
             return false;
         }
         std::array<std::pair<size_t, int64_t>, GGML_MAX_DIMS> dimensions;
