@@ -2148,6 +2148,38 @@ static bool amd_supports_unary_f32(
         amd_tensor_output_can_reuse_input(op, op->src[0]);
 }
 
+static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
+        const flagos_amd::kernel_metadata * metadata, size_t arguments, size_t pointers,
+        uint64_t grid_x, uint64_t grid_y, uint64_t grid_z) {
+    if (device == nullptr || metadata == nullptr || pointers > arguments ||
+        metadata->argument_count != static_cast<int>(arguments) || metadata->argument_abi.size() != arguments ||
+        metadata->num_warps <= 0 || metadata->warp_size <= 0 || metadata->shared_memory < 0 ||
+        metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0) {
+        return false;
+    }
+    for (size_t index = 0; index < arguments; ++index) {
+        const auto & abi = metadata->argument_abi[index];
+        const bool pointer = index < pointers;
+        if (abi.size != (pointer ? sizeof(void *) : sizeof(int32_t)) ||
+            abi.kind != (pointer ? flagos_amd::kernel_argument_kind::global_buffer : flagos_amd::kernel_argument_kind::by_value)) {
+            return false;
+        }
+    }
+    const uint64_t grid[] = { grid_x, grid_y, grid_z };
+    for (int dimension = 0; dimension < 3; ++dimension) {
+        if (grid[dimension] == 0 || grid[dimension] > UINT32_MAX ||
+            (device->props.maxGridSize[dimension] > 0 && grid[dimension] > static_cast<uint64_t>(device->props.maxGridSize[dimension]))) {
+            return false;
+        }
+    }
+    const uint64_t threads = static_cast<uint64_t>(metadata->num_warps) * metadata->warp_size;
+    const size_t shared = device->props.sharedMemPerBlock;
+    return (device->props.warpSize <= 0 || metadata->warp_size == device->props.warpSize) &&
+        (device->props.maxThreadsPerBlock <= 0 || threads <= static_cast<uint64_t>(device->props.maxThreadsPerBlock)) &&
+        (shared == 0 || (metadata->static_shared_memory <= shared &&
+         static_cast<size_t>(metadata->shared_memory) <= shared - metadata->static_shared_memory));
+}
+
 static bool amd_supports_l2_norm(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_L2_NORM || op->src[0] == nullptr ||
@@ -2165,7 +2197,8 @@ static bool amd_supports_l2_norm(const amd_device_context * device, const ggml_t
     const auto * metadata = device->aot->find("flagos_l2_norm_strided_f32");
     float eps = 0.0f;
     std::memcpy(&eps, op->op_params, sizeof(eps));
-    return metadata->block_size >= op->ne[0] && std::isfinite(eps) && eps >= 0.0f &&
+    return amd_kernel_launch_contract_fits(device, metadata, 9, 2, op->ne[1], op->ne[2], op->ne[3]) &&
+        metadata->block_size >= op->ne[0] && std::isfinite(eps) && eps >= 0.0f &&
         // The strided source may map several logical rows onto a larger
         // backing allocation.  The kernel writes a separate contiguous
         // output layout, so even an exact base-pointer alias is unsafe unless
