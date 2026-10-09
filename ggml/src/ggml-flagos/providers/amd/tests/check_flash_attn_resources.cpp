@@ -74,5 +74,34 @@ int main(int argc,char **argv) {
         };
         test("head grid",[&]{device.props.maxGridSize[0]=1;});if(prefill)test("query grid",[&]{device.props.maxGridSize[1]=1;});test("threads",[&]{device.props.maxThreadsPerBlock=64;});test("wave",[&]{device.props.warpSize=64;});test("LDS capacity",[&]{device.props.sharedMemPerBlock=1;});test("dynamic LDS",[&]{metadata->shared_memory=70000;});test("static LDS",[&]{metadata->static_shared_memory=70000;});test("scratch",[&]{metadata->global_scratch_size=1;});test("profile scratch",[&]{metadata->profile_scratch_size=1;});test("missing ABI",[&]{metadata->argument_abi.pop_back();});test("pointer ABI",[&]{metadata->argument_abi[0].kind=flagos_amd::kernel_argument_kind::by_value;});test("scalar width",[&]{metadata->argument_abi.back().size=8;});test("zero warps",[&]{metadata->num_warps=0;});*metadata=saved;ggml_free(ctx);
     }
-    device.aot.reset();check(loaded==unloaded&&launches==4&&allocations==0,"mock lifecycle");std::printf("FLASH_ATTN_RESOURCES_HOST_COMPLETE API=%d checks=%d mock_launches=%d actual_GPU_calls=0\n",GGML_BACKEND_API_VERSION,checks,launches);
+    int split_checks=0;
+    for(int variant=0;variant<6;++variant) {
+        bool grouped=variant>=2;int head=(variant==1||variant==5)?256:128;int group=variant<2?4:(variant==2?2:variant==3?4:8);setenv("FLAGOS_AMD_SPLITKV_DECODE","1",1);setenv("FLAGOS_AMD_GROUPED_SPLITKV_DECODE",grouped?"1":"0",1);
+        auto * ctx=ggml_init({1024*1024,nullptr,true});auto * q=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,head,1,16);auto * kb=ggml_new_tensor_3d(ctx,GGML_TYPE_F16,head,16/group,4096);auto * vb=ggml_new_tensor_3d(ctx,GGML_TYPE_F16,head,16/group,4096);auto * k=ggml_permute(ctx,kb,0,2,1,3);auto * v=ggml_permute(ctx,vb,0,2,1,3);auto * mask=ggml_new_tensor_1d(ctx,GGML_TYPE_F16,4096);auto * out=ggml_flash_attn_ext(ctx,q,k,v,mask,.125f,0.f,0.f);hipGetDeviceProperties(&device.props,0);amd_backend_context context(&device,nullptr);flagos_amd::splitkv_decode_geometry geometry;check(amd_describe_splitkv(&context,out,&geometry),"valid optional selection");++split_checks;
+        auto * partial=const_cast<flagos_amd::kernel_metadata*>(amd_splitkv_kernel(&device,out,false));auto * merge=const_cast<flagos_amd::kernel_metadata*>(amd_splitkv_kernel(&device,out,true));check(partial&&merge,"split profiles");auto saved_partial=*partial,saved_merge=*merge;
+        auto test=[&](const char * label,const std::function<void()> & mutate) {
+            for(bool bound:{false,true}) {
+                *partial=saved_partial;*merge=saved_merge;hipGetDeviceProperties(&device.props,0);for(int j=0;j<4;++j)out->src[j]->data=bound?reinterpret_cast<void*>(UINT64_C(0x100000000)*(j+1)):nullptr;out->data=bound?reinterpret_cast<void*>(UINT64_C(0x600000000)):nullptr;mutate();check(amd_supports_flash_attn_decode(&device,out),"legal baseline preserved");
+#ifdef FLAGOS_SPLITKV_BEFORE_FIXTURE
+                check(amd_describe_splitkv(&context,out,&geometry),label);
+#else
+                check(!amd_describe_splitkv(&context,out,&geometry),label);
+#endif
+                ++split_checks;
+            }
+        };
+        test("partial pointer ABI",[&]{partial->argument_abi[0].kind=flagos_amd::kernel_argument_kind::by_value;});test("partial scalar width",[&]{partial->argument_abi.back().size=8;});test("partial ABI missing",[&]{partial->argument_abi.pop_back();});test("merge pointer ABI",[&]{merge->argument_abi[0].kind=flagos_amd::kernel_argument_kind::by_value;});test("merge scalar width",[&]{merge->argument_abi.back().size=8;});test("merge ABI missing",[&]{merge->argument_abi.pop_back();});test("split grid",[&]{device.props.maxGridSize[1]=1;});test("partial static LDS",[&]{partial->static_shared_memory=65536;});test("merge static LDS",[&]{merge->static_shared_memory=65537;});*partial=saved_partial;*merge=saved_merge;
+#ifndef FLAGOS_SPLITKV_BEFORE_FIXTURE
+        partial->argument_abi[0].kind=flagos_amd::kernel_argument_kind::by_value;
+        std::vector<float> query(ggml_nelements(q)+32,41.f),result(ggml_nelements(out)+32,37.f);std::vector<ggml_fp16_t> keys(ggml_nelements(k)+32,43),values(ggml_nelements(v)+32,47),masks(ggml_nelements(mask)+32,53);q->data=query.data()+8;kb->data=k->data=keys.data()+8;vb->data=v->data=values.data()+8;mask->data=masks.data()+8;out->data=result.data()+8;hipGetDeviceProperties(&device.props,0);expected_node=out;expected_prefill=false;int previous_launches=launches;ggml_backend backend{};backend.context=&context;ggml_tensor * nodes[]={out};ggml_cgraph graph{};graph.nodes=nodes;graph.n_nodes=1;check(amd_backend_graph_compute(&backend,&graph)==GGML_STATUS_SUCCESS,"invalid optional profile uses baseline");check(launches==previous_launches+1&&allocations==0&&context.splitkv_workspace==nullptr,"one baseline submission without workspace");check(std::all_of(result.begin()+8,result.end()-24,[](float x){return x==-123.f;}),"fallback output");check(std::all_of(result.begin(),result.begin()+8,[](float x){return x==37.f;})&&std::all_of(result.end()-24,result.end(),[](float x){return x==37.f;}),"fallback guards");check(std::all_of(query.begin(),query.end(),[](float x){return x==41.f;})&&std::all_of(keys.begin(),keys.end(),[](ggml_fp16_t x){return x==43;})&&std::all_of(values.begin(),values.end(),[](ggml_fp16_t x){return x==47;})&&std::all_of(masks.begin(),masks.end(),[](ggml_fp16_t x){return x==53;}),"fallback readonly inputs");expected_node=nullptr;*partial=saved_partial;++split_checks;
+#endif
+        ggml_free(ctx);
+    }
+    setenv("FLAGOS_AMD_SPLITKV_DECODE","0",1);setenv("FLAGOS_AMD_GROUPED_SPLITKV_DECODE","0",1);std::printf("SPLITKV_SELECTION_RESOURCES_HOST_COMPLETE API=%d checks=%d actual_GPU_calls=0\n",GGML_BACKEND_API_VERSION,split_checks);
+#ifdef FLAGOS_SPLITKV_BEFORE_FIXTURE
+    const int expected_launches=4;
+#else
+    const int expected_launches=10;
+#endif
+    device.aot.reset();check(loaded==unloaded&&launches==expected_launches&&allocations==0,"mock lifecycle");std::printf("FLASH_ATTN_RESOURCES_HOST_COMPLETE API=%d checks=%d mock_launches=%d actual_GPU_calls=0\n",GGML_BACKEND_API_VERSION,checks,launches);
 }

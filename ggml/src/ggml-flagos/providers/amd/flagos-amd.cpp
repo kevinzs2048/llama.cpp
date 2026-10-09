@@ -3824,12 +3824,22 @@ static const flagos_amd::kernel_metadata * amd_splitkv_kernel(
 
 static bool amd_describe_splitkv(const amd_backend_context * context, const ggml_tensor * op,
         flagos_amd::splitkv_decode_geometry * geometry) {
-    return amd_env_enabled("FLAGOS_AMD_SPLITKV_DECODE") && context != nullptr &&
-        amd_supports_flash_attn_decode(context->device, op) &&
-        flagos_amd::base_gcn_arch(context->device->arch) == "gfx1150" &&
-        flagos_amd::describe_splitkv_decode(op, geometry) &&
-        amd_splitkv_kernel(context->device, op, false) != nullptr &&
-        amd_splitkv_kernel(context->device, op, true) != nullptr;
+    if (!amd_env_enabled("FLAGOS_AMD_SPLITKV_DECODE") || context == nullptr ||
+        !amd_supports_flash_attn_decode(context->device, op) ||
+        flagos_amd::base_gcn_arch(context->device->arch) != "gfx1150" ||
+        !flagos_amd::describe_splitkv_decode(op, geometry)) {
+        return false;
+    }
+    const auto * partial = amd_splitkv_kernel(context->device, op, false);
+    const auto * merge = amd_splitkv_kernel(context->device, op, true);
+    if (partial == nullptr || merge == nullptr) {
+        return false;
+    }
+    const uint64_t group = static_cast<uint64_t>(op->src[0]->ne[2] / op->src[1]->ne[2]);
+    const uint64_t partial_heads = partial->tile_m == 16 ? geometry->heads / group : geometry->heads;
+    return amd_kernel_launch_contract_fits(context->device, partial, 18, 7,
+            partial_heads, geometry->splits, 1) &&
+        amd_kernel_launch_contract_fits(context->device, merge, 7, 4, geometry->heads, 1, 1);
 }
 
 static bool amd_splitkv_ready(const amd_backend_context * context, const ggml_tensor * op) {
