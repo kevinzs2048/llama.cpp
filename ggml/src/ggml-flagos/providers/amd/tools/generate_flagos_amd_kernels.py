@@ -2505,7 +2505,9 @@ def compile_core_ops_package_without_launch(
     with amd_hint_context():
         for operation, export in exports:
             FLAGGEMS_AOT_EXPORTS += (export,)
-            block = 4096 if operation == "rms_norm" else 256
+            # Preserve the legacy L2 row-width contract when replacing its
+            # module. A 256-column export silently removed 512-column support.
+            block = 4096 if operation == "rms_norm" else 512 if operation == "l2_norm_strided" else 256
             signature = {argument: "*fp32" if argument in ("x", "y", "output", "gate", "up", "a", "b", "s", "c")
                 else "fp32" if argument in ("scale", "bias", "eps") else "i32"
                 for argument in export.runtime_arguments}
