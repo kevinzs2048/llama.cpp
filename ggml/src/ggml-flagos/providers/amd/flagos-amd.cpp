@@ -2230,7 +2230,11 @@ static bool amd_supports_ssm_conv(
         ggml_nelements(op) <= 0 || ggml_nelements(op) > INT32_MAX) {
         return false;
     }
-    return !amd_tensor_data_overlaps(op, op->src[0]) &&
+    const auto * metadata = device->aot->find(kernel_name);
+    return metadata->block_size > 0 &&
+        amd_kernel_launch_contract_fits(device, metadata, 12, 3, op->ne[1], op->ne[2],
+            (static_cast<uint64_t>(op->ne[0]) + metadata->block_size - 1) / metadata->block_size) &&
+        !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
