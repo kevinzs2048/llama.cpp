@@ -3703,6 +3703,7 @@ static bool amd_supports_swiglu(const amd_device_context * device, const ggml_te
 
 #include "flagos-amd-geglu.inc"
 #include "flagos-amd-moe.inc"
+#include "flagos-amd-argsort.inc"
 #include "flagos-amd-attention.inc"
 
 static const char * amd_soft_max_kernel_name(const ggml_tensor * op) {
@@ -5926,6 +5927,15 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, "silu");
             continue;
         }
+        if (node->op == GGML_OP_ARGSORT && amd_supports_argsort(backend_context->device, node)) {
+            if (!amd_launch_argsort(backend_context, node)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "argsort");
+            continue;
+        }
         if (node->op == GGML_OP_MUL_MAT_ID && amd_supports_moe(backend_context->device, node)) {
             if (!amd_launch_moe(backend_context, node)) {
                 return GGML_STATUS_FAILED;
@@ -6145,6 +6155,7 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
            amd_supports_dense_get_rows(amd_device_from_dev(dev), op) ||
            amd_supports_half_get_rows(amd_device_from_dev(dev), op) ||
            amd_supports_batched_gather(amd_device_from_dev(dev), op))) ||
+         (op->op == GGML_OP_ARGSORT && amd_supports_argsort(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_MUL_MAT_ID && amd_supports_moe(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_MUL_MAT &&
           (amd_supports_quantized_mul_mat(amd_device_from_dev(dev), op) ||

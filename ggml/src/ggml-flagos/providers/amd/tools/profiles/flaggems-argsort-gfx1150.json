@@ -1,0 +1,87 @@
+{
+  "format": 1,
+  "arch": "gfx1150",
+  "warp_size": 32,
+  "profiles": [
+    {
+      "export": "flagos_argsort_f32_i32",
+      "name": "flagos_argsort_f32_i32_b64",
+      "semantic": "ggml.argsort.f32_rows.i32_permutation.strided_rows.stable_index_ties.nan_last.asc_desc.v1",
+      "signature": {
+        "x": "*fp32",
+        "output": "*i32",
+        "columns": "i32",
+        "source_row_stride": "i32",
+        "descending": "i32"
+      },
+      "constants": {
+        "BLOCK": 64,
+        "LOG2_BLOCK": 6
+      },
+      "geometry": {
+        "block_size": "BLOCK"
+      },
+      "num_warps": 4
+    },
+    {
+      "export": "flagos_argsort_f32_i32",
+      "name": "flagos_argsort_f32_i32_b256",
+      "semantic": "ggml.argsort.f32_rows.i32_permutation.strided_rows.stable_index_ties.nan_last.asc_desc.v1",
+      "signature": {
+        "x": "*fp32",
+        "output": "*i32",
+        "columns": "i32",
+        "source_row_stride": "i32",
+        "descending": "i32"
+      },
+      "constants": {
+        "BLOCK": 256,
+        "LOG2_BLOCK": 8
+      },
+      "geometry": {
+        "block_size": "BLOCK"
+      },
+      "num_warps": 4
+    },
+    {
+      "export": "flagos_argsort_f32_i32",
+      "name": "flagos_argsort_f32_i32_b1024",
+      "semantic": "ggml.argsort.f32_rows.i32_permutation.strided_rows.stable_index_ties.nan_last.asc_desc.v1",
+      "signature": {
+        "x": "*fp32",
+        "output": "*i32",
+        "columns": "i32",
+        "source_row_stride": "i32",
+        "descending": "i32"
+      },
+      "constants": {
+        "BLOCK": 1024,
+        "LOG2_BLOCK": 10
+      },
+      "geometry": {
+        "block_size": "BLOCK"
+      },
+      "num_warps": 4
+    },
+    {
+      "export": "flagos_argsort_f32_i32",
+      "name": "flagos_argsort_f32_i32_b4096",
+      "semantic": "ggml.argsort.f32_rows.i32_permutation.strided_rows.stable_index_ties.nan_last.asc_desc.v1",
+      "signature": {
+        "x": "*fp32",
+        "output": "*i32",
+        "columns": "i32",
+        "source_row_stride": "i32",
+        "descending": "i32"
+      },
+      "constants": {
+        "BLOCK": 4096,
+        "LOG2_BLOCK": 12
+      },
+      "geometry": {
+        "block_size": "BLOCK"
+      },
+      "num_warps": 8
+    }
+  ]
+}
