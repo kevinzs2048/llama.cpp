@@ -34,6 +34,7 @@ extern "C" hipError_t hipMalloc(void ** ptr, size_t size) { *ptr = std::malloc(s
 extern "C" hipError_t hipFree(void * ptr) { std::free(ptr); ++releases; return hipSuccess; }
 static ggml_tensor * expected_activation = nullptr, * expected_mul = nullptr;
 static std::vector<std::string> submitted;
+static bool fail_fused_submission=false;
 extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function,unsigned gx,unsigned gy,unsigned gz,
  unsigned,unsigned,unsigned,unsigned,hipStream_t,void **args,void **) {
     check(expected_activation && expected_mul && gx==4 && gy==1 && gz==1,"grid");
@@ -47,6 +48,7 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function,unsigned gx,u
         check(*static_cast<int*>(args[3])==771,"fused count");output=*static_cast<void **>(args[2]);
     } else if(silu) {check(*static_cast<void **>(args[0])==expected_activation->src[0]->data && *static_cast<void **>(args[1])==expected_activation->data,"direct silu bindings");output=*static_cast<void **>(args[1]);}
     else {check(*static_cast<void **>(args[0])==expected_activation->data && *static_cast<void **>(args[1])==expected_mul->src[1]->data && *static_cast<void **>(args[2])==expected_mul->data,"direct mul bindings");output=*static_cast<void **>(args[2]);}
+    if(fused&&fail_fused_submission){static_cast<float*>(output)[0]=-99.f;++launches;return hipErrorInvalidValue;}
     std::fill_n(static_cast<float*>(output),771,42.f);++launches;return hipSuccess;
 }
 int main(int argc,char **argv) {
@@ -118,5 +120,13 @@ int main(int argc,char **argv) {
     test("input alignment",false,[](auto*a,auto*){a->src[0]->data=reinterpret_cast<void*>(UINT64_C(0x100000002));});
     test("up alignment",false,[](auto*,auto*m){m->src[1]->data=reinterpret_cast<void*>(UINT64_C(0x200000002));});
     test("output alignment",false,[](auto*,auto*m){m->data=reinterpret_cast<void*>(UINT64_C(0x300000002));});
+    if(after) {
+        *metadata=saved;hipGetDeviceProperties(&device.props,0);setenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS","1",1);
+        auto*ctx=ggml_init({1024*1024,nullptr,true});auto*x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,257,3);auto*up=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,257,3);auto*a=ggml_silu(ctx,x);auto*m=ggml_mul(ctx,a,up);
+        std::vector<float>xv(803,37.f),uv(803,43.f),av(803,47.f),ov(803,53.f);x->data=xv.data()+8;up->data=uv.data()+8;a->data=av.data()+8;m->data=ov.data()+8;auto*g=ggml_new_graph(ctx);ggml_build_forward_expand(g,m);ggml_cgraph split=ggml_graph_view(g,0,2);
+        expected_activation=a;expected_mul=m;submitted.clear();fail_fused_submission=true;
+        {amd_backend_context context(&device,nullptr);ggml_backend backend{};backend.context=&context;check(amd_backend_graph_compute(&backend,&split)==GGML_STATUS_FAILED,"post-submission error");}
+        check(submitted.size()==1&&submitted[0].find("flagos_swiglu_split_f32")==0,"no direct retry after partial fusion write");check(ov[8]==-99.f&&std::all_of(ov.begin()+9,ov.end(),[](float v){return v==53.f;})&&std::all_of(ov.begin(),ov.begin()+8,[](float v){return v==53.f;}),"partial output remains failed");check(std::all_of(av.begin(),av.end(),[](float v){return v==47.f;})&&std::all_of(xv.begin(),xv.end(),[](float v){return v==37.f;})&&std::all_of(uv.begin(),uv.end(),[](float v){return v==43.f;}),"no intermediate or input rewrite");fail_fused_submission=false;expected_activation=expected_mul=nullptr;++checks;ggml_free(ctx);
+    }
     *metadata=saved;device.aot.reset();check(loaded==unloaded&&allocations==0,"lifecycle");std::printf("selected_profile=%s\n",selected_profile);std::printf("SILU_MUL_FUSION_HOST_COMPLETE API=%d checks=%d mock_launches=%d after=%d actual_GPU_calls=0\n",GGML_BACKEND_API_VERSION,checks,launches,int(after));
 }
