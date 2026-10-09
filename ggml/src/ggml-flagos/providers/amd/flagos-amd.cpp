@@ -1500,6 +1500,22 @@ static bool amd_f16_graph_cache_ready(
     return true;
 }
 
+static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
+        const flagos_amd::kernel_metadata * metadata, size_t arguments, size_t pointers,
+        uint64_t grid_x, uint64_t grid_y, uint64_t grid_z);
+
+struct amd_f16_projection_launch {
+    const char * kernel = nullptr;
+    unsigned int grid_x = 0;
+    unsigned int grid_y = 0;
+    bool grouped = false;
+    bool aligned = false;
+};
+
+static bool amd_describe_f16_projection(const amd_device_context * device,
+        const void * weights, const void * input, const void * output,
+        int k, int rows, int columns, amd_f16_projection_launch * launch);
+
 static void * amd_get_dequantized_weight(
         amd_backend_context * context, const ggml_tensor * weight,
         const flagos_quantized_matmul_signature & signature) {
@@ -1540,7 +1556,12 @@ static void * amd_get_dequantized_weight(
         }
     }
     const char * kernel_name = amd_quantized_dequant_kernel(signature.weight_kind);
-    if (kernel_name == nullptr || context->device->aot->find(kernel_name) == nullptr) {
+    const auto * metadata = kernel_name == nullptr ? nullptr : context->device->aot->find(kernel_name);
+    const uint64_t elements = static_cast<uint64_t>(signature.k) * static_cast<uint64_t>(signature.rows);
+    const uint64_t blocks = elements / static_cast<uint64_t>(block_size);
+    if (metadata == nullptr || metadata->block_size != block_size ||
+        ggml_nbytes(weight) > INT32_MAX || reinterpret_cast<uintptr_t>(weight->data) % sizeof(uint16_t) != 0 ||
+        !amd_kernel_launch_contract_fits(context->device, metadata, 3, 3, blocks, 1, 1)) {
         return nullptr;
     }
     size_t bytes = 0;
@@ -1548,8 +1569,6 @@ static void * amd_get_dequantized_weight(
         (reusable != nullptr && reusable->bytes != bytes)) {
         return nullptr;
     }
-    const uint64_t elements = static_cast<uint64_t>(signature.k) *
-        static_cast<uint64_t>(signature.rows);
     if (reusable == nullptr && context->dequant_cache_limit_bytes != 0 &&
         (bytes > context->dequant_cache_limit_bytes ||
          context->dequant_cache_bytes > context->dequant_cache_limit_bytes - bytes)) {
@@ -1572,7 +1591,6 @@ static void * amd_get_dequantized_weight(
     }
     void * weights_u8 = weight->data;
     void * weights_f16 = weight->data;
-    int blocks = static_cast<int>(elements / static_cast<uint64_t>(block_size));
     flagos_amd::kernel_arguments arguments = { &weights_u8, &weights_f16, &f16_data };
     if (!context->device->aot->launch(kernel_name, context->stream,
             static_cast<unsigned int>(blocks), 1, 1, arguments)) {
@@ -2181,6 +2199,8 @@ static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
         (shared == 0 || (metadata->static_shared_memory <= shared &&
          static_cast<size_t>(metadata->shared_memory) <= shared - metadata->static_shared_memory));
 }
+
+#include "flagos-amd-f16-projection.inc"
 
 static bool amd_supports_l2_norm(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
@@ -5794,41 +5814,21 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                         &dequantized_weights, &activation_data, &output_data,
                         &k, &rows, &columns,
                     };
-                    const bool grouped = amd_grouped_f16_gemm_enabled(backend_context->device, columns) &&
-                        backend_context->device->aot->find("flagos_mul_mat_f16_f32_grouped") != nullptr;
-                    const char * aligned_config = std::getenv("FLAGOS_AMD_ALIGNED_F16_GEMM");
-                    const bool aligned = !grouped &&
-                        (aligned_config == nullptr || std::strcmp(aligned_config, "0") != 0) &&
-                        backend_context->device->aot->find("flagos_mul_mat_f16_f32_batched_aligned") != nullptr &&
-                        flagos_amd::supports_aligned_f16_gemm_launch(
-                            dequantized_weights, activation_data, output_data, k, rows);
-                    const char * f16_kernel = grouped
-                        ? "flagos_mul_mat_f16_f32_grouped" : aligned
-                        ? "flagos_mul_mat_f16_f32_batched_aligned" : "flagos_mul_mat_f16_f32_batched";
-                    if (grouped || aligned) {
-                        f16_metadata = backend_context->device->aot->find(f16_kernel);
+                    amd_f16_projection_launch projection;
+                    if (amd_describe_f16_projection(backend_context->device, dequantized_weights,
+                            activation_data, output_data, k, rows, columns, &projection)) {
+                        if (!backend_context->device->aot->launch(
+                                projection.kernel, backend_context->stream,
+                                projection.grid_x, projection.grid_y, 1, f16_arguments)) {
+                            return GGML_STATUS_FAILED;
+                        }
+                        backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                        backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+                        backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
+                        amd_trace_op(backend_context, node,
+                            projection.grouped ? "f16_matmul_grouped" : projection.aligned ? "f16_matmul_aligned" : "f16_matmul_batched");
+                        continue;
                     }
-                    const unsigned int tile_m = f16_metadata->tile_m > 0
-                        ? static_cast<unsigned int>(f16_metadata->tile_m) : AMD_F16_MATMUL_BLOCK_M;
-                    const unsigned int tile_n = f16_metadata->tile_n > 0
-                        ? static_cast<unsigned int>(f16_metadata->tile_n) : AMD_F16_MATMUL_BLOCK_N;
-                    const unsigned int blocks_m =
-                        (static_cast<unsigned int>(rows) + tile_m - 1) / tile_m;
-                    const unsigned int blocks_n =
-                        (static_cast<unsigned int>(columns) + tile_n - 1) / tile_n;
-                    const unsigned int grid_x = grouped ? blocks_m * blocks_n : blocks_m;
-                    const unsigned int grid_y = grouped ? 1U : blocks_n;
-                    if (!backend_context->device->aot->launch(
-                            f16_kernel, backend_context->stream,
-                            grid_x, grid_y, 1, f16_arguments)) {
-                        return GGML_STATUS_FAILED;
-                    }
-                    backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
-                    backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
-                    backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
-                    amd_trace_op(backend_context, node,
-                        grouped ? "f16_matmul_grouped" : aligned ? "f16_matmul_aligned" : "f16_matmul_batched");
-                    continue;
                 }
             }
             if (columns == 1) {
