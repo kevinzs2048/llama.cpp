@@ -3715,7 +3715,10 @@ static const flagos_amd::kernel_metadata * amd_flash_attn_kernel(
         metadata->block_size != (prefill ? metadata->tile_m : metadata->tile_n)) {
         return nullptr;
     }
-    return metadata;
+    const uint64_t query_tiles = prefill
+        ? (static_cast<uint64_t>(op->ne[2]) + metadata->block_size - 1) / metadata->block_size : 1;
+    return amd_kernel_launch_contract_fits(device, metadata, prefill ? 19 : 16, 5,
+        static_cast<uint64_t>(op->ne[1]), query_tiles, 1) ? metadata : nullptr;
 }
 
 static bool amd_supports_flash_attn_decode(const amd_device_context * device, const ggml_tensor * op) {
