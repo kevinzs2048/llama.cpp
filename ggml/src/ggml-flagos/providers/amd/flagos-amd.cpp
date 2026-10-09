@@ -2136,8 +2136,30 @@ static bool amd_candidate_bindings_ready(
 }
 
 static bool amd_tensor_data_overlaps(const ggml_tensor * left, const ggml_tensor * right) {
-    if (left == nullptr || right == nullptr || left->data == nullptr || right->data == nullptr) {
+    if (left == nullptr || right == nullptr) {
         return false;
+    }
+    if (left->data == nullptr || right->data == nullptr) {
+        // GGML flattens public views to their allocation root. These offsets
+        // and spans already establish aliasing before scheduler allocation;
+        // do not advertise a path that will reject the same views when bound.
+        const auto * left_root = left->view_src == nullptr ? left : left->view_src;
+        const auto * right_root = right->view_src == nullptr ? right : right->view_src;
+        if (left_root != right_root) {
+            return false;
+        }
+        const size_t left_size = ggml_nbytes(left);
+        const size_t right_size = ggml_nbytes(right);
+        const size_t left_offset = left->view_src == nullptr ? 0 : left->view_offs;
+        const size_t right_offset = right->view_src == nullptr ? 0 : right->view_offs;
+        if (left_size == 0 || right_size == 0) {
+            return false;
+        }
+        if (left_offset > SIZE_MAX - left_size || right_offset > SIZE_MAX - right_size) {
+            return true;
+        }
+        return left_offset < right_offset + right_size &&
+            right_offset < left_offset + left_size;
     }
     const uintptr_t left_begin = reinterpret_cast<uintptr_t>(left->data);
     const uintptr_t right_begin = reinterpret_cast<uintptr_t>(right->data);
@@ -2152,8 +2174,18 @@ static bool amd_tensor_data_overlaps(const ggml_tensor * left, const ggml_tensor
 
 static bool amd_tensor_output_can_reuse_input(
         const ggml_tensor * output, const ggml_tensor * input) {
-    return !amd_tensor_data_overlaps(output, input) ||
-        (output->data == input->data && ggml_nbytes(output) == ggml_nbytes(input));
+    if (!amd_tensor_data_overlaps(output, input)) {
+        return true;
+    }
+    if (ggml_nbytes(output) != ggml_nbytes(input)) {
+        return false;
+    }
+    if (output->data != nullptr && input->data != nullptr) {
+        return output->data == input->data;
+    }
+    const size_t output_offset = output->view_src == nullptr ? 0 : output->view_offs;
+    const size_t input_offset = input->view_src == nullptr ? 0 : input->view_offs;
+    return output_offset == input_offset;
 }
 
 static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
