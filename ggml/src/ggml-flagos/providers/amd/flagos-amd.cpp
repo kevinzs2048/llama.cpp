@@ -3579,12 +3579,19 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
     return gate->data == nullptr || up->data == nullptr || gate->data != up->data;
 }
 
-static bool amd_supports_rope_kv_store(const amd_device_context * device,
+static bool amd_rope_kv_launch_contract_fits(const amd_device_context * device, const ggml_tensor * view) {
+    const auto * metadata = device->aot->find("flagos_rope_kv_store_f32_f16");
+    return metadata != nullptr && metadata->block_size > 0 &&
+        amd_kernel_launch_contract_fits(device, metadata, 12, 4,
+            (static_cast<uint64_t>(ggml_nelements(view)) + metadata->block_size - 1) /
+                metadata->block_size, 1, 1);
+}
+
+static bool amd_supports_rope_kv_store_tensors(const amd_device_context * device,
                                        const ggml_tensor * rope,
                                        const ggml_tensor * view,
                                        const ggml_tensor * set_rows) {
     return device != nullptr && device->aot != nullptr &&
-        device->aot->find("flagos_rope_kv_store_f32_f16") != nullptr &&
         rope != nullptr && view != nullptr && set_rows != nullptr &&
         amd_supports_rope_neox(device, rope) &&
         view->op == GGML_OP_VIEW && view->src[0] == rope &&
@@ -3600,6 +3607,12 @@ static bool amd_supports_rope_kv_store(const amd_device_context * device,
         !amd_tensor_data_overlaps(set_rows, rope->src[0]) &&
         !amd_tensor_data_overlaps(set_rows, rope->src[1]) &&
         amd_supports_set_rows(device, set_rows);
+}
+
+static bool amd_supports_rope_kv_store(const amd_device_context * device,
+        const ggml_tensor * rope, const ggml_tensor * view, const ggml_tensor * set_rows) {
+    return amd_supports_rope_kv_store_tensors(device, rope, view, set_rows) &&
+        amd_rope_kv_launch_contract_fits(device, view);
 }
 
 static bool amd_supports_rms_norm_mul_rope(
@@ -3650,10 +3663,18 @@ static bool amd_supports_rms_norm_mul_rope(
         amd_tensor_data_overlaps(output, rope->src[1])) {
         return false;
     }
+    if (!amd_tensor_data_is_aligned(norm->src[0], sizeof(float)) ||
+        !amd_tensor_data_is_aligned(weight, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(rope->src[1], sizeof(int32_t)) ||
+        !amd_tensor_data_is_aligned(output, store ? sizeof(uint16_t) : sizeof(float)) ||
+        !amd_kernel_launch_contract_fits(device, metadata, store ? 13 : 11, store ? 5 : 4,
+            static_cast<uint64_t>(norm->ne[1]) * norm->ne[2], 1, 1)) {
+        return false;
+    }
     if (!store) {
         return true;
     }
-    return view != nullptr && amd_supports_rope_kv_store(device, rope, view, set_rows) &&
+    return view != nullptr && amd_supports_rope_kv_store_tensors(device, rope, view, set_rows) &&
         set_rows->src[1]->data != nullptr && !amd_tensor_data_overlaps(set_rows, set_rows->src[1]);
 }
 
