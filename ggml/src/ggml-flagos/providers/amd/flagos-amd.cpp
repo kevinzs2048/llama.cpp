@@ -2156,19 +2156,6 @@ static bool amd_tensor_output_can_reuse_input(
         (output->data == input->data && ggml_nbytes(output) == ggml_nbytes(input));
 }
 
-static bool amd_supports_unary_f32(
-        const amd_device_context * device, const ggml_tensor * op,
-        ggml_unary_op unary, const char * kernel_name) {
-    return device != nullptr && device->aot != nullptr && kernel_name != nullptr &&
-        device->aot->find(kernel_name) != nullptr && op != nullptr &&
-        op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == unary &&
-        op->src[0] != nullptr && amd_tensor_is_contiguous_f32(op) &&
-        amd_tensor_is_contiguous_f32(op->src[0]) &&
-        ggml_are_same_shape(op, op->src[0]) && ggml_nelements(op) > 0 &&
-        ggml_nelements(op) <= INT32_MAX &&
-        amd_tensor_output_can_reuse_input(op, op->src[0]);
-}
-
 static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
         const flagos_amd::kernel_metadata * metadata, size_t arguments, size_t pointers,
         uint64_t grid_x, uint64_t grid_y, uint64_t grid_z) {
@@ -2201,6 +2188,7 @@ static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
          static_cast<size_t>(metadata->shared_memory) <= shared - metadata->static_shared_memory));
 }
 
+#include "flagos-amd-elementwise.inc"
 #include "flagos-amd-f16-projection.inc"
 
 static bool amd_supports_l2_norm(const amd_device_context * device, const ggml_tensor * op) {
@@ -2810,13 +2798,7 @@ static bool amd_supports_mrope(const amd_device_context * device, const ggml_ten
 }
 
 static bool amd_supports_silu(const amd_device_context * device, const ggml_tensor * op) {
-    return device != nullptr && device->aot != nullptr && op != nullptr &&
-        op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SILU &&
-        device->aot->find("flagos_silu_f32") != nullptr && op->src[0] != nullptr &&
-        amd_tensor_is_contiguous_f32(op) && amd_tensor_is_contiguous_f32(op->src[0]) &&
-        ggml_are_same_shape(op, op->src[0]) && ggml_nelements(op) > 0 &&
-        ggml_nelements(op) <= INT32_MAX &&
-        amd_tensor_output_can_reuse_input(op, op->src[0]);
+    return amd_supports_unary_f32(device, op, GGML_UNARY_OP_SILU, "flagos_silu_f32");
 }
 
 static bool amd_supports_set_rows(const amd_device_context * device, const ggml_tensor * op) {
@@ -5211,7 +5193,8 @@ static bool amd_supports_add(const amd_device_context * device, const ggml_tenso
     const bool flat_vector_repeat = op->src[1]->ne[0] == op->src[0]->ne[0] &&
         op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1;
     const char * kernel = same_shape ? "flagos_add_f32" : "flagos_add_repeat_f32";
-    return (same_shape || flat_vector_repeat) && device->aot->find(kernel) != nullptr &&
+    return (same_shape || flat_vector_repeat) &&
+        amd_elementwise_launch_contract_fits(device, op, kernel, same_shape ? 4 : 5, 3) &&
         amd_tensor_output_can_reuse_input(op, op->src[0]) &&
         (same_shape ? amd_tensor_output_can_reuse_input(op, op->src[1])
                     : !amd_tensor_data_overlaps(op, op->src[1]));
@@ -5237,6 +5220,9 @@ static bool amd_supports_mul(const amd_device_context * device, const ggml_tenso
         ggml_nelements(op->src[1]) <= 0 || ggml_nelements(op->src[1]) > INT32_MAX) {
         return false;
     }
+    if (!amd_elementwise_launch_contract_fits(device, op, "flagos_mul_f32", 5, 3)) {
+        return false;
+    }
     if (ggml_are_same_shape(op->src[0], op->src[1])) {
         return amd_tensor_output_can_reuse_input(op, op->src[0]) &&
             amd_tensor_output_can_reuse_input(op, op->src[1]);
@@ -5257,7 +5243,8 @@ static bool amd_supports_scale(const amd_device_context * device, const ggml_ten
         amd_tensor_is_contiguous_f32(op) && amd_tensor_is_contiguous_f32(op->src[0]) &&
         ggml_are_same_shape(op, op->src[0]) &&
         ggml_nelements(op) <= INT32_MAX &&
-        amd_tensor_output_can_reuse_input(op, op->src[0]);
+        amd_tensor_output_can_reuse_input(op, op->src[0]) &&
+        amd_elementwise_launch_contract_fits(device, op, "flagos_scale_f32", 5, 2);
 }
 
 static bool amd_supports_strided_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
