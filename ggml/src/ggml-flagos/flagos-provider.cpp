@@ -100,6 +100,12 @@ bool flagos_provider_get_device_profile(
         return flagos_device_profile_is_valid(profile);
     }
 
+    // A declined optional query may have written only part of its result.
+    // Build the conservative fallback without any of those unverified fields.
+    *profile = {};
+    profile->struct_size = sizeof(flagos_device_profile);
+    profile->version = 1;
+
     flagos_device_caps caps {};
     if (!provider->device_caps(local_index, &caps) ||
         !flagos_device_caps_are_valid(&caps)) {

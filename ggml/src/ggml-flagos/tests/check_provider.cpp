@@ -101,6 +101,24 @@ static bool device_profile(size_t, flagos_device_profile * profile) {
     return true;
 }
 
+static bool declining_device_profile(size_t, flagos_device_profile * profile) {
+    *profile = {};
+    profile->struct_size = sizeof(flagos_device_profile);
+    profile->version = 1;
+    profile->features = FLAGOS_FEATURE_SME;
+    profile->vector_bits = 1024;
+    profile->lane_count = 32;
+    profile->matrix_m = profile->matrix_n = profile->matrix_k = 16;
+    profile->concurrency = 64;
+    profile->memory_domain_id = 99;
+    return false;
+}
+
+static bool unavailable_device_profile(size_t, flagos_device_profile * profile) {
+    *profile = {};
+    return false;
+}
+
 int main() {
     flagos_provider_v1 provider = {
         FLAGOS_PROVIDER_API_VERSION,
@@ -218,6 +236,27 @@ int main() {
     CHECK(legacy_profile.engine == flagos_engine_kind::gpu);
     CHECK(legacy_profile.architecture != nullptr);
     CHECK(std::strcmp(legacy_profile.architecture, "gpu") == 0);
+
+    flagos_provider_v1 declining_provider = legacy_provider;
+    declining_provider.struct_size = sizeof(flagos_provider_v1);
+    declining_provider.get_device_profile = declining_device_profile;
+    CHECK(flagos_provider_get_device_profile(&declining_provider, 0, &legacy_profile));
+    CHECK(legacy_profile.vector_bits == 0);
+    CHECK(legacy_profile.lane_count == 0);
+    CHECK(legacy_profile.matrix_m == 0 && legacy_profile.matrix_n == 0 && legacy_profile.matrix_k == 0);
+    CHECK(legacy_profile.concurrency == 0);
+    CHECK(legacy_profile.features == 0);
+    CHECK(legacy_profile.memory_domain_id == 7);
+    const flagos_kernel_variant vector_variant {
+        "requires-vector-width",
+        { 0, 0, 128, 4, nullptr },
+    };
+    CHECK(!flagos_kernel_variant_matches(&legacy_profile, &vector_variant, &shape));
+
+    declining_provider.get_device_profile = unavailable_device_profile;
+    CHECK(flagos_provider_get_device_profile(&declining_provider, 0, &legacy_profile));
+    CHECK(legacy_profile.engine == flagos_engine_kind::gpu);
+    CHECK(legacy_profile.struct_size == sizeof(flagos_device_profile) && legacy_profile.version == 1);
 
     std::puts("FlagOS provider ABI checks passed");
     return 0;
