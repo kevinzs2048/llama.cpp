@@ -176,5 +176,5 @@ const flagos_kernel_variant * flagos_select_kernel_variant(
             selected_state = match.state;
         }
     }
-    return selected_score == std::numeric_limits<int64_t>::min() ? nullptr : selected;
+    return selected;
 }
