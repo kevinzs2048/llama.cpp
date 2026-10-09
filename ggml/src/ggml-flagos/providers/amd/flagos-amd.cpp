@@ -220,6 +220,9 @@ struct amd_backend_context {
     amd_device_context * device = nullptr;
     hipStream_t stream = nullptr;
     void * packed_ffn_workspace = nullptr;
+    void * geglu_lut = nullptr;
+    bool geglu_lut_ready = false;
+    uint64_t geglu_lut_generation = 0;
     void * splitkv_workspace = nullptr;
     size_t splitkv_workspace_capacity = 0;
     uint64_t splitkv_workspace_generation = 0;
@@ -503,6 +506,7 @@ static uint64_t amd_execution_policy_key() {
     add(std::getenv("FLAGOS_AMD_BATCHED_GATHER"));
     add(std::getenv("FLAGOS_AMD_REPEAT_OPS"));
     add(std::getenv("FLAGOS_AMD_TANH"));
+    add(std::getenv("FLAGOS_AMD_GEGLU_LUT"));
     add(std::getenv("FLAGOS_AMD_ROPE_NEOX_RECURRENCE"));
     add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
     add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
@@ -527,6 +531,7 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     const uint64_t epochs[] = {
         context == nullptr ? 0 : context->dequant_cache_epoch,
         context == nullptr ? 0 : context->splitkv_workspace_generation,
+        context == nullptr ? 0 : context->geglu_lut_generation,
     };
     for (const uint64_t epoch : epochs) {
         for (size_t byte = 0; byte < sizeof(epoch); ++byte) {
@@ -1887,6 +1892,9 @@ static void amd_backend_free(ggml_backend_t backend) {
         }
         amd_clear_graph_captures(context);
         amd_release_dequant_cache(context);
+        if (context->geglu_lut != nullptr) {
+            amd_hip_check(hipFree(context->geglu_lut), "hipFree GEGLU LUT");
+        }
         if (context->packed_ffn_workspace != nullptr) {
             amd_hip_check(hipFree(context->packed_ffn_workspace), "hipFree packed FFN workspace");
         }
@@ -3693,6 +3701,7 @@ static bool amd_supports_swiglu(const amd_device_context * device, const ggml_te
         amd_elementwise_launch_contract_fits(device, op, "flagos_swiglu_split_f32", 4, 3);
 }
 
+#include "flagos-amd-geglu.inc"
 #include "flagos-amd-attention.inc"
 
 static const char * amd_soft_max_kernel_name(const ggml_tensor * op) {
@@ -4943,6 +4952,9 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
     if (cgraph->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
     }
+    if (!amd_prepare_geglu_lut(backend_context, cgraph)) {
+        return GGML_STATUS_FAILED;
+    }
     amd_prepare_dequant_cache(backend_context, cgraph);
     if (!amd_prepare_splitkv_workspace(backend_context, cgraph)) {
         return GGML_STATUS_FAILED;
@@ -5037,6 +5049,10 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         capture_binding_fingerprint ^= backend_context->dequant_cache_epoch;
         capture_binding_fingerprint *= 1099511628211ULL;
         capture_binding_fingerprint ^= backend_context->splitkv_workspace_generation;
+        capture_binding_fingerprint *= 1099511628211ULL;
+        capture_binding_fingerprint ^= backend_context->geglu_lut_generation;
+        capture_binding_fingerprint *= 1099511628211ULL;
+        capture_binding_fingerprint ^= reinterpret_cast<uintptr_t>(backend_context->geglu_lut);
         capture_binding_fingerprint *= 1099511628211ULL;
     }
     flagos_graph_binding_snapshot capture_bindings;
@@ -5909,6 +5925,25 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, "silu");
             continue;
         }
+        if (node->op == GGML_OP_GLU && amd_supports_geglu_lut(backend_context->device, node)) {
+            if (!backend_context->geglu_lut_ready || backend_context->geglu_lut == nullptr) {
+                return GGML_STATUS_FAILED;
+            }
+            const void * gate = node->src[0]->data;
+            const void * up = node->src[1]->data;
+            void * output = node->data;
+            const void * table = backend_context->geglu_lut;
+            const int count = static_cast<int>(ggml_nelements(node));
+            flagos_amd::kernel_arguments arguments { &gate, &up, &output, &table, &count };
+            if (!backend_context->device->aot->launch(AMD_GEGLU_LUT_KERNEL, backend_context->stream,
+                    static_cast<unsigned>((static_cast<uint64_t>(count) + 255) / 256), 1, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "geglu_cpu_fp16_lut");
+            continue;
+        }
         if (node->op == GGML_OP_GLU && amd_supports_swiglu(backend_context->device, node)) {
             const auto * metadata = backend_context->device->aot->find("flagos_swiglu_split_f32");
             int n = static_cast<int>(ggml_nelements(node));
@@ -6118,7 +6153,8 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
                GGML_UNARY_OP_SIGMOID, "flagos_sigmoid_f32") ||
            amd_supports_unary_f32(amd_device_from_dev(dev), op,
                GGML_UNARY_OP_SOFTPLUS, "flagos_softplus_f32"))) ||
-         (op->op == GGML_OP_GLU && amd_supports_swiglu(amd_device_from_dev(dev), op)) ||
+         (op->op == GGML_OP_GLU && (amd_supports_swiglu(amd_device_from_dev(dev), op) ||
+             amd_supports_geglu_lut(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_SOFT_MAX && amd_supports_soft_max(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_FLASH_ATTN_EXT &&
           (amd_supports_flash_attn_decode(amd_device_from_dev(dev), op) ||
