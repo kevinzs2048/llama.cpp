@@ -2468,6 +2468,8 @@ static bool amd_supports_copy(const amd_device_context * device, const ggml_tens
     return !amd_tensor_data_overlaps(op, op->src[0]);
 }
 
+static const char * amd_gated_delta_net_kernel_name(const amd_device_context * device, const ggml_tensor * op);
+
 static bool amd_supports_gated_delta_net(
         const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
@@ -2550,9 +2552,15 @@ static bool amd_supports_gated_delta_net(
     // The model-shape AOT package attaches tt.divisibility=16 to the Q/K/V
     // strides. ggml_is_contiguous_rows() proves only nb[0], so make the
     // stronger compiler contract explicit at the provider boundary.
-    return amd_tensor_data_is_aligned(op, 16) &&
-        amd_tensor_element_strides_are_aligned(q, sizeof(float), 16, 1) &&
-        amd_tensor_element_strides_are_aligned(v, sizeof(float), 16, 1);
+    if (!amd_tensor_data_is_aligned(op, 16) ||
+        !amd_tensor_element_strides_are_aligned(q, sizeof(float), 16, 1) ||
+        !amd_tensor_element_strides_are_aligned(v, sizeof(float), 16, 1)) {
+        return false;
+    }
+    const auto * selected = device->aot->find(amd_gated_delta_net_kernel_name(device, op));
+    return selected != nullptr && selected->tile_n > 0 &&
+        amd_kernel_launch_contract_fits(device, selected, 24, 7, heads, sequences,
+            (static_cast<uint64_t>(state_size) + selected->tile_n - 1) / selected->tile_n);
 }
 
 // Called only after the complete legacy GDN tensor/stride/alias contract passes.
