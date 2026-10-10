@@ -224,6 +224,18 @@ flagos_rt_status graph_capture_end(flagos_rt_stream_t stream, flagos_rt_graph_t 
     return FLAGOS_RT_OK;
 }
 
+// Replace the recorded launches of `existing` with the new recording; the
+// host graph has no fixed topology, so the update always succeeds.
+flagos_rt_status graph_capture_end_update(flagos_rt_stream_t stream, flagos_rt_graph_t existing, flagos_rt_graph_t * graph) {
+    auto * s = reinterpret_cast<hs_stream *>(stream);
+    if (s->recording == nullptr) return FLAGOS_RT_INVALID_ARGUMENT;
+    reinterpret_cast<hs_graph *>(existing)->records = std::move(s->recording->records);
+    delete s->recording;
+    s->recording = nullptr;
+    *graph = existing;
+    return FLAGOS_RT_OK;
+}
+
 flagos_rt_status graph_launch(flagos_rt_stream_t, flagos_rt_graph_t graph) {
     for (const hs_record & r : reinterpret_cast<hs_graph *>(graph)->records) {
         const flagos_rt_status status = run_kernel(r.kernel, r.grid, r.args.data(), uint32_t(r.args.size()));
@@ -264,6 +276,7 @@ flagos_runtime_v1 make_runtime() {
     rt.graph_capture_end = graph_capture_end;
     rt.graph_launch = graph_launch;
     rt.graph_destroy = graph_destroy;
+    rt.graph_capture_end_update = graph_capture_end_update;
     return rt;
 }
 

@@ -187,6 +187,18 @@ hipError_t hipGraphInstantiate(hipGraphExec_t * exec, hipGraph_t graph, hipGraph
     return hipSuccess;
 }
 hipError_t hipGraphDestroy(hipGraph_t graph) { delete reinterpret_cast<emu_graph *>(graph); return hipSuccess; }
+hipError_t hipGraphExecUpdate(hipGraphExec_t exec, hipGraph_t graph, hipGraphNode_t * error_node, hipGraphExecUpdateResult * result) {
+    auto * e = reinterpret_cast<emu_graph *>(exec);
+    auto * g = reinterpret_cast<emu_graph *>(graph);
+    if (error_node) *error_node = nullptr;
+    // Like HIP: kernel-node parameters may change, the topology may not.
+    bool same = e->launches.size() == g->launches.size();
+    for (size_t i = 0; same && i < e->launches.size(); ++i) same = e->launches[i].function == g->launches[i].function;
+    if (!same) { *result = hipGraphExecUpdateErrorTopologyChanged; return hipErrorGraphExecUpdateFailure; }
+    e->launches = g->launches;
+    *result = hipGraphExecUpdateSuccess;
+    return hipSuccess;
+}
 hipError_t hipGraphExecDestroy(hipGraphExec_t exec) { delete reinterpret_cast<emu_graph *>(exec); return hipSuccess; }
 hipError_t hipGraphLaunch(hipGraphExec_t exec, hipStream_t) {
     for (emu_launch & l : reinterpret_cast<emu_graph *>(exec)->launches) {

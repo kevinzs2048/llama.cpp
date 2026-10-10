@@ -347,6 +347,31 @@ flagos_rt_status graph_capture_end(flagos_rt_stream_t handle, flagos_rt_graph_t 
     return FLAGOS_RT_OK;
 }
 
+flagos_rt_status graph_capture_end_update(flagos_rt_stream_t handle, flagos_rt_graph_t existing, flagos_rt_graph_t * out) {
+    hipGraph_t graph = nullptr;
+    if (check(hipStreamEndCapture(reinterpret_cast<amd_stream *>(handle)->stream, &graph), "hipStreamEndCapture") !=
+            FLAGOS_RT_OK || graph == nullptr) {
+        return FLAGOS_RT_ERROR;
+    }
+    hipGraphExec_t exec = reinterpret_cast<hipGraphExec_t>(existing);
+    hipGraphNode_t error_node = nullptr;
+    hipGraphExecUpdateResult result = hipGraphExecUpdateError;
+    if (hipGraphExecUpdate(exec, graph, &error_node, &result) == hipSuccess && result == hipGraphExecUpdateSuccess) {
+        check(hipGraphDestroy(graph), "hipGraphDestroy");
+        *out = existing;
+        return FLAGOS_RT_OK;
+    }
+    // Topology changed: instantiate a new executable; `existing` stays valid.
+    hipGraphExec_t fresh = nullptr;
+    const flagos_rt_status status = check(hipGraphInstantiate(&fresh, graph, nullptr, nullptr, 0), "hipGraphInstantiate");
+    check(hipGraphDestroy(graph), "hipGraphDestroy");
+    if (status != FLAGOS_RT_OK) {
+        return status;
+    }
+    *out = reinterpret_cast<flagos_rt_graph_t>(fresh);
+    return FLAGOS_RT_OK;
+}
+
 flagos_rt_status graph_launch(flagos_rt_stream_t handle, flagos_rt_graph_t graph) {
     return check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), reinterpret_cast<amd_stream *>(handle)->stream),
                  "hipGraphLaunch");
@@ -401,6 +426,7 @@ flagos_runtime_v1 make_runtime() {
     rt.graph_capture_end = graph_capture_end;
     rt.graph_launch = graph_launch;
     rt.graph_destroy = graph_destroy;
+    rt.graph_capture_end_update = graph_capture_end_update;
     return rt;
 }
 

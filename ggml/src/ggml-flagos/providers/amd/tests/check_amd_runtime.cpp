@@ -149,6 +149,20 @@ extern "C" hipError_t hipGraphInstantiate(hipGraphExec_t * exec, hipGraph_t grap
     return hipSuccess;
 }
 extern "C" hipError_t hipGraphDestroy(hipGraph_t graph) { delete reinterpret_cast<mock_graph *>(graph); return hipSuccess; }
+static int g_graph_updates = 0;
+extern "C" hipError_t hipGraphExecUpdate(hipGraphExec_t exec, hipGraph_t graph, hipGraphNode_t * error_node,
+                                         hipGraphExecUpdateResult * result) {
+    auto * e = reinterpret_cast<mock_graph *>(exec);
+    auto * g = reinterpret_cast<mock_graph *>(graph);
+    if (error_node) *error_node = nullptr;
+    bool same = e->launches.size() == g->launches.size();
+    for (size_t i = 0; same && i < e->launches.size(); ++i) same = e->launches[i].function == g->launches[i].function;
+    if (!same) { *result = hipGraphExecUpdateErrorTopologyChanged; return hipErrorGraphExecUpdateFailure; }
+    e->launches = g->launches;
+    *result = hipGraphExecUpdateSuccess;
+    ++g_graph_updates;
+    return hipSuccess;
+}
 extern "C" hipError_t hipGraphExecDestroy(hipGraphExec_t exec) { delete reinterpret_cast<mock_graph *>(exec); return hipSuccess; }
 extern "C" hipError_t hipGraphLaunch(hipGraphExec_t exec, hipStream_t stream) {
     ++g_graph_launches;
@@ -399,6 +413,31 @@ int main(int argc, char ** argv) {
         }
         CHECK(g_graph_instantiations == 1);
         CHECK(g_graph_launches == 2);
+        // Same structure in new buffers (as decode moves KV views every
+        // token): the recorded graph is updated in place, not re-instantiated.
+        ggml_context * d2 = ggml_init(params);
+        ggml_tensor *ex, *ew, *eq;
+        ggml_tensor * eout = build(d2, ex, ew, eq);
+        ggml_cgraph * eg = ggml_new_graph(d2);
+        ggml_build_forward_expand(eg, eout);
+        ggml_backend_buffer_t eb = ggml_backend_alloc_ctx_tensors(d2, backend);
+        CHECK(eb != nullptr);
+        for (auto [d, c] : { std::pair{ ex, cx }, std::pair{ ew, cw }, std::pair{ eq, cq } }) {
+            std::vector<uint8_t> bytes(ggml_nbytes(c));
+            ggml_backend_tensor_get(c, bytes.data(), 0, bytes.size());
+            ggml_backend_tensor_set(d, bytes.data(), 0, bytes.size());
+        }
+        CHECK(ggml_backend_graph_compute(backend, eg) == GGML_STATUS_SUCCESS);
+        std::vector<float> a(ggml_nelements(eout)), b(ggml_nelements(cout));
+        ggml_backend_tensor_get(eout, a.data(), 0, ggml_nbytes(eout));
+        ggml_backend_tensor_get(cout, b.data(), 0, ggml_nbytes(cout));
+        double num = 0, den = 0;
+        for (size_t i = 0; i < a.size(); ++i) { num += (a[i] - b[i]) * double(a[i] - b[i]); den += double(b[i]) * b[i]; }
+        std::printf("  %-28s nmse %.3g\n", "captured graph, new buffers", num / den);
+        CHECK(num / den < 5e-4);
+        CHECK(g_graph_updates == 1 && g_graph_instantiations == 1 && g_graph_launches == 3);
+        ggml_backend_buffer_free(eb);
+        ggml_free(d2);
         ggml_backend_buffer_free(db);
         ggml_backend_buffer_free(cb);
         ggml_free(dctx);

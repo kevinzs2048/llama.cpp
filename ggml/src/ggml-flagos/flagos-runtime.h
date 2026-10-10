@@ -223,6 +223,13 @@ typedef struct flagos_runtime_v1 {
     flagos_rt_status (*graph_capture_end)(flagos_rt_stream_t stream, flagos_rt_graph_t * graph);
     flagos_rt_status (*graph_launch)(flagos_rt_stream_t stream, flagos_rt_graph_t graph);
     void (*graph_destroy)(flagos_rt_graph_t graph);
+    // End a capture by updating an existing recorded graph in place with the
+    // newly captured work (same structure, new addresses or scalars), as
+    // cudaGraphExecUpdate / hipGraphExecUpdate do. On success *graph is the
+    // updated `existing`; if the update is impossible the provider returns a
+    // fresh graph in *graph and leaves `existing` untouched. May be NULL.
+    flagos_rt_status (*graph_capture_end_update)(flagos_rt_stream_t stream, flagos_rt_graph_t existing,
+                                                 flagos_rt_graph_t * graph);
     // Whether the provider accepts a Common fusion pattern (flagos_pattern_id)
     // on this device. The core additionally requires the fused kernel in the
     // device's package.

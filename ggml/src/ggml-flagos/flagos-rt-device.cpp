@@ -254,6 +254,7 @@ struct rt_backend {
     uint64_t capture_tick = 0;
     uint64_t replays = 0;
     uint64_t recordings = 0;
+    uint64_t updates = 0;
 };
 
 rt_backend * backend_of(ggml_backend_t backend) {
@@ -281,8 +282,9 @@ void backend_free(ggml_backend_t backend) {
         ctx->device->rt->graph_destroy(entry.graph);
     }
     if (ctx->stats && ctx->capture) {
-        std::fprintf(stderr, "FlagOS %s: graph capture: %llu recorded, %llu replayed\n", ctx->device->name.c_str(),
-                     (unsigned long long) ctx->recordings, (unsigned long long) ctx->replays);
+        std::fprintf(stderr, "FlagOS %s: graph capture: %llu recorded, %llu updated in place, %llu launched\n",
+                     ctx->device->name.c_str(), (unsigned long long) ctx->recordings, (unsigned long long) ctx->updates,
+                     (unsigned long long) ctx->replays);
     }
     ctx->device->rt->stream_destroy(ctx->stream);
     delete ctx;
@@ -368,11 +370,23 @@ bool run_captured(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_pla
             return true;
         }
     }
+    // A structure seen before with other addresses (decode: KV views and
+    // lengths move every token) is re-recorded into its existing graph when
+    // the runtime can update graphs in place; otherwise a structure/binding
+    // pair is recorded the second time it appears.
+    rt_backend::capture_entry * same_structure = nullptr;
+    for (auto & entry : ctx->captures) {
+        if (entry.fingerprint == plan.structural_fingerprint) {
+            same_structure = &entry;
+            break;
+        }
+    }
+    const bool can_update = rt->graph_capture_end_update != nullptr && same_structure != nullptr;
     const uint64_t key = plan.structural_fingerprint ^ (bindings.fingerprint * 0x9e3779b97f4a7c15ull);
     if (ctx->capture_sightings.size() > 4096) {
         ctx->capture_sightings.clear();  // bounded; a cleared key only delays recording
     }
-    if (++ctx->capture_sightings[key] < 2) {
+    if (!can_update && ++ctx->capture_sightings[key] < 2) {
         return false;
     }
     if (rt->graph_capture_begin(ctx->stream) != FLAGOS_RT_OK) {
@@ -380,13 +394,26 @@ bool run_captured(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_pla
     }
     const bool recorded = run_plan(ctx, cgraph, plan);
     flagos_rt_graph_t graph = nullptr;
-    const bool ended = rt->graph_capture_end(ctx->stream, &graph) == FLAGOS_RT_OK && graph != nullptr;
+    bool ended;
+    if (can_update) {
+        ended = rt->graph_capture_end_update(ctx->stream, same_structure->graph, &graph) == FLAGOS_RT_OK && graph != nullptr;
+    } else {
+        ended = rt->graph_capture_end(ctx->stream, &graph) == FLAGOS_RT_OK && graph != nullptr;
+    }
     if (!recorded || !ended) {
-        if (graph != nullptr) {
+        if (graph != nullptr && !(can_update && graph == same_structure->graph)) {
             rt->graph_destroy(graph);
         }
         // Nothing ran while recording; fall back to direct execution.
         return false;
+    }
+    if (can_update && graph == same_structure->graph) {
+        same_structure->bindings = std::move(bindings);
+        same_structure->last_used = ++ctx->capture_tick;
+        ++ctx->updates;
+        ok = rt_check(rt->graph_launch(ctx->stream, graph), ctx->device, "graph_launch");
+        ctx->replays += ok;
+        return true;
     }
     // Bound the cache; a decode round can touch one split per layer.
     constexpr size_t capacity = 128;
