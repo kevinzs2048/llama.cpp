@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace flagos_ref {
 
@@ -20,6 +21,7 @@ struct program {
     uint32_t pid_y;
     uint32_t pid_z;
     uint32_t block;           // Triton BLOCK of the kernel
+    uint32_t tile_n;          // columns per program for tiled kernels, 0 if unused
     void * const * args;      // pointers to argument values, as in hipModuleLaunchKernel
 };
 
@@ -295,6 +297,40 @@ inline bool run(const std::string & name, const program & p) {
             float acc = 0.0f;
             for (int32_t tap = 0; tap < d_conv; ++tap) acc += F(0)[seq * I(8) + ch * I(7) + t + tap] * F(1)[ch * I(9) + tap];
             F(2)[seq * I(11) + t * I(10) + ch] = acc;
+        }
+        return true;
+    }
+    if (name == "flagos_gated_delta_net_scalar_f32") {
+        // (q, k, v, g, beta, state, out, Sd, H, T, B, sq1..3, sv1..3, sb1..3, q_heads, q_seq_ratio, K, scale)
+        const int32_t Sd = I(7), H = I(8), T = I(9), B = I(10);
+        const int32_t sq1 = I(11), sq2 = I(12), sq3 = I(13), sv1 = I(14), sv2 = I(15), sv3 = I(16);
+        const int32_t sb1 = I(17), sb2 = I(18), sb3 = I(19), q_heads = I(20), ratio = I(21), K = I(22);
+        const float scale = arg<float>(p, 23);
+        const int64_t head = p.pid_x, seq = p.pid_y;
+        const int64_t cols = p.tile_n;
+        const int64_t j0 = int64_t(p.pid_z) * cols, j1 = std::min<int64_t>(j0 + cols, Sd);
+        const int64_t qh = head % q_heads, qs = seq / ratio;
+        const int64_t sb = (seq * H + head) * int64_t(Sd) * Sd;
+        const int64_t attn_elems = int64_t(Sd) * H * T * B, snap_stride = int64_t(Sd) * Sd * H * B;
+        const float * q = F(0); const float * k = F(1); const float * v = F(2);
+        const float * g = F(3); const float * beta = F(4); const float * state = F(5); float * out = F(6);
+        std::vector<float> M(size_t(j1 - j0) * Sd);
+        for (int64_t j = j0; j < j1; ++j) for (int32_t i = 0; i < Sd; ++i) M[(j - j0) * Sd + i] = state[sb + j * Sd + i];
+        for (int32_t t = 0; t < T; ++t) {
+            const int64_t qb = qs * sq3 + int64_t(t) * sq2 + qh * sq1;
+            const int64_t gb = seq * sb3 + int64_t(t) * sb2 + head * sb1;
+            const float decay = std::exp(g[gb]), bt = beta[gb];
+            for (int64_t j = j0; j < j1; ++j) {
+                float * m = &M[(j - j0) * Sd];
+                float pk = 0.0f;
+                for (int32_t i = 0; i < Sd; ++i) { m[i] *= decay; pk += m[i] * k[qb + i]; }
+                const float d = (v[seq * sv3 + int64_t(t) * sv2 + head * sv1 + j] - pk) * bt;
+                float a = 0.0f;
+                for (int32_t i = 0; i < Sd; ++i) { m[i] += d * k[qb + i]; a += m[i] * q[qb + i]; }
+                out[((seq * T + t) * H + head) * Sd + j] = a * scale;
+                const int32_t slot = T - 1 - t;
+                if (slot < K) for (int32_t i = 0; i < Sd; ++i) out[attn_elems + slot * snap_stride + sb + j * Sd + i] = m[i];
+            }
         }
         return true;
     }

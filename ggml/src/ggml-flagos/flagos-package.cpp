@@ -110,6 +110,9 @@ bool flagos_kernel_package::open(const std::string & dir, std::string & error) {
             !flagos_get_int(item, "warp_size", info.warp_size, error) ||
             !flagos_get_int(item, "shared", info.shared_memory, error) ||
             !flagos_get_int(item, "argument_count", info.argument_count, error) ||
+            !flagos_get_int(item, "tile_m", info.tile_m, error) ||
+            !flagos_get_int(item, "tile_n", info.tile_n, error) ||
+            !flagos_get_int(item, "tile_k", info.tile_k, error) ||
             !flagos_get_int(item, "global_scratch_size", info.global_scratch_size, error) ||
             !flagos_get_int(item, "global_scratch_align", info.global_scratch_align, error) ||
             !flagos_get_int(item, "profile_scratch_size", info.profile_scratch_size, error) ||
@@ -117,7 +120,8 @@ bool flagos_kernel_package::open(const std::string & dir, std::string & error) {
             error = "kernel '" + info.name + "': " + error;
             return false;
         }
-        if (info.block_size < 0 || info.num_warps < 0 || info.warp_size < 0 || info.shared_memory < 0) {
+        if (info.block_size < 0 || info.num_warps < 0 || info.warp_size < 0 || info.shared_memory < 0 ||
+            info.tile_m < 0 || info.tile_n < 0 || info.tile_k < 0) {
             error = "kernel '" + info.name + "' has negative launch metadata";
             return false;
         }

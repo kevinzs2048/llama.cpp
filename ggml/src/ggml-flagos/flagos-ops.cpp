@@ -638,6 +638,81 @@ bool plan_ssm_conv(const flagos_kernel_package & package, const ggml_tensor * op
     }
     return true;
 }
+
+bool aligned16(const ggml_tensor * t) {
+    return t->data == nullptr || reinterpret_cast<uintptr_t>(t->data) % 16 == 0;
+}
+
+// GATED_DELTA_NET with a scalar gate per head and token (Qwen3.5/3.6
+// linear-attention layers). One program owns tile_n value rows of one
+// (head, sequence) state and walks the tokens:
+// flagos_gated_delta_net_scalar_f32(q, k, v, g, beta, state, out, S, H, T, B,
+//   q strides x3, v strides x3, beta strides x3, q_heads, B/Bq, K, 1/sqrt(S)),
+// grid (H, B, ceil(S / tile_n)). k shares q's layout and g shares beta's,
+// which the contract checks. The output holds the attention scores followed
+// by K state snapshots, most recent first.
+bool plan_gated_delta_net(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    const ggml_tensor * g = op->src[3];
+    const ggml_tensor * beta = op->src[4];
+    const ggml_tensor * state = op->src[5];
+    if (q == nullptr || k == nullptr || v == nullptr || g == nullptr || beta == nullptr || state == nullptr ||
+        !is_contiguous_f32(op) || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
+        !is_contiguous_f32(g) || !is_contiguous_f32(beta) || !is_contiguous_f32(state) ||
+        q->nb[0] != sizeof(float) || v->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const int64_t S = v->ne[0], H = v->ne[1], T = v->ne[2], B = v->ne[3];
+    const int64_t Hq = q->ne[1], Bq = q->ne[3];
+    int32_t K = 0;
+    std::memcpy(&K, op->op_params, sizeof(K));
+    if (S <= 0 || H <= 0 || T <= 0 || B <= 0 || Hq <= 0 || Hq > H || H % Hq != 0 || Bq <= 0 || Bq > B ||
+        B % Bq != 0 || K <= 0 || S % 16 != 0 || q->ne[0] != S || q->ne[2] != T ||
+        k->ne[0] != S || k->ne[1] != Hq || k->ne[2] != T || k->ne[3] != Bq ||
+        g->ne[0] != 1 || g->ne[1] != H || g->ne[2] != T || g->ne[3] != B ||
+        !ggml_are_same_shape(g, beta) || state->ne[0] != S || state->ne[1] != S || state->ne[2] != H || state->ne[3] != B ||
+        op->ne[0] != S * H || op->ne[1] != T * B + int64_t(K) * S * B || op->ne[2] != 1 || op->ne[3] != 1 ||
+        !fits_i32(ggml_nelements(op)) || !fits_i32(S * S * H * B) || !fits_i32(T * B) || H > 65535 || B > 65535 ||
+        !element_offsets_fit_i32(q, sizeof(float)) || !element_offsets_fit_i32(v, sizeof(float))) {
+        return false;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (q->nb[d] != k->nb[d] || g->nb[d] != beta->nb[d]) {
+            return false;
+        }
+    }
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if ((q->nb[d] / sizeof(float)) % 16 != 0 || (v->nb[d] / sizeof(float)) % 16 != 0) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : { q, k, v, g, beta, state }) {
+        if (!aligned16(t) || partially_overlaps(op, t) || (op->data != nullptr && op->data == t->data)) {
+            return false;
+        }
+    }
+    if (!aligned16(op)) {
+        return false;
+    }
+    const flagos_kernel_info * kernel = find_kernel(package, "flagos_gated_delta_net_scalar_f32", 24, H);
+    if (kernel == nullptr || kernel->block_size < S || kernel->tile_n <= 0) {
+        return false;
+    }
+    if (call != nullptr) {
+        const float scale = 1.0f / std::sqrt(static_cast<float>(S));
+        set_call(call, kernel, H, { ptr(q), ptr(k), ptr(v), ptr(g), ptr(beta), ptr(state), ptr(op),
+                 i32(S), i32(H), i32(T), i32(B),
+                 i32(q->nb[1] / sizeof(float)), i32(q->nb[2] / sizeof(float)), i32(q->nb[3] / sizeof(float)),
+                 i32(v->nb[1] / sizeof(float)), i32(v->nb[2] / sizeof(float)), i32(v->nb[3] / sizeof(float)),
+                 i32(beta->nb[1] / sizeof(float)), i32(beta->nb[2] / sizeof(float)), i32(beta->nb[3] / sizeof(float)),
+                 i32(Hq), i32(B / Bq), i32(K), f32(scale) });
+        call->grid[1] = static_cast<uint32_t>(B);
+        call->grid[2] = static_cast<uint32_t>((S + kernel->tile_n - 1) / kernel->tile_n);
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -660,6 +735,8 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
             return plan_l2_norm(package, op, call);
         case GGML_OP_SSM_CONV:
             return plan_ssm_conv(package, op, call);
+        case GGML_OP_GATED_DELTA_NET:
+            return plan_gated_delta_net(package, op, call);
         case GGML_OP_UNARY:
             return plan_unary(package, op, call);
         case GGML_OP_MUL_MAT:

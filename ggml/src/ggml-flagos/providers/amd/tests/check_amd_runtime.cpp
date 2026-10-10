@@ -181,7 +181,7 @@ static hipError_t execute_launch(hipFunction_t function, unsigned gx, unsigned g
     for (uint32_t z = 0; z < gz; ++z) {
         for (uint32_t y = 0; y < gy; ++y) {
             for (uint32_t x = 0; x < gx; ++x) {
-                CHECK(flagos_ref::run(name, { x, y, z, uint32_t(info->block_size), args }));
+                CHECK(flagos_ref::run(name, { x, y, z, uint32_t(info->block_size), uint32_t(info->tile_n), args }));
             }
         }
     }

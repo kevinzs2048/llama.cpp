@@ -25,11 +25,13 @@ namespace {
 
 struct hs_module {
     std::unordered_map<std::string, uint32_t> blocks;  // symbol -> BLOCK baked into the "binary"
+    std::unordered_map<std::string, uint32_t> tiles;   // symbol -> tile_n, 0 if untiled
 };
 
 struct hs_kernel {
     std::string name;
     uint32_t block;
+    uint32_t tile_n;
     uint32_t n_args;
 };
 
@@ -134,17 +136,20 @@ flagos_rt_status rt_memset(flagos_rt_stream_t, void * dst, int value, size_t siz
     return FLAGOS_RT_OK;
 }
 
-// Artifact format: first line "hostsim-module v1", then "<symbol> <BLOCK>".
+// Artifact format: first line "hostsim-module v1", then "<symbol> <BLOCK> <tile_n>".
 flagos_rt_status module_load(flagos_rt_device_t, const void * image, size_t size, flagos_rt_module_t * module) {
     std::istringstream in(std::string(static_cast<const char *>(image), size));
     std::string header;
     std::getline(in, header);
     if (header != "hostsim-module v1") return FLAGOS_RT_INVALID_ARGUMENT;
     auto * m = new hs_module;
+    // Each line: "<symbol> <BLOCK> <tile_n>".
     std::string symbol;
     uint32_t block = 0;
-    while (in >> symbol >> block) {
+    uint32_t tile = 0;
+    while (in >> symbol >> block >> tile) {
         m->blocks[symbol] = block;
+        m->tiles[symbol] = tile;
     }
     *module = reinterpret_cast<flagos_rt_module_t>(m);
     return FLAGOS_RT_OK;
@@ -161,7 +166,8 @@ flagos_rt_status kernel_get(flagos_rt_module_t module, const flagos_rt_kernel_de
     // The manifest and the artifact must agree on BLOCK, as they would for a
     // compiled Triton kernel.
     if (desc->block_size != 0 && desc->block_size != in_module->second) return FLAGOS_RT_INVALID_ARGUMENT;
-    *kernel = reinterpret_cast<flagos_rt_kernel_t>(new hs_kernel { desc->symbol, in_module->second, desc->n_args });
+    *kernel = reinterpret_cast<flagos_rt_kernel_t>(
+        new hs_kernel { desc->symbol, in_module->second, m->tiles[desc->symbol], desc->n_args });
     return FLAGOS_RT_OK;
 }
 
@@ -190,7 +196,7 @@ flagos_rt_status run_kernel(hs_kernel * k, const uint32_t grid[3], const flagos_
     for (uint32_t z = 0; z < launch->grid[2]; ++z) {
         for (uint32_t y = 0; y < launch->grid[1]; ++y) {
             for (uint32_t x = 0; x < launch->grid[0]; ++x) {
-                if (!flagos_ref::run(k->name, { x, y, z, k->block, values })) return FLAGOS_RT_NOT_FOUND;
+                if (!flagos_ref::run(k->name, { x, y, z, k->block, k->tile_n, values })) return FLAGOS_RT_NOT_FOUND;
             }
         }
     }

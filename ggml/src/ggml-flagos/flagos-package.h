@@ -23,6 +23,9 @@ struct flagos_kernel_info {
     int warp_size = 0;
     int shared_memory = 0;
     int argument_count = -1;   // -1 when the manifest does not declare it
+    int tile_m = 0;            // optional multi-dimensional tile, 0 when unused
+    int tile_n = 0;
+    int tile_k = 0;
     size_t global_scratch_size = 0;
     size_t global_scratch_align = 1;
     size_t profile_scratch_size = 0;
