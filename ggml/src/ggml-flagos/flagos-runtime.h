@@ -184,7 +184,7 @@ typedef struct flagos_runtime_v1 {
     flagos_rt_status (*buffer_alloc)(flagos_rt_device_t device, size_t size, flagos_rt_buffer_t * buffer);
     void (*buffer_free)(flagos_rt_buffer_t buffer);
     // Device address of the allocation's first byte; used for pointer arguments
-    // and for GGML tensor->data.
+    // and for GGML tensor->data. Must be aligned to props.alignment.
     void * (*buffer_base)(flagos_rt_buffer_t buffer);
 
     flagos_rt_status (*stream_create)(flagos_rt_device_t device, flagos_rt_stream_t * stream);

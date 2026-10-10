@@ -29,7 +29,7 @@ static flagos_rt_status mock_device_memory(flagos_rt_device_t device, uint64_t *
     (void) device; *free_bytes = *total = 1u << 20; return FLAGOS_RT_OK;
 }
 static flagos_rt_status mock_alloc(flagos_rt_device_t device, size_t size, flagos_rt_buffer_t * buffer) {
-    (void) device; *buffer = (flagos_rt_buffer_t) malloc(size ? size : 1); return *buffer ? FLAGOS_RT_OK : FLAGOS_RT_OUT_OF_MEMORY;
+    (void) device; *buffer = (flagos_rt_buffer_t) aligned_alloc(64, (size + 63) / 64 * 64); return *buffer ? FLAGOS_RT_OK : FLAGOS_RT_OUT_OF_MEMORY;
 }
 static void mock_free(flagos_rt_buffer_t buffer) { free(buffer); }
 static void * mock_base(flagos_rt_buffer_t buffer) { return buffer; }

@@ -187,19 +187,28 @@ const char * buft_get_name(ggml_backend_buffer_type_t buft) {
     return static_cast<rt_device *>(buft->context)->name.c_str();
 }
 
+size_t buft_get_alignment(ggml_backend_buffer_type_t buft) {
+    const uint32_t alignment = static_cast<rt_device *>(buft->context)->props.alignment;
+    return alignment >= 32 ? alignment : 128;
+}
+
 ggml_backend_buffer_t buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     rt_device * device = static_cast<rt_device *>(buft->context);
     flagos_rt_buffer_t handle = nullptr;
     if (!rt_check(device->rt->buffer_alloc(device->handle, size == 0 ? 1 : size, &handle), device, "buffer_alloc")) {
         return nullptr;
     }
-    auto * ctx = new rt_buffer { device, handle, device->rt->buffer_base(handle) };
+    void * base = device->rt->buffer_base(handle);
+    // GGML places tensors at offsets aligned relative to the base, so a
+    // misaligned base would silently shrink the usable buffer.
+    if (base == nullptr || reinterpret_cast<uintptr_t>(base) % buft_get_alignment(buft) != 0) {
+        GGML_LOG_ERROR("FlagOS %s: runtime returned a buffer not aligned to %zu bytes\n", device->name.c_str(),
+                       buft_get_alignment(buft));
+        device->rt->buffer_free(handle);
+        return nullptr;
+    }
+    auto * ctx = new rt_buffer { device, handle, base };
     return ggml_backend_buffer_init(buft, buffer_interface, ctx, size);
-}
-
-size_t buft_get_alignment(ggml_backend_buffer_type_t buft) {
-    const uint32_t alignment = static_cast<rt_device *>(buft->context)->props.alignment;
-    return alignment >= 32 ? alignment : 128;
 }
 
 const ggml_backend_buffer_type_i buft_interface = {

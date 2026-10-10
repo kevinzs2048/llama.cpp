@@ -294,6 +294,32 @@ if (GGML_FLAGOS_AMD)
         ${FLAGOS_AMD_PRIVATE_DEFINITIONS})
     target_link_libraries(flagos-check-amd PRIVATE ggml hip::host ${CMAKE_DL_LIBS})
 
+    # AMD as a RUNTIME-kind provider under the core runtime device; HIP mocked.
+    add_executable(flagos-check-amd-runtime EXCLUDE_FROM_ALL
+        providers/amd/flagos-amd-runtime.cpp
+        providers/amd/tests/check_amd_runtime.cpp
+        flagos-ops.cpp
+        flagos-package.cpp
+        flagos-rt-device.cpp)
+    target_include_directories(flagos-check-amd-runtime PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
+    target_link_libraries(flagos-check-amd-runtime PRIVATE ggml-base ggml-cpu hip::host)
+
+    # Opt-in plugin for the migration period. It is built into a separate
+    # directory so it is not auto-loaded next to the DEVICE-kind AMD
+    # provider (both would expose the same GPU); point
+    # GGML_FLAGOS_PROVIDER_PATH at it to use it instead.
+    if (GGML_FLAGOS_PROVIDER_MODULES)
+        add_library(flagos-provider-amd-rt MODULE EXCLUDE_FROM_ALL providers/amd/flagos-amd-runtime.cpp)
+        set_target_properties(flagos-provider-amd-rt PROPERTIES
+            PREFIX "lib" OUTPUT_NAME "flagos-provider-amd-rt"
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/flagos-providers-optional"
+            CXX_VISIBILITY_PRESET hidden)
+        target_link_libraries(flagos-provider-amd-rt PRIVATE hip::host)
+        target_compile_definitions(flagos-provider-amd-rt PRIVATE
+            GGML_FLAGOS_PROVIDER_MODULE ${FLAGOS_AMD_PRIVATE_DEFINITIONS})
+    endif()
+
     add_executable(flagos-check-amd-gdn-contract EXCLUDE_FROM_ALL
         flagos-graph-plan.cpp tests/check_amd_gdn_contract.cpp)
     target_include_directories(flagos-check-amd-gdn-contract PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
