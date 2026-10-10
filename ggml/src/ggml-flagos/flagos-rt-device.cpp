@@ -623,8 +623,35 @@ void trace_declined(const rt_device * device, const ggml_tensor * op) {
     std::fprintf(stderr, "FlagOS %s: declined %s\n", device->name.c_str(), text.c_str());
 }
 
+// GGML_FLAGOS_DISABLE_OPS=MUL_MAT_ID,ARGSORT,... declines those ops (by
+// ggml_op_desc name) so they fall back to another backend; used to bisect
+// numerical differences.
+bool op_disabled(const ggml_tensor * op) {
+    static const std::vector<std::string> disabled = [] {
+        std::vector<std::string> names;
+        if (const char * value = std::getenv("GGML_FLAGOS_DISABLE_OPS")) {
+            std::string list(value);
+            size_t start = 0;
+            while (start <= list.size()) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                if (end > start) names.push_back(list.substr(start, end - start));
+                start = end + 1;
+            }
+        }
+        return names;
+    }();
+    if (disabled.empty()) {
+        return false;
+    }
+    const std::string name = ggml_op_desc(op);
+    return std::find(disabled.begin(), disabled.end(), name) != disabled.end();
+}
+
 bool dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     rt_device * device = device_of(dev);
+    if (op_disabled(op)) {
+        return false;
+    }
     // Empty nodes (for example cache copies while GGML reserves a graph for
     // zero sequences) need no kernel; graph_compute skips them.
     if (ggml_is_empty(op) || flagos_op_is_noop(op) || flagos_op_plan(device->package, op, nullptr)) {

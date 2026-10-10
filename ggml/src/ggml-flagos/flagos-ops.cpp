@@ -92,9 +92,23 @@ void set_call(flagos_kernel_call * call, const flagos_kernel_info * kernel, int6
     }
 }
 
-// ADD and MUL: src0 has the output shape; src1 is either the same shape or a
-// single row repeated over all rows. The kernels broadcast with a flat
-// index % src1_elements, which equals GGML's repeat only in those two cases.
+// ADD and MUL: src0 has the output shape. The kernels broadcast src1 with a
+// flat index % src1_elements, which equals GGML's repeat exactly when src1
+// matches src0 in its leading dimensions and has extent 1 in the rest
+// (same shape, one row repeated, or a single scalar).
+bool flat_repeat_matches(const ggml_tensor * a, const ggml_tensor * b) {
+    int d = 0;
+    while (d < GGML_MAX_DIMS && b->ne[d] == a->ne[d]) {
+        ++d;
+    }
+    for (; d < GGML_MAX_DIMS; ++d) {
+        if (b->ne[d] != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool plan_binary(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
@@ -103,8 +117,7 @@ bool plan_binary(const flagos_kernel_package & package, const ggml_tensor * op, 
         return false;
     }
     const bool same_shape = ggml_are_same_shape(a, b);
-    const bool row_repeat = b->ne[0] == a->ne[0] && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1;
-    if (!same_shape && !row_repeat) {
+    if (!same_shape && !flat_repeat_matches(a, b)) {
         return false;
     }
     const int64_t n = ggml_nelements(op);
@@ -934,6 +947,267 @@ bool plan_get_rows_quant(const flagos_kernel_package & package, const ggml_tenso
     }
     return true;
 }
+
+// ----- MoE routing and expert ops (Qwen3.6-35B-A3B) -----
+
+// ARGSORT of F32 rows into I32 indices (router top-k). Kernel capacity is
+// the smallest of 64/256/1024/4096 that holds a row; ties keep index order.
+// flagos_argsort_f32_i32_b<C>(x, out, columns, row_stride, descending).
+bool plan_argsort(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * x = op->src[0];
+    int32_t params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+    std::memcpy(params, op->op_params, sizeof(params));
+    const int32_t order = params[0];
+    for (size_t i = 1; i < sizeof(params) / sizeof(params[0]); ++i) {
+        if (params[i] != 0) {
+            return false;
+        }
+    }
+    if (x == nullptr || op->type != GGML_TYPE_I32 || !ggml_is_contiguous(op) || x->type != GGML_TYPE_F32 ||
+        x->nb[0] != sizeof(float) || !ggml_are_same_shape(op, x) || (order != GGML_SORT_ORDER_ASC && order != GGML_SORT_ORDER_DESC) ||
+        !element_offsets_fit_i32(x, sizeof(float)) || !fits_i32(ggml_nelements(op)) || op->ne[0] > 4096 ||
+        x->nb[1] < size_t(x->ne[0]) * sizeof(float) || (x->ne[2] > 1 && x->nb[2] != x->nb[1] * x->ne[1]) ||
+        (x->ne[3] > 1 && x->nb[3] != x->nb[2] * x->ne[2]) || partially_overlaps(op, x) ||
+        (op->data != nullptr && op->data == x->data)) {
+        return false;
+    }
+    int capacity = 64;
+    while (capacity < op->ne[0]) {
+        capacity *= 4;   // 64, 256, 1024, 4096
+    }
+    const std::string name = "flagos_argsort_f32_i32_b" + std::to_string(capacity);
+    const int64_t rows = ggml_nrows(op);
+    const flagos_kernel_info * kernel = find_kernel(package, name.c_str(), 5, rows);
+    if (kernel == nullptr || kernel->block_size != capacity) {
+        return false;
+    }
+    set_call(call, kernel, rows, { ptr(x), ptr(op), i32(op->ne[0]), i32(x->nb[1] / sizeof(float)), i32(order) });
+    return true;
+}
+
+// SUM_ROWS of contiguous F32 rows (one row per program, f64 accumulation).
+bool plan_sum_rows(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * x = op->src[0];
+    if (x == nullptr || !is_contiguous_f32(op) || !is_contiguous_f32(x) || op->ne[0] != 1 || x->ne[0] <= 0 ||
+        op->ne[1] != x->ne[1] || op->ne[2] != x->ne[2] || op->ne[3] != x->ne[3] || !fits_i32(ggml_nelements(x)) ||
+        partially_overlaps(op, x) || (op->data != nullptr && op->data == x->data)) {
+        return false;
+    }
+    const int64_t rows = ggml_nrows(x);
+    const flagos_kernel_info * kernel = find_kernel(package, "flagos_sum_rows_f32_acc_f64", 3, rows);
+    if (kernel == nullptr || kernel->block_size < x->ne[0]) {
+        return false;
+    }
+    set_call(call, kernel, rows, { ptr(x), ptr(op), i32(x->ne[0]) });
+    return true;
+}
+
+// CLAMP of contiguous F32, in place or into a disjoint output.
+bool plan_clamp(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * x = op->src[0];
+    float bounds[2];
+    std::memcpy(bounds, op->op_params, sizeof(bounds));
+    if (x == nullptr || !is_contiguous_f32(op) || !is_contiguous_f32(x) || !ggml_are_same_shape(op, x) ||
+        !fits_i32(ggml_nelements(op)) || std::isnan(bounds[0]) || std::isnan(bounds[1]) || bounds[0] > bounds[1] ||
+        partially_overlaps(op, x)) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(op);
+    const flagos_kernel_info * kernel = find_elementwise(package, "flagos_clamp_compare_f32", 5, n);
+    if (kernel == nullptr) {
+        return false;
+    }
+    set_call(call, kernel, programs_for(kernel, n), { ptr(x), ptr(op), i32(n), f32(bounds[0]), f32(bounds[1]) });
+    return true;
+}
+
+// ADD / MUL / DIV with GGML's per-dimension repeat of src1 and arbitrary
+// input strides, into a dense output:
+// flagos_{add,mul,div}_repeat_strided_f32(x, y, out, n[4], y_ne[4], sx[4], sy[4], n_elements).
+// Used when the flat-broadcast kernels do not apply (MoE expert weighting,
+// router normalization, strided expert views). The output may reuse a
+// contiguous src0 exactly (each element is read before it is written).
+bool plan_binary_strided(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    if (a == nullptr || b == nullptr || !is_contiguous_f32(op) || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+        a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) || !ggml_are_same_shape(op, a) ||
+        !fits_i32(ggml_nelements(op)) || !element_offsets_fit_i32(a, sizeof(float)) ||
+        !element_offsets_fit_i32(b, sizeof(float))) {
+        return false;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (b->ne[d] <= 0 || op->ne[d] % b->ne[d] != 0) {
+            return false;
+        }
+    }
+    if (partially_overlaps(op, a) || partially_overlaps(op, b) ||
+        (op->data != nullptr && op->data == b->data) ||
+        (op->data != nullptr && op->data == a->data && !ggml_is_contiguous(a))) {
+        return false;
+    }
+    const char * name = op->op == GGML_OP_ADD ? "flagos_add_repeat_strided_f32"
+                      : op->op == GGML_OP_MUL ? "flagos_mul_repeat_strided_f32" : "flagos_div_repeat_strided_f32";
+    const int64_t n = ggml_nelements(op);
+    const flagos_kernel_info * kernel = find_elementwise(package, name, 20, n);
+    if (kernel == nullptr) {
+        return false;
+    }
+    static_assert(3 + 4 * GGML_MAX_DIMS + 1 <= FLAGOS_MAX_KERNEL_ARGS, "strided binary arguments exceed the call capacity");
+    if (call != nullptr) {
+        set_call(call, kernel, programs_for(kernel, n), { ptr(a), ptr(b), ptr(op) });
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(op->ne[d]);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(b->ne[d]);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(a->nb[d] / sizeof(float));
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(b->nb[d] / sizeof(float));
+        call->args[call->n_args++] = i32(n);
+    }
+    return true;
+}
+
+// GET_ROWS from a strided F32 table with 2-D I32 indices (router weights for
+// several tokens): flagos_get_rows_batched_f32 (16 arguments); an index out
+// of range yields 0.
+bool plan_get_rows_batched(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * table = op->src[0];
+    const ggml_tensor * index = op->src[1];
+    if (table == nullptr || index == nullptr || op->type != GGML_TYPE_F32 || table->type != GGML_TYPE_F32 ||
+        index->type != GGML_TYPE_I32 || !ggml_is_contiguous(op) || table->nb[0] != sizeof(float) ||
+        table->ne[2] != index->ne[1] || table->ne[3] != index->ne[2] || index->ne[3] != 1 ||
+        op->ne[0] != table->ne[0] || op->ne[1] != index->ne[0] || op->ne[2] != table->ne[2] || op->ne[3] != table->ne[3] ||
+        !fits_i32(ggml_nelements(op)) || !element_offsets_fit_i32(table, sizeof(float)) ||
+        !element_offsets_fit_i32(index, sizeof(int32_t)) || partially_overlaps(op, table) || partially_overlaps(op, index) ||
+        (op->data != nullptr && (op->data == table->data || op->data == index->data))) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(op);
+    const flagos_kernel_info * kernel = find_elementwise(package, "flagos_get_rows_batched_f32", 16, n);
+    if (kernel == nullptr) {
+        return false;
+    }
+    set_call(call, kernel, programs_for(kernel, n), { ptr(table), ptr(index), ptr(op),
+             i32(table->ne[0]), i32(table->ne[1]), i32(index->ne[0]), i32(table->ne[2]), i32(table->ne[3]),
+             i32(table->nb[0] / 4), i32(table->nb[1] / 4), i32(table->nb[2] / 4), i32(table->nb[3] / 4),
+             i32(index->nb[0] / 4), i32(index->nb[1] / 4), i32(index->nb[2] / 4), i32(n) });
+    return true;
+}
+
+// Dense F32 x F32 MUL_MAT with strided, broadcast batches (MoE router
+// logits, shared-expert gate): flagos_mul_mat_f32_f32_strided_batched_ieee
+// (15 arguments), grid (ceil(rows / tile_m), ceil(columns / tile_n), ne2 * ne3).
+bool plan_mul_mat_f32(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    if (w == nullptr || x == nullptr || w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || !is_contiguous_f32(op) ||
+        w->nb[0] != sizeof(float) || x->nb[0] != sizeof(float) || w->ne[0] != x->ne[0] || op->ne[0] != w->ne[1] ||
+        op->ne[1] != x->ne[1] || op->ne[2] != x->ne[2] || op->ne[3] != x->ne[3] ||
+        x->ne[2] % w->ne[2] != 0 || x->ne[3] % w->ne[3] != 0 || !fits_i32(ggml_nelements(op)) ||
+        !element_offsets_fit_i32(w, sizeof(float)) || !element_offsets_fit_i32(x, sizeof(float)) ||
+        op->ne[2] * op->ne[3] > 65535) {
+        return false;
+    }
+    for (const ggml_tensor * t : { w, x }) {
+        if (partially_overlaps(op, t) || (op->data != nullptr && op->data == t->data)) {
+            return false;
+        }
+    }
+    const flagos_kernel_info * kernel = package.find("flagos_mul_mat_f32_f32_strided_batched_ieee");
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 15) ||
+        kernel->tile_m <= 0 || kernel->tile_n <= 0) {
+        return false;
+    }
+    const int64_t gx = (op->ne[0] + kernel->tile_m - 1) / kernel->tile_m;
+    const int64_t gy = (op->ne[1] + kernel->tile_n - 1) / kernel->tile_n;
+    if (gx > INT32_MAX || gy > 65535) {
+        return false;
+    }
+    if (call != nullptr) {
+        set_call(call, kernel, gx, { ptr(w), ptr(x), ptr(op), i32(w->ne[0]), i32(op->ne[0]), i32(op->ne[1]),
+                 i32(op->ne[2]), i32(x->ne[2] / w->ne[2]), i32(x->ne[3] / w->ne[3]),
+                 i32(w->nb[1] / 4), i32(w->nb[2] / 4), i32(w->nb[3] / 4), i32(x->nb[1] / 4), i32(x->nb[2] / 4), i32(x->nb[3] / 4) });
+        call->grid[1] = static_cast<uint32_t>(gy);
+        call->grid[2] = static_cast<uint32_t>(op->ne[2] * op->ne[3]);
+    }
+    return true;
+}
+
+// MUL_MAT_ID (routed experts): each program reads its expert id, so no
+// expert sort or workspace is needed. Quantized weights:
+// flagos_mul_mat_id_<type>(w_u8, w_f16, x, ids, out, k, rows, picks, tokens,
+//   input_picks, experts, sw1_bytes, sw2_bytes, sx1, sx2, si0, si1),
+// grid (rows, picks * tokens). F32 weights: flagos_mul_mat_id_f32_f32 with
+// element strides, grid (ceil(rows / tile_m), picks * tokens).
+bool plan_mul_mat_id(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    const ggml_tensor * ids = op->src[2];
+    if (w == nullptr || x == nullptr || ids == nullptr || !is_contiguous_f32(op) || x->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32 || w->ne[3] != 1 || x->ne[3] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        op->ne[3] != 1 || w->ne[0] != x->ne[0] || w->ne[0] > 16384 || ids->ne[1] != x->ne[2] ||
+        x->ne[1] <= 0 || ids->ne[0] % x->ne[1] != 0 || op->ne[0] != w->ne[1] || op->ne[1] != ids->ne[0] ||
+        op->ne[2] != ids->ne[1] || !fits_i32(ggml_nelements(op)) || x->nb[0] != sizeof(float) ||
+        !element_offsets_fit_i32(x, sizeof(float)) || !element_offsets_fit_i32(ids, sizeof(int32_t)) ||
+        ids->nb[0] < sizeof(int32_t) || ids->ne[0] * ids->ne[1] > 65535) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_OP_PARAMS / int(sizeof(int32_t)); ++i) {
+        int32_t v = 0;
+        std::memcpy(&v, reinterpret_cast<const char *>(op->op_params) + i * sizeof(int32_t), sizeof(v));
+        if (v != 0 && !((i == 0 || i == 3) && v == GGML_PREC_F32)) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : { w, x, ids }) {
+        if (partially_overlaps(op, t) || (op->data != nullptr && op->data == t->data)) {
+            return false;
+        }
+    }
+    const char * type = nullptr;
+    int64_t qk = 0;
+    switch (w->type) {
+        case GGML_TYPE_Q4_0: type = "q4_0_f32_decoded_compensation"; qk = 32; break;
+        case GGML_TYPE_Q4_1: type = "q4_1_f32"; qk = 32; break;
+        case GGML_TYPE_Q8_0: type = "q8_0_f32_finite_compensation"; qk = 32; break;
+        case GGML_TYPE_Q4_K: type = "q4_k_f32"; qk = 256; break;
+        case GGML_TYPE_Q5_K: type = "q5_k_f32"; qk = 256; break;   // proposed FlagGems kernel
+        case GGML_TYPE_Q6_K: type = "q6_k_f32"; qk = 256; break;   // proposed FlagGems kernel
+        case GGML_TYPE_F32:  type = "f32_f32"; break;
+        default: return false;
+    }
+    const int64_t picks = ids->ne[0], tokens = ids->ne[1];
+    const std::string name = std::string("flagos_mul_mat_id_") + type;
+    const flagos_kernel_info * kernel = package.find(name);
+    if (kernel == nullptr) {
+        return false;
+    }
+    if (qk != 0) {
+        const size_t row_bytes = size_t(w->ne[0] / qk) * ggml_type_size(w->type);
+        if (w->ne[0] % qk != 0 || w->nb[0] != ggml_type_size(w->type) || w->nb[1] < row_bytes ||
+            w->nb[1] > size_t(INT32_MAX) || w->nb[2] > size_t(INT32_MAX) ||
+            size_t(w->ne[2] - 1) * w->nb[2] + size_t(w->ne[1] - 1) * w->nb[1] + row_bytes > size_t(INT32_MAX) ||
+            (kernel->argument_count >= 0 && kernel->argument_count != 17) || kernel->block_size != qk) {
+            return false;
+        }
+        if (call != nullptr) {
+            set_call(call, kernel, w->ne[1], { ptr(w), ptr(w), ptr(x), ptr(ids), ptr(op), i32(w->ne[0]), i32(w->ne[1]),
+                     i32(picks), i32(tokens), i32(x->ne[1]), i32(w->ne[2]), i32(w->nb[1]), i32(w->nb[2]),
+                     i32(x->nb[1] / 4), i32(x->nb[2] / 4), i32(ids->nb[0] / 4), i32(ids->nb[1] / 4) });
+            call->grid[1] = static_cast<uint32_t>(picks * tokens);
+        }
+        return true;
+    }
+    if (w->nb[0] != sizeof(float) || !element_offsets_fit_i32(w, sizeof(float)) ||
+        (kernel->argument_count >= 0 && kernel->argument_count != 16) || kernel->tile_m <= 0) {
+        return false;
+    }
+    if (call != nullptr) {
+        set_call(call, kernel, (w->ne[1] + kernel->tile_m - 1) / kernel->tile_m, { ptr(w), ptr(x), ptr(ids), ptr(op),
+                 i32(w->ne[0]), i32(w->ne[1]), i32(picks), i32(tokens), i32(x->ne[1]), i32(w->ne[2]),
+                 i32(w->nb[1] / 4), i32(w->nb[2] / 4), i32(x->nb[1] / 4), i32(x->nb[2] / 4), i32(ids->nb[0] / 4), i32(ids->nb[1] / 4) });
+        call->grid[1] = static_cast<uint32_t>(picks * tokens);
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -943,7 +1217,17 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
     switch (op->op) {
         case GGML_OP_ADD:
         case GGML_OP_MUL:
-            return plan_binary(package, op, call);
+            return plan_binary(package, op, call) || plan_binary_strided(package, op, call);
+        case GGML_OP_DIV:
+            return plan_binary_strided(package, op, call);
+        case GGML_OP_ARGSORT:
+            return plan_argsort(package, op, call);
+        case GGML_OP_SUM_ROWS:
+            return plan_sum_rows(package, op, call);
+        case GGML_OP_CLAMP:
+            return plan_clamp(package, op, call);
+        case GGML_OP_MUL_MAT_ID:
+            return plan_mul_mat_id(package, op, call);
         case GGML_OP_SCALE:
             return plan_scale(package, op, call);
         case GGML_OP_RMS_NORM:
@@ -965,7 +1249,7 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
         case GGML_OP_UNARY:
             return plan_unary(package, op, call);
         case GGML_OP_MUL_MAT:
-            return plan_mul_mat(package, op, call);
+            return plan_mul_mat(package, op, call) || plan_mul_mat_f32(package, op, call);
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
@@ -973,7 +1257,8 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
         case GGML_OP_SET_ROWS:
             return plan_set_rows(package, op, call);
         case GGML_OP_GET_ROWS:
-            return plan_get_rows(package, op, call) || plan_get_rows_quant(package, op, call);
+            return plan_get_rows(package, op, call) || plan_get_rows_quant(package, op, call) ||
+                   plan_get_rows_batched(package, op, call);
         case GGML_OP_SOFT_MAX:
             return plan_soft_max(package, op, call);
         default:

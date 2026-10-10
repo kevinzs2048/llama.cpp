@@ -452,6 +452,114 @@ inline bool run(const std::string & name, const program & p) {
         f.dequant(w + blk * f.block_bytes, out + int64_t(p.pid_x) * n + int64_t(p.pid_y) * f.block_elems);
         return true;
     }
+    if (name.rfind("flagos_argsort_f32_i32_b", 0) == 0) {   // (x, out, columns, row_stride, descending)
+        const int32_t cols = I(2), stride = I(3), desc = I(4);
+        const float * x = F(0) + int64_t(p.pid_x) * stride;
+        auto * out = arg<int32_t *>(p, 1) + int64_t(p.pid_x) * cols;
+        std::vector<int32_t> idx(cols);
+        for (int32_t i = 0; i < cols; ++i) idx[i] = i;
+        std::stable_sort(idx.begin(), idx.end(), [&](int32_t i, int32_t j) {
+            const float a = x[i], bv = x[j];
+            if (std::isnan(a) || std::isnan(bv)) return !std::isnan(a) && std::isnan(bv);
+            return desc ? a > bv : a < bv;
+        });
+        for (int32_t i = 0; i < cols; ++i) out[i] = idx[i];
+        return true;
+    }
+    if (name == "flagos_sum_rows_f32_acc_f64") {   // (x, out, n_cols)
+        const int32_t n = I(2);
+        const float * x = F(0) + int64_t(p.pid_x) * n;
+        double sum = 0.0;
+        for (int32_t i = 0; i < n; ++i) sum += x[i];
+        F(1)[p.pid_x] = float(sum);
+        return true;
+    }
+    if (name == "flagos_clamp_compare_f32") {   // (x, out, n, min, max)
+        range(p, I(2), b, e);
+        for (int64_t i = b; i < e; ++i) { float v = F(0)[i]; v = v < S(4) ? v : S(4); v = v > S(3) ? v : S(3); F(1)[i] = v; }
+        return true;
+    }
+    if (name == "flagos_add_repeat_strided_f32" || name == "flagos_mul_repeat_strided_f32" ||
+        name == "flagos_div_repeat_strided_f32") {   // (x, y, out, n[4], y[4], sx[4], sy[4], n_elements)
+        range(p, I(19), b, e);
+        const char kind = name[7];   // 'a', 'm', 'd'
+        for (int64_t o = b; o < e; ++o) {
+            int64_t r = o, ix = 0, iy = 0;
+            for (int d = 0; d < 4; ++d) {
+                const int64_t c = r % I(3 + d);
+                r /= I(3 + d);
+                ix += c * I(11 + d);
+                iy += (c % I(7 + d)) * I(15 + d);
+            }
+            const float av = F(0)[ix], bv2 = F(1)[iy];
+            F(2)[o] = kind == 'a' ? av + bv2 : kind == 'm' ? av * bv2 : av / bv2;
+        }
+        return true;
+    }
+    if (name == "flagos_get_rows_batched_f32") {
+        // (table, idx, out, n_cols, table_rows, gather_rows, batch2, batch3, st0..3, si0..2, n)
+        range(p, I(15), b, e);
+        const int64_t cols = I(3), trows = I(4), grows = I(5), b2n = I(6);
+        const auto * idx = arg<const int32_t *>(p, 1);
+        for (int64_t o = b; o < e; ++o) {
+            const int64_t col = o % cols, tok = (o / cols) % grows, b2 = (o / (cols * grows)) % b2n, b3 = o / (cols * grows * b2n);
+            const int64_t row = idx[tok * I(12) + b2 * I(13) + b3 * I(14)];
+            F(2)[o] = (row >= 0 && row < trows) ? F(0)[col * I(8) + row * I(9) + b2 * I(10) + b3 * I(11)] : 0.0f;
+        }
+        return true;
+    }
+    if (name == "flagos_mul_mat_f32_f32_strided_batched_ieee") {
+        // (w, x, out, k, rows, columns, heads, head_ratio, sample_ratio, sw1..3, sx1..3); tile 32 x 16
+        const int32_t k = I(3), rows = I(4), cols = I(5), heads = I(6);
+        const int64_t head = p.pid_z % heads, sample = p.pid_z / heads;
+        const int64_t a_base = (head / I(7)) * I(10) + (sample / I(8)) * I(11);
+        const int64_t b_base = head * I(13) + sample * I(14);
+        for (int64_t m = int64_t(p.pid_x) * 32; m < std::min<int64_t>(int64_t(p.pid_x) * 32 + 32, rows); ++m) {
+            for (int64_t n = int64_t(p.pid_y) * 16; n < std::min<int64_t>(int64_t(p.pid_y) * 16 + 16, cols); ++n) {
+                float acc = 0.0f;
+                for (int32_t kk = 0; kk < k; ++kk) acc += F(0)[a_base + m * I(9) + kk] * F(1)[b_base + n * I(12) + kk];
+                F(2)[(sample * heads + head) * int64_t(rows) * cols + n * rows + m] = acc;
+            }
+        }
+        return true;
+    }
+    if (name.rfind("flagos_mul_mat_id_", 0) == 0) {
+        // quantized (17): (w_u8, w_f16, x, ids, out, k, rows, picks, tokens, input_picks, experts, sw1_b, sw2_b, sx1, sx2, si0, si1)
+        // f32 (16):       (w, x, ids, out, k, rows, picks, tokens, input_picks, experts, sw1, sw2, sx1, sx2, si0, si1)
+        const bool f32w = name == "flagos_mul_mat_id_f32_f32";
+        const int a0 = f32w ? 4 : 5;
+        const int32_t k = I(a0), rows = I(a0 + 1), picks = I(a0 + 2), input_picks = I(a0 + 4), experts = I(a0 + 5);
+        const int64_t sw1 = I(a0 + 6), sw2 = I(a0 + 7), sx1 = I(a0 + 8), sx2 = I(a0 + 9), si0 = I(a0 + 10), si1 = I(a0 + 11);
+        const float * x = F(f32w ? 1 : 2);
+        const auto * ids = arg<const int32_t *>(p, f32w ? 2 : 3);
+        float * out = F(f32w ? 3 : 4);
+        const int64_t pick = p.pid_y % picks, token = p.pid_y / picks;
+        const int64_t expert = ids[pick * si0 + token * si1];
+        const bool valid = expert >= 0 && expert < experts;
+        const int64_t xb = token * sx2 + (pick % input_picks) * sx1;
+        const int64_t r0 = f32w ? int64_t(p.pid_x) * p.tile_n : p.pid_x;
+        const int64_t r1 = f32w ? std::min<int64_t>(r0 + std::max<uint32_t>(p.tile_n, 1), rows) : r0 + 1;
+        for (int64_t row = r0; row < r1; ++row) {
+            double acc = 0.0;
+            if (valid) {
+                if (f32w) {
+                    const float * wr = F(0) + expert * sw2 + row * sw1;
+                    for (int32_t kk = 0; kk < k; ++kk) acc += double(wr[kk]) * x[xb + kk];
+                } else {
+                    quant_format f;
+                    if (!quant_format_of(name, f)) return false;
+                    const uint8_t * wr = arg<const uint8_t *>(p, 0) + expert * sw2 + row * sw1;
+                    float tmp[256];
+                    for (int64_t blk = 0; blk < k / f.block_elems; ++blk) {
+                        f.dequant(wr + blk * f.block_bytes, tmp);
+                        for (int i = 0; i < f.block_elems; ++i) acc += double(tmp[i]) * x[xb + blk * f.block_elems + i];
+                    }
+                }
+            }
+            out[(token * picks + pick) * int64_t(rows) + row] = float(acc);
+        }
+        return true;
+    }
     if (name == "flagos_rms_norm_mul_f32") {   // (norm_out, mul_out, x, weight, n_cols, eps); one program per row
         const int32_t n = I(4);
         const float * x = F(2) + int64_t(p.pid_x) * n;
