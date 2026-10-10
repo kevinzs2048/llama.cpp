@@ -1,4 +1,4 @@
-#include "../../ggml-flagos.h"
+#include "ggml-flagos.h"
 #include "../../flagos-graph-plan.h"
 #include "../../flagos-provider.h"
 #include "flagos-denglin-api.h"

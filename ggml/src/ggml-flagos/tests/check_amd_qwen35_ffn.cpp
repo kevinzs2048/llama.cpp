@@ -4,7 +4,7 @@
 #include "check_amd_qwen35_ffn.h"
 
 #include "../flagos-provider.h"
-#include "../ggml-flagos.h"
+#include "ggml-flagos.h"
 
 #include <cmath>
 #include <cstdio>

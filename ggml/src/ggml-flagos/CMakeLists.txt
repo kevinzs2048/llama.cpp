@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.18)
 
+# Provider selection lives here rather than in ggml/CMakeLists.txt so the
+# upstream footprint is the single GGML_FLAGOS option. Every provider is
+# opt-in: a plain -DGGML_FLAGOS=ON build needs no vendor SDK.
+option(GGML_FLAGOS_DENGLIN    "ggml: build the FlagOS Denglin provider"                OFF)
+option(GGML_FLAGOS_AMD        "ggml: build the FlagOS AMD HIP provider"                OFF)
+option(GGML_FLAGOS_SPACEMIT   "ggml: build the experimental FlagOS SpaceMiT provider"  OFF)
+option(GGML_FLAGOS_TRITON_JIT "ggml: build the optional FlagOS Triton JIT runtime"     OFF)
+
 option(GGML_FLAGOS_PROVIDER_MODULES "ggml: build each FlagOS provider as a separately loaded plugin" OFF)
 
 # Common code that both the core and DEVICE-kind provider plugins compile in.
@@ -30,8 +38,7 @@ set(FLAGOS_CORE_SOURCES
 
 set(FLAGOS_SOURCES
     ${FLAGOS_COMMON_SOURCES}
-    ${FLAGOS_CORE_SOURCES}
-    ggml-flagos.h)
+    ${FLAGOS_CORE_SOURCES})
 
 set(FLAGOS_PRIVATE_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/vendor")
 set(FLAGOS_PRIVATE_LIBRARIES)
@@ -137,12 +144,6 @@ if (GGML_FLAGOS_SPACEMIT)
     target_link_options(ggml-flagos INTERFACE "$<BUILD_INTERFACE:LINKER:-rpath-link,${SPERT_DIR}/lib>")
 endif()
 
-# In static mode ggml-backend-reg.cpp includes the backend's public registry
-# header while compiling the core ggml target.  Keep that include path private
-# for the dynamic plugin, but propagate it to the core static target.
-if (NOT GGML_BACKEND_DL)
-    target_include_directories(ggml PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-endif()
 
 if (GGML_FLAGOS_DENGLIN)
     add_executable(flagos-check-kernels EXCLUDE_FROM_ALL kernels/check_merged_module.cpp)
@@ -373,12 +374,10 @@ if (GGML_FLAGOS_AMD)
     endif()
 endif()
 
-install(FILES
-    ggml-flagos.h
-    flagos-provider.h
-    flagos-registry.h
-    flagos-target.h
-    DESTINATION include)
+# ggml-flagos.h is installed with the other ggml public headers. The plugin
+# ABI header is installed for out-of-tree providers; the remaining FlagOS
+# headers are internal.
+install(FILES flagos-runtime.h DESTINATION include)
 if (GGML_FLAGOS_DENGLIN)
     install(DIRECTORY "${FLAGOS_DENGLIN_AOT_KERNEL_DIR}/" DESTINATION share/ggml/flagos/denglin)
 endif()
