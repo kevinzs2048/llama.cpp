@@ -6,6 +6,7 @@
 #include "../ggml-backend-impl.h"
 #include "../ggml-impl.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -226,6 +227,11 @@ const ggml_backend_buffer_type_i buft_interface = {
 struct rt_backend {
     rt_device * device;
     flagos_rt_stream_t stream;
+    // GGML_FLAGOS_STATS=1: executed nodes per op, printed when the backend
+    // is freed, to measure how much of a model runs on the device.
+    bool stats = false;
+    uint64_t graphs = 0;
+    std::unordered_map<std::string, uint64_t> executed;
 };
 
 rt_backend * backend_of(ggml_backend_t backend) {
@@ -238,6 +244,16 @@ const char * backend_get_name(ggml_backend_t backend) {
 
 void backend_free(ggml_backend_t backend) {
     rt_backend * ctx = backend_of(backend);
+    if (ctx->stats) {
+        uint64_t total = 0;
+        std::string text;
+        for (const auto & [op, count] : ctx->executed) {
+            total += count;
+            text += " " + op + "=" + std::to_string(count);
+        }
+        std::fprintf(stderr, "FlagOS %s: %llu graphs, %llu kernel launches:%s\n", ctx->device->name.c_str(),
+                     (unsigned long long) ctx->graphs, (unsigned long long) total, text.c_str());
+    }
     ctx->device->rt->stream_synchronize(ctx->stream);
     ctx->device->rt->stream_destroy(ctx->stream);
     delete ctx;
@@ -288,7 +304,11 @@ enum ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgr
         if (!rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str())) {
             return GGML_STATUS_FAILED;
         }
+        if (ctx->stats) {
+            ++ctx->executed[ggml_op_desc(node)];
+        }
     }
+    ctx->graphs += ctx->stats ? 1 : 0;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -388,7 +408,10 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char *) {
         /* .guid    = */ backend_guid(),
         /* .iface   = */ backend_interface(device),
         /* .device  = */ dev,
-        /* .context = */ new rt_backend { device, stream },
+        /* .context = */ new rt_backend { device, stream, [] {
+            const char * value = std::getenv("GGML_FLAGOS_STATS");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }() },
     };
 }
 
@@ -396,8 +419,42 @@ ggml_backend_buffer_type_t dev_get_buffer_type(ggml_backend_dev_t dev) {
     return &device_of(dev)->buft;
 }
 
+// GGML_FLAGOS_TRACE_SUPPORT=1 logs every node the device declines, with
+// types, shapes and strides, to see which contract a model misses.
+void trace_declined(const rt_device * device, const ggml_tensor * op) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_FLAGOS_TRACE_SUPPORT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    std::string text = std::string(ggml_op_desc(op)) + " " + op->name + " -> " + ggml_type_name(op->type);
+    auto describe = [&text](const char * label, const ggml_tensor * t) {
+        char buffer[256];
+        std::snprintf(buffer, sizeof(buffer), " %s=%s[%lld,%lld,%lld,%lld]/nb[%zu,%zu,%zu,%zu]", label, ggml_type_name(t->type),
+                      (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                      t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+        text += buffer;
+    };
+    describe("dst", op);
+    for (int i = 0; i < GGML_MAX_SRC && op->src[i] != nullptr; ++i) {
+        describe(("src" + std::to_string(i)).c_str(), op->src[i]);
+    }
+    // Written to stderr directly: tools may silence the GGML log while they
+    // probe placement, which is exactly when this trace is wanted.
+    std::fprintf(stderr, "FlagOS %s: declined %s\n", device->name.c_str(), text.c_str());
+}
+
 bool dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    return flagos_op_is_noop(op) || flagos_op_plan(device_of(dev)->package, op, nullptr);
+    rt_device * device = device_of(dev);
+    // Empty nodes (for example cache copies while GGML reserves a graph for
+    // zero sequences) need no kernel; graph_compute skips them.
+    if (ggml_is_empty(op) || flagos_op_is_noop(op) || flagos_op_plan(device->package, op, nullptr)) {
+        return true;
+    }
+    trace_declined(device, op);
+    return false;
 }
 
 bool dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

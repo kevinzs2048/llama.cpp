@@ -18,7 +18,8 @@
 
 #include <cstdint>
 
-static constexpr uint32_t FLAGOS_MAX_KERNEL_ARGS = 16;
+// Matches the 30 explicit arguments the AMD launcher accepts, rounded up.
+static constexpr uint32_t FLAGOS_MAX_KERNEL_ARGS = 32;
 
 struct flagos_kernel_call {
     const flagos_kernel_info * kernel = nullptr;

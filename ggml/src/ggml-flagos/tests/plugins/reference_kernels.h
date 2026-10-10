@@ -52,6 +52,30 @@ inline float f16_to_f32(uint16_t h) {
     return f;
 }
 
+inline uint16_t f32_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000;
+    const int32_t exp = int32_t((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = x & 0x7fffff;
+    if (((x >> 23) & 0xff) == 0xff) return uint16_t(sign | 0x7c00 | (mant ? 0x200 : 0));
+    if (exp >= 31) return uint16_t(sign | 0x7c00);
+    if (exp <= 0) {
+        if (exp < -10) return uint16_t(sign);
+        mant |= 0x800000;
+        const uint32_t shift = uint32_t(14 - exp);
+        uint32_t half = mant >> shift;
+        const uint32_t rem = mant & ((1u << shift) - 1);
+        const uint32_t mid = 1u << (shift - 1);
+        if (rem > mid || (rem == mid && (half & 1))) ++half;
+        return uint16_t(sign | half);
+    }
+    uint32_t half = sign | (uint32_t(exp) << 10) | (mant >> 13);
+    const uint32_t rem = mant & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
+    return uint16_t(half);
+}
+
 inline float f16_at(const uint8_t * p) {
     uint16_t h;
     std::memcpy(&h, p, sizeof(h));
@@ -219,6 +243,42 @@ inline bool run(const std::string & name, const program & p) {
         for (int32_t i = 0; i < n; ++i) sum += double(x[i]) * x[i];
         const float s = 1.0f / std::sqrt(float(sum / n) + S(3));
         for (int32_t i = 0; i < n; ++i) y[i] = x[i] * s;
+        return true;
+    }
+    if (name == "flagos_copy_strided_f32") {   // (src, dst, src_ne[4], dst_ne[4], src_stride[4], dst_stride[4], n)
+        range(p, I(18), b, e);
+        const float * src = F(0);
+        float * dst = F(1);
+        for (int64_t i = b; i < e; ++i) {
+            int64_t r = i, so = 0;
+            for (int d = 0; d < 4; ++d) { so += (r % I(2 + d)) * I(10 + d); r /= I(2 + d); }
+            r = i;
+            int64_t dof = 0;
+            for (int d = 0; d < 4; ++d) { dof += (r % I(6 + d)) * I(14 + d); r /= I(6 + d); }
+            dst[dof] = src[so];
+        }
+        return true;
+    }
+    if (name == "flagos_set_rows_f32_f16") {   // (src, idx_i64, dst_f16, n_cols, n_rows, n_dst_rows)
+        const int32_t cols = I(3);
+        range(p, cols * I(4), b, e);
+        const float * src = F(0);
+        const auto * idx = arg<const int64_t *>(p, 1);
+        auto * dst = arg<uint16_t *>(p, 2);
+        for (int64_t i = b; i < e; ++i) {
+            const int64_t row = i / cols, col = i % cols;
+            dst[idx[row] * cols + col] = f32_to_f16(src[i]);
+        }
+        return true;
+    }
+    if (name == "flagos_get_rows_f32") {       // (table, idx_i32, out, columns); grid (rows, ceil(columns / BLOCK))
+        const int32_t cols = I(3);
+        const float * table = F(0);
+        const auto * idx = arg<const int32_t *>(p, 1);
+        float * out = F(2);
+        const int64_t c0 = int64_t(p.pid_y) * p.block;
+        const int64_t c1 = std::min<int64_t>(c0 + p.block, cols);
+        for (int64_t c = c0; c < c1; ++c) out[int64_t(p.pid_x) * cols + c] = table[int64_t(idx[p.pid_x]) * cols + c];
         return true;
     }
     // Quantized GEMV: (w_u8, w_f16, x, y, k, rows); one program per row.

@@ -84,6 +84,7 @@ void set_call(flagos_kernel_call * call, const flagos_kernel_info * kernel, int6
     call->grid[1] = 1;
     call->grid[2] = 1;
     call->n_args = 0;
+    GGML_ASSERT(args.size() <= FLAGOS_MAX_KERNEL_ARGS);
     for (const flagos_rt_arg & arg : args) {
         call->args[call->n_args++] = arg;
     }
@@ -250,6 +251,130 @@ bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op,
     }
     return true;
 }
+
+// Pointer ranges [data, data + nbytes) overlap but are not identical.
+bool partially_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->data == nullptr || b->data == nullptr || a->data == b->data) {
+        return false;
+    }
+    const auto * pa = static_cast<const char *>(a->data);
+    const auto * pb = static_cast<const char *>(b->data);
+    return pa < pb + ggml_nbytes(b) && pb < pa + ggml_nbytes(a);
+}
+
+// Largest element offset reachable through a tensor's strides.
+bool element_offsets_fit_i32(const ggml_tensor * t, size_t element_size) {
+    int64_t max_offset = 0;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (t->ne[d] <= 0) {
+            return false;
+        }
+        if (t->nb[d] % element_size != 0) {
+            return false;
+        }
+        max_offset += (t->ne[d] - 1) * static_cast<int64_t>(t->nb[d] / element_size);
+    }
+    return max_offset < INT32_MAX;
+}
+
+// CPY / CONT / DUP of F32 between arbitrarily strided views. The kernel
+// walks the logical element index, decomposing it with the source shape for
+// the read and with the destination shape for the write, as GGML defines it.
+bool plan_copy(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * src = op->src[0];
+    if (src == nullptr || op->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 ||
+        op->nb[0] != sizeof(float) || src->nb[0] != sizeof(float) ||
+        ggml_nelements(op) != ggml_nelements(src) || !fits_i32(ggml_nelements(op)) ||
+        !element_offsets_fit_i32(op, sizeof(float)) || !element_offsets_fit_i32(src, sizeof(float))) {
+        return false;
+    }
+    // CPY writes into src[1]; GGML's output is a view of it.
+    if (op->op == GGML_OP_CPY &&
+        (op->src[1] == nullptr || op->src[1]->type != op->type ||
+         ((op->data != nullptr || op->src[1]->data != nullptr) && op->data != op->src[1]->data))) {
+        return false;
+    }
+    if (partially_overlaps(op, src) || (op->data != nullptr && op->data == src->data)) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(op);
+    const flagos_kernel_info * kernel = find_elementwise(package, "flagos_copy_strided_f32", 19, n);
+    if (kernel == nullptr) {
+        return false;
+    }
+    static_assert(2 + 4 * GGML_MAX_DIMS + 1 <= FLAGOS_MAX_KERNEL_ARGS, "copy arguments exceed the call capacity");
+    if (call != nullptr) {
+        set_call(call, kernel, programs_for(kernel, n), { ptr(src), ptr(op) });
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(src->ne[d]);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(op->ne[d]);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(src->nb[d] / sizeof(float));
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(op->nb[d] / sizeof(float));
+        call->args[call->n_args++] = i32(n);
+    }
+    return true;
+}
+
+// SET_ROWS: write F32 rows into an F16 destination (the KV cache) at I64
+// row indices. src[2] is the destination GGML updates in place.
+bool plan_set_rows(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * values = op->src[0];
+    const ggml_tensor * index = op->src[1];
+    const ggml_tensor * dst = op->src[2];
+    if (values == nullptr || index == nullptr || dst == nullptr || op->type != GGML_TYPE_F16 ||
+        values->type != GGML_TYPE_F32 || index->type != GGML_TYPE_I64 || dst->type != GGML_TYPE_F16 ||
+        op->ne[0] <= 0 || op->ne[1] <= 0 || op->ne[2] != 1 || op->ne[3] != 1 ||
+        values->ne[0] != op->ne[0] || values->ne[1] <= 0 || values->ne[2] != 1 || values->ne[3] != 1 ||
+        index->ne[0] != values->ne[1] || index->ne[1] != 1 || index->ne[2] != 1 || index->ne[3] != 1 ||
+        !ggml_are_same_shape(op, dst) || !ggml_is_contiguous(op) || !ggml_is_contiguous(values) ||
+        !ggml_is_contiguous(index) || !ggml_is_contiguous(dst) ||
+        !fits_i32(ggml_nelements(op)) || !fits_i32(ggml_nelements(values))) {
+        return false;
+    }
+    if (op->data != nullptr && dst->data != nullptr && op->data != dst->data) {
+        return false;
+    }
+    if (partially_overlaps(op, values) || partially_overlaps(op, index)) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(values);
+    const flagos_kernel_info * kernel = find_elementwise(package, "flagos_set_rows_f32_f16", 6, n);
+    if (kernel == nullptr) {
+        return false;
+    }
+    set_call(call, kernel, programs_for(kernel, n),
+             { ptr(values), ptr(index), ptr(op), i32(values->ne[0]), i32(values->ne[1]), i32(op->ne[1]) });
+    return true;
+}
+
+// GET_ROWS from a contiguous F32 table with I32 indices; grid (rows, ceil(columns / BLOCK)).
+bool plan_get_rows(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * table = op->src[0];
+    const ggml_tensor * index = op->src[1];
+    const int64_t max_elements = INT32_MAX / sizeof(float);
+    if (table == nullptr || index == nullptr || op->type != GGML_TYPE_F32 || table->type != GGML_TYPE_F32 ||
+        index->type != GGML_TYPE_I32 || table->ne[0] <= 0 || table->ne[0] > max_elements || table->ne[1] <= 0 ||
+        table->ne[1] > max_elements / table->ne[0] || table->ne[2] != 1 || table->ne[3] != 1 ||
+        index->ne[0] <= 0 || index->ne[0] > max_elements / table->ne[0] ||
+        index->ne[1] != 1 || index->ne[2] != 1 || index->ne[3] != 1 ||
+        op->ne[0] != table->ne[0] || op->ne[1] != index->ne[0] || op->ne[2] != 1 || op->ne[3] != 1 ||
+        !ggml_is_contiguous(table) || !ggml_is_contiguous(index) || !ggml_is_contiguous(op) ||
+        partially_overlaps(op, table) || partially_overlaps(op, index)) {
+        return false;
+    }
+    const flagos_kernel_info * kernel = package.find("flagos_get_rows_f32");
+    if (kernel == nullptr || kernel->block_size <= 0 || (kernel->argument_count >= 0 && kernel->argument_count != 4)) {
+        return false;
+    }
+    const int64_t col_programs = (op->ne[0] + kernel->block_size - 1) / kernel->block_size;
+    if (col_programs > 65535 || op->ne[1] > INT32_MAX) {
+        return false;
+    }
+    set_call(call, kernel, op->ne[1], { ptr(table), ptr(index), ptr(op), i32(op->ne[0]) });
+    if (call != nullptr) {
+        call->grid[1] = static_cast<uint32_t>(col_programs);
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -268,6 +393,14 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
             return plan_unary(package, op, call);
         case GGML_OP_MUL_MAT:
             return plan_mul_mat(package, op, call);
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+            return plan_copy(package, op, call);
+        case GGML_OP_SET_ROWS:
+            return plan_set_rows(package, op, call);
+        case GGML_OP_GET_ROWS:
+            return plan_get_rows(package, op, call);
         default:
             return false;
     }
