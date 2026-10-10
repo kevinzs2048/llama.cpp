@@ -367,6 +367,61 @@ inline bool run(const std::string & name, const program & p) {
         }
         return true;
     }
+    if (name.rfind("flagos_flash_attn_", 0) == 0) {
+        // decode:  (q, k, v, mask, out, klen, gqa, sqt, sqh, skt, skh, svt, svh, sot, soh, scale)
+        // prefill: (q, k, v, mask, out, qlen, klen, gqa, sqt, sqh, skt, skh, svt, svh, smt, smq, sot, soh, scale)
+        const bool prefill = name.find("_prefill_") != std::string::npos;
+        const int D = name.find("_h256") != std::string::npos ? 256 : 128;
+        int a = 5;
+        const int32_t qlen = prefill ? I(a++) : 1;
+        const int32_t klen = I(a++), gqa = I(a++), sqt = I(a++), sqh = I(a++), skt = I(a++), skh = I(a++);
+        const int32_t svt = I(a++), svh = I(a++);
+        const int32_t smt = prefill ? I(a++) : 1, smq = prefill ? I(a++) : 0;
+        const int32_t sot = I(a++), soh = I(a++);
+        const float scale = arg<float>(p, a);
+        const float * q = F(0);
+        const auto * k = arg<const uint16_t *>(p, 1);
+        const auto * v = arg<const uint16_t *>(p, 2);
+        const auto * mask = arg<const uint16_t *>(p, 3);
+        float * out = F(4);
+        const int64_t qh = p.pid_x, kvh = qh / gqa;
+        const int64_t r0 = prefill ? int64_t(p.pid_y) * p.block : 0, r1 = prefill ? std::min<int64_t>(r0 + p.block, qlen) : 1;
+        auto f16r = [](float x) { return f16_to_f32(f32_to_f16(x)); };
+        std::vector<float> Q(D), acc(D);
+        for (int64_t r = r0; r < r1; ++r) {
+            for (int d = 0; d < D; ++d) Q[d] = f16r(q[r * sqt + qh * sqh + d]);
+            float m = -INFINITY, l = 0.0f;
+            std::fill(acc.begin(), acc.end(), 0.0f);
+            for (int64_t ks = 0; ks < klen; ks += 16) {
+                float S[16], P[16];
+                float bm = -INFINITY;
+                for (int n = 0; n < 16; ++n) {
+                    const int64_t key = ks + n;
+                    if (key >= klen) { S[n] = -INFINITY; continue; }
+                    float dot = 0.0f;
+                    for (int d = 0; d < D; ++d) dot += Q[d] * f16_to_f32(k[d + kvh * skh + key * skt]);
+                    S[n] = dot * scale + f16_to_f32(mask[key * smt + (prefill ? r * smq : 0)]);
+                    bm = std::max(bm, S[n]);
+                }
+                const float nm = std::max(m, bm);
+                const float safe = nm == -INFINITY ? 0.0f : nm;
+                const float resc = std::exp(m - safe);
+                float psum = 0.0f;
+                for (int n = 0; n < 16; ++n) { P[n] = S[n] == -INFINITY ? 0.0f : std::exp(S[n] - safe); psum += P[n]; }
+                l = l * resc + psum;
+                for (int d = 0; d < D; ++d) {
+                    float t = 0.0f;
+                    for (int n = 0; n < 16; ++n) {
+                        if (ks + n < klen) t += f16r(P[n]) * f16_to_f32(v[(ks + n) * svt + kvh * svh + d]);
+                    }
+                    acc[d] = acc[d] * resc + t;
+                }
+                m = nm;
+            }
+            for (int d = 0; d < D; ++d) out[r * sot + qh * soh + d] = acc[d] / (l > 0.0f ? l : 1.0f);
+        }
+        return true;
+    }
     if (name == "flagos_rms_norm_mul_f32") {   // (norm_out, mul_out, x, weight, n_cols, eps); one program per row
         const int32_t n = I(4);
         const float * x = F(2) + int64_t(p.pid_x) * n;

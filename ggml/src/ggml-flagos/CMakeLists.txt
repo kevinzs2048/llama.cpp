@@ -244,7 +244,11 @@ list(APPEND _flagos_hostsim_kernels
     "flagos_softplus_f32 64 3" "flagos_swiglu_split_f32 64 4" "flagos_concat_f32 64 21"
     "flagos_l2_norm_strided_f32 512 9" "flagos_rms_norm_ggml_strided_f32 256 9" "flagos_ssm_conv_f32 64 12"
     "flagos_gated_delta_net_scalar_f32 128 24 4"
-    "flagos_rope_ggml_recurrence_f32 128 20" "flagos_rope_ggml_neox_recurrence_f32 128 20")
+    "flagos_rope_ggml_recurrence_f32 128 20" "flagos_rope_ggml_neox_recurrence_f32 128 20"
+    "flagos_flash_attn_decode_f32_f16_generic_h128 16 16 16 16 128"
+    "flagos_flash_attn_decode_f32_f16_generic_h256 16 16 16 16 256"
+    "flagos_flash_attn_prefill_f32_f16_generic_h128 16 19 16 16 128"
+    "flagos_flash_attn_prefill_f32_f16_generic_h256 16 19 16 16 256")
 foreach(_q q4_0 q4_1 q8_0 q4_k q5_k q6_k)
     list(APPEND _flagos_hostsim_kernels "flagos_mul_mat_${_q}_f32 1 6" "flagos_mul_mat_${_q}_f32_batched 4 7")
 endforeach()
@@ -271,13 +275,19 @@ foreach(_k IN LISTS _flagos_hostsim_kernels)
     list(GET _k 2 _argc)
     list(LENGTH _k _len)
     set(_tile 0)
+    set(_tile_m 0)
+    set(_tile_k 0)
     if (_len GREATER 3)
         list(GET _k 3 _tile)
+    endif()
+    if (_len GREATER 5)
+        list(GET _k 4 _tile_m)
+        list(GET _k 5 _tile_k)
     endif()
     if (_flagos_hostsim_entries)
         string(APPEND _flagos_hostsim_entries ",\n")
     endif()
-    string(APPEND _flagos_hostsim_entries "  {\"name\": \"${_name}\", \"file\": \"hostsim-elementwise.bin\", \"sha256\": \"${_flagos_hostsim_sha}\", \"size_bytes\": ${_flagos_hostsim_size}, \"block_size\": ${_block}, \"num_warps\": 1, \"warp_size\": 1, \"argument_count\": ${_argc}, \"tile_n\": ${_tile}}")
+    string(APPEND _flagos_hostsim_entries "  {\"name\": \"${_name}\", \"file\": \"hostsim-elementwise.bin\", \"sha256\": \"${_flagos_hostsim_sha}\", \"size_bytes\": ${_flagos_hostsim_size}, \"block_size\": ${_block}, \"num_warps\": 1, \"warp_size\": 1, \"argument_count\": ${_argc}, \"tile_n\": ${_tile}, \"tile_m\": ${_tile_m}, \"tile_k\": ${_tile_k}}")
 endforeach()
 file(WRITE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/manifest.json"
     "{\"format\": \"flagos-kernel-package-v1\", \"arch\": \"hostsim-v1\", \"kernels\": [\n${_flagos_hostsim_entries}\n]}\n")

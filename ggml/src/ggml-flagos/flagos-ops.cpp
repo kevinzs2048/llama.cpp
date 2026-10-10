@@ -783,6 +783,81 @@ bool plan_rope(const flagos_kernel_package & package, const ggml_tensor * op, fl
     }
     return true;
 }
+
+// FLASH_ATTN_EXT with F32 Q, F16 K/V/mask, head size 128 or 256, GQA by
+// head-group division, online softmax over 16-key tiles. No sinks, ALiBi
+// or logit softcap.
+// - decode (one query): flagos_flash_attn_decode_f32_f16_generic_h{D}, 16
+//   arguments, grid (Hq); needs the KV-cache layout (head stride D) and a
+//   mask of exactly [n_kv, 1, 1, 1].
+// - prefill: flagos_flash_attn_prefill_f32_f16_generic_h{D}, 19 arguments,
+//   grid (Hq, ceil(n_q / BLOCK)); one mask plane shared by all heads.
+bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    float params[3];
+    std::memcpy(params, op->op_params, sizeof(params));
+    const float scale = params[0], max_bias = params[1], softcap = params[2];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr || op->src[4] != nullptr ||
+        op->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
+        v->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 || !std::isfinite(scale) || max_bias != 0.0f ||
+        softcap != 0.0f || !ggml_is_contiguous(op) || !ggml_is_contiguous(mask) ||
+        q->nb[0] != sizeof(float) || k->nb[0] != 2 || v->nb[0] != 2) {
+        return false;
+    }
+    const int64_t D = q->ne[0], n_q = q->ne[1], Hq = q->ne[2], n_kv = k->ne[1], Hkv = k->ne[2];
+    if ((D != 128 && D != 256) || k->ne[0] != D || v->ne[0] != D || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        !ggml_are_same_shape(k, v) || Hkv <= 0 || Hq % Hkv != 0 || n_kv <= 0 || n_q <= 0 ||
+        op->ne[0] != D || op->ne[1] != Hq || op->ne[2] != n_q || op->ne[3] != 1 || v->nb[1] != k->nb[1] || v->nb[2] != k->nb[2] ||
+        !element_offsets_fit_i32(q, sizeof(float)) || !element_offsets_fit_i32(k, 2) || !element_offsets_fit_i32(v, 2) ||
+        !fits_i32(ggml_nelements(op)) || Hq > INT32_MAX) {
+        return false;
+    }
+    for (const ggml_tensor * t : { q, k, v, mask }) {
+        if (partially_overlaps(op, t) || (op->data != nullptr && op->data == t->data)) {
+            return false;
+        }
+    }
+    const bool decode = n_q == 1;
+    if (decode) {
+        if (mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            k->nb[2] != size_t(D) * 2 || k->nb[1] < size_t(D) * 2) {
+            return false;
+        }
+    } else if (mask->ne[0] < n_kv || mask->ne[1] < n_q || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    const std::string name = std::string("flagos_flash_attn_") + (decode ? "decode" : "prefill") +
+        "_f32_f16_generic_h" + std::to_string(D);
+    const flagos_kernel_info * kernel = package.find(name);
+    const int expected_args = decode ? 16 : 19;
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != expected_args) ||
+        kernel->tile_k != D || kernel->tile_m != 16 || kernel->tile_n < 16 || kernel->tile_n > 64 ||
+        (kernel->tile_n & (kernel->tile_n - 1)) != 0 || kernel->block_size != (decode ? kernel->tile_n : kernel->tile_m)) {
+        return false;
+    }
+    const int64_t q_programs = decode ? 1 : (n_q + kernel->block_size - 1) / kernel->block_size;
+    if (q_programs > 65535) {
+        return false;
+    }
+    if (call != nullptr) {
+        const int64_t gqa = Hq / Hkv;
+        const int32_t sqt = q->nb[1] / 4, sqh = q->nb[2] / 4, skt = k->nb[1] / 2, skh = k->nb[2] / 2;
+        const int32_t svt = v->nb[1] / 2, svh = v->nb[2] / 2, sot = op->nb[2] / 4, soh = op->nb[1] / 4;
+        if (decode) {
+            set_call(call, kernel, Hq, { ptr(q), ptr(k), ptr(v), ptr(mask), ptr(op), i32(n_kv), i32(gqa),
+                     i32(sqt), i32(sqh), i32(skt), i32(skh), i32(svt), i32(svh), i32(sot), i32(soh), f32(scale) });
+        } else {
+            set_call(call, kernel, Hq, { ptr(q), ptr(k), ptr(v), ptr(mask), ptr(op), i32(n_q), i32(n_kv), i32(gqa),
+                     i32(sqt), i32(sqh), i32(skt), i32(skh), i32(svt), i32(svh), i32(mask->nb[0] / 2),
+                     i32(mask->nb[1] / 2), i32(sot), i32(soh), f32(scale) });
+            call->grid[1] = static_cast<uint32_t>(q_programs);
+        }
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -809,6 +884,8 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
             return plan_gated_delta_net(package, op, call);
         case GGML_OP_ROPE:
             return plan_rope(package, op, call);
+        case GGML_OP_FLASH_ATTN_EXT:
+            return plan_flash_attn(package, op, call);
         case GGML_OP_UNARY:
             return plan_unary(package, op, call);
         case GGML_OP_MUL_MAT:
