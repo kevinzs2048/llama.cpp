@@ -11,6 +11,7 @@ struct flagos_provider_v1;
 
 struct flagos_loaded_provider {
     std::string path;   // plugin file, empty for built-ins
+    std::string dir;    // directory holding the plugin
     std::string name;
     void * handle = nullptr;
     const flagos_provider_entry_v1 * entry = nullptr;

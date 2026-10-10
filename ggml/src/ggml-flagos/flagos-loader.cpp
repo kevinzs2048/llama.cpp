@@ -159,7 +159,7 @@ static void flagos_try_load(const fs::path & path, flagos_loader_result & result
         dlclose(handle);
         return;
     }
-    result.providers.push_back({ file, entry->name, handle, entry });
+    result.providers.push_back({ file, path.parent_path().string(), entry->name, handle, entry });
 }
 
 flagos_loader_result flagos_loader_load_all() {

@@ -112,6 +112,9 @@ typedef struct flagos_rt_device_props {
     uint32_t warp_size;
     uint32_t compute_units;
     uint32_t shared_memory_per_block;
+    // Default kernel-package directory for this device, or NULL. The core
+    // prefers GGML_FLAGOS_KERNEL_DIR when it is set.
+    const char * package_dir;
 } flagos_rt_device_props;
 
 typedef enum {
@@ -135,11 +138,26 @@ typedef struct flagos_rt_arg {
     } value;
 } flagos_rt_arg;
 
+// Launch properties of one kernel, taken from the package manifest. The
+// runtime keeps what it needs when the kernel is looked up.
+typedef struct flagos_rt_kernel_desc {
+    uint32_t struct_size;
+    const char * symbol;
+    uint32_t threads;           // threads per program (workgroup size)
+    uint32_t block_size;        // logical elements per program (Triton BLOCK)
+    uint32_t shared_memory;     // dynamic shared memory per launch, bytes
+    uint32_t n_args;            // arguments the core passes to launch()
+    // Compiler-managed scratch that the runtime allocates and appends after
+    // the core's arguments (Triton global/profile scratch). Zero if unused.
+    uint64_t global_scratch_size;
+    uint32_t global_scratch_align;
+    uint64_t profile_scratch_size;
+    uint32_t profile_scratch_align;
+} flagos_rt_kernel_desc;
+
 typedef struct flagos_rt_launch {
     uint32_t struct_size;
-    uint32_t grid[3];
-    uint32_t block[3];
-    uint32_t shared_memory;
+    uint32_t grid[3];           // number of programs per dimension
     uint32_t n_args;
     const flagos_rt_arg * args;
 } flagos_rt_launch;
@@ -183,7 +201,8 @@ typedef struct flagos_runtime_v1 {
     flagos_rt_status (*module_load)(flagos_rt_device_t device, const void * image, size_t size,
                                     flagos_rt_module_t * module);
     void (*module_unload)(flagos_rt_module_t module);
-    flagos_rt_status (*kernel_get)(flagos_rt_module_t module, const char * name, flagos_rt_kernel_t * kernel);
+    flagos_rt_status (*kernel_get)(flagos_rt_module_t module, const flagos_rt_kernel_desc * desc,
+                                   flagos_rt_kernel_t * kernel);
     flagos_rt_status (*launch)(flagos_rt_stream_t stream, flagos_rt_kernel_t kernel, const flagos_rt_launch * launch);
 
     // Tier 1, optional when the device reports no event support.

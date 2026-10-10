@@ -2,6 +2,7 @@
 #include "flagos-provider.h"
 #include "flagos-registry.h"
 #include "flagos-loader.h"
+#include "flagos-rt-device.h"
 
 #include "../ggml-backend-impl.h"
 #include "../ggml-impl.h"
@@ -104,9 +105,19 @@ static const flagos_loader_result & flagos_plugins() {
 
 static std::vector<const flagos_provider_v1 *> flagos_all_providers() {
     std::vector<const flagos_provider_v1 *> providers = flagos_compiled_providers();
+    std::vector<flagos_runtime_source> runtimes;
     for (const flagos_loaded_provider & plugin : flagos_plugins().providers) {
         if (plugin.entry->kind == FLAGOS_PROVIDER_ENTRY_DEVICE) {
             providers.push_back(plugin.entry->device);
+        } else {
+            runtimes.push_back({ plugin.entry->runtime, plugin.dir.c_str() });
+        }
+    }
+    // RUNTIME-kind plugins get core-owned GGML devices, exposed through one
+    // adapter descriptor so selection and profiles work for both kinds.
+    if (!runtimes.empty()) {
+        if (const flagos_provider_v1 * adapter = flagos_runtime_adapter(runtimes)) {
+            providers.push_back(adapter);
         }
     }
     {

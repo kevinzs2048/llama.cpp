@@ -13,12 +13,24 @@ set(FLAGOS_COMMON_SOURCES
     flagos-plugin.h
     flagos-runtime.h)
 
-set(FLAGOS_SOURCES
-    ${FLAGOS_COMMON_SOURCES}
+# Core-only code: plugin loading, the registry, and the core-owned runtime
+# device (L0) with its kernel-package reader and op adapter (L2).
+set(FLAGOS_CORE_SOURCES
     flagos-loader.cpp
     flagos-loader.h
+    flagos-ops.cpp
+    flagos-ops.h
+    flagos-package.cpp
+    flagos-package.h
     flagos-registry.h
     flagos-registry.cpp
+    flagos-rt-device.cpp
+    flagos-rt-device.h
+    flagos-sha256.h)
+
+set(FLAGOS_SOURCES
+    ${FLAGOS_COMMON_SOURCES}
+    ${FLAGOS_CORE_SOURCES}
     ggml-flagos.h)
 
 set(FLAGOS_PRIVATE_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/vendor")
@@ -165,10 +177,9 @@ target_include_directories(flagos-check-target PRIVATE
 add_executable(flagos-check-registry EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
-    flagos-loader.cpp
-    flagos-registry.cpp
+    ${FLAGOS_CORE_SOURCES}
     tests/check_registry.cpp)
-target_include_directories(flagos-check-registry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_include_directories(flagos-check-registry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
 target_compile_definitions(flagos-check-registry PRIVATE GGML_FLAGOS_HAVE_DENGLIN GGML_FLAGOS_HAVE_AMD)
 target_link_libraries(flagos-check-registry PRIVATE ggml)
 
@@ -203,22 +214,57 @@ file(WRITE "${FLAGOS_TEST_PLUGIN_DIR}/not-a-provider.so" "")
 add_executable(flagos-check-loader EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
-    flagos-loader.cpp
-    flagos-registry.cpp
+    ${FLAGOS_CORE_SOURCES}
     tests/check_loader.cpp)
-target_include_directories(flagos-check-loader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_include_directories(flagos-check-loader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
 target_compile_definitions(flagos-check-loader PRIVATE FLAGOS_TEST_PLUGIN_DIR="${FLAGOS_TEST_PLUGIN_DIR}")
 target_link_libraries(flagos-check-loader PRIVATE ggml ${CMAKE_DL_LIBS})
 add_dependencies(flagos-check-loader flagos-test-plugin-runtime flagos-test-plugin-bad flagos-test-plugin-device)
 
+# hostsim: reference RUNTIME provider plus a generated kernel package, used to
+# test the core runtime device end to end (also with test-backend-ops):
+#   GGML_FLAGOS_PROVIDER_PATH=<build>/flagos-hostsim test-backend-ops -b FlagOS-hostsim0
+set(FLAGOS_HOSTSIM_DIR "${CMAKE_BINARY_DIR}/flagos-hostsim")
+add_library(flagos-provider-hostsim MODULE EXCLUDE_FROM_ALL tests/plugins/hostsim_provider.cpp)
+target_include_directories(flagos-provider-hostsim PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(flagos-provider-hostsim PROPERTIES
+    PREFIX "lib" OUTPUT_NAME "flagos-provider-hostsim"
+    LIBRARY_OUTPUT_DIRECTORY "${FLAGOS_HOSTSIM_DIR}"
+    CXX_VISIBILITY_PRESET hidden)
+set(_flagos_hostsim_kernels
+    "flagos_add_f32 64 4" "flagos_add_repeat_f32 64 5" "flagos_mul_f32 64 5" "flagos_scale_f32 64 5"
+    "flagos_rms_norm_f32 4096 4" "flagos_silu_f32 64 3" "flagos_sigmoid_f32 64 3" "flagos_tanh_f32 64 3")
+set(_flagos_hostsim_module "hostsim-module v1\n")
+foreach(_k IN LISTS _flagos_hostsim_kernels)
+    string(REPLACE " " ";" _k "${_k}")
+    list(GET _k 0 _name)
+    list(GET _k 1 _block)
+    string(APPEND _flagos_hostsim_module "${_name} ${_block}\n")
+endforeach()
+file(WRITE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/hostsim-elementwise.bin" "${_flagos_hostsim_module}")
+file(SHA256 "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/hostsim-elementwise.bin" _flagos_hostsim_sha)
+file(SIZE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/hostsim-elementwise.bin" _flagos_hostsim_size)
+set(_flagos_hostsim_entries "")
+foreach(_k IN LISTS _flagos_hostsim_kernels)
+    string(REPLACE " " ";" _k "${_k}")
+    list(GET _k 0 _name)
+    list(GET _k 1 _block)
+    list(GET _k 2 _argc)
+    if (_flagos_hostsim_entries)
+        string(APPEND _flagos_hostsim_entries ",\n")
+    endif()
+    string(APPEND _flagos_hostsim_entries "  {\"name\": \"${_name}\", \"file\": \"hostsim-elementwise.bin\", \"sha256\": \"${_flagos_hostsim_sha}\", \"size_bytes\": ${_flagos_hostsim_size}, \"block_size\": ${_block}, \"num_warps\": 1, \"warp_size\": 1, \"argument_count\": ${_argc}}")
+endforeach()
+file(WRITE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/manifest.json"
+    "{\"format\": \"flagos-kernel-package-v1\", \"arch\": \"hostsim-v1\", \"kernels\": [\n${_flagos_hostsim_entries}\n]}\n")
+
 add_executable(flagos-check-spacemit-adapter EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
-    flagos-loader.cpp
-    flagos-registry.cpp
+    ${FLAGOS_CORE_SOURCES}
     providers/spacemit/flagos-spacemit.cpp
     tests/check_spacemit_adapter.cpp)
-target_include_directories(flagos-check-spacemit-adapter PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_include_directories(flagos-check-spacemit-adapter PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
 target_compile_definitions(flagos-check-spacemit-adapter PRIVATE GGML_FLAGOS_HAVE_SPACEMIT)
 target_link_libraries(flagos-check-spacemit-adapter PRIVATE ggml)
 
@@ -232,8 +278,7 @@ if (GGML_FLAGOS_AMD)
     add_executable(flagos-check-amd EXCLUDE_FROM_ALL
         flagos-provider.cpp
         flagos-target.cpp
-        flagos-loader.cpp
-        flagos-registry.cpp
+        ${FLAGOS_CORE_SOURCES}
         flagos-graph-plan.cpp
         providers/amd/flagos-amd.cpp
         providers/amd/flagos-amd-hsaco.cpp

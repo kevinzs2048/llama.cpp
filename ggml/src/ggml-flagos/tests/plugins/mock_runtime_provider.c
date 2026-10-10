@@ -48,8 +48,8 @@ static flagos_rt_status mock_module_load(flagos_rt_device_t device, const void *
     (void) device; (void) image; (void) size; (void) module; return FLAGOS_RT_UNSUPPORTED;
 }
 static void mock_module_unload(flagos_rt_module_t module) { (void) module; }
-static flagos_rt_status mock_kernel_get(flagos_rt_module_t module, const char * name, flagos_rt_kernel_t * kernel) {
-    (void) module; (void) name; (void) kernel; return FLAGOS_RT_NOT_FOUND;
+static flagos_rt_status mock_kernel_get(flagos_rt_module_t module, const flagos_rt_kernel_desc * desc, flagos_rt_kernel_t * kernel) {
+    (void) module; (void) desc; (void) kernel; return FLAGOS_RT_NOT_FOUND;
 }
 static flagos_rt_status mock_launch(flagos_rt_stream_t stream, flagos_rt_kernel_t kernel, const flagos_rt_launch * launch) {
     (void) stream; (void) kernel; (void) launch; return FLAGOS_RT_UNSUPPORTED;
