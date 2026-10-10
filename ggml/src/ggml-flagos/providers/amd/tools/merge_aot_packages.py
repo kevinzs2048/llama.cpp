@@ -392,7 +392,7 @@ def main() -> None:
     artifact_owners = {asset["file"]: ("asset", asset["name"]) for asset in merged_assets}
     for kernel in base["kernels"] + additional["kernels"]:
         owner = artifact_owners.get(kernel["file"])
-        if owner is not None:
+        if owner is not None and owner != ("kernel", kernel["name"]):
             raise RuntimeError(f"kernel and constant asset file collision: {kernel['file']}")
         artifact_owners[kernel["file"]] = ("kernel", kernel["name"])
     additional_assets = []

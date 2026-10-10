@@ -131,13 +131,15 @@ def _write_asset(root: Path, name="table", filename="table.bin", data=b"referenc
 
 
 class MergePackageTest(unittest.TestCase):
-    def _merge(self, base: Path, extension: Path, output: Path, tuning="", add_missing=False):
+    def _merge(self, base: Path, extension: Path, output: Path, tuning="", add_missing=False, replace_existing=False):
         command = [sys.executable, str(MERGE), "--base-dir", str(base),
                    "--additional-dir", str(extension), "--output-dir", str(output)]
         if tuning:
             command += ["--tuning-profile", tuning]
         if add_missing:
             command += ["--add-missing"]
+        if replace_existing:
+            command += ["--replace-existing"]
         return subprocess.run(command, text=True, capture_output=True, check=False)
 
     def test_legacy_base_plus_v2_extension(self):
@@ -215,6 +217,46 @@ class MergePackageTest(unittest.TestCase):
                 ["shared", "base", "extension"],
             )
             self.assertEqual(manifest["kernels"][0]["block_size"], 8)
+
+    def test_replace_existing_same_artifact_preserves_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_package(root / "base", ["a", "keep"], package=True)
+            _write_package(root / "extension", "a", package=True)
+            _write_asset(root / "base")
+            path = root / "extension/manifest.json"
+            manifest = json.loads(path.read_text())
+            manifest["kernels"][0]["block_size"] = 16
+            path.write_text(json.dumps(manifest))
+            artifact = root / "extension/a.hsaco"
+            artifact.write_bytes(artifact.read_bytes() + b"replacement")
+            rejected = self._merge(root / "base", root / "extension", root / "rejected")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse((root / "rejected").exists())
+            result = self._merge(root / "base", root / "extension", root / "out", replace_existing=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            merged = json.loads((root / "out/manifest.json").read_text())
+            self.assertEqual([k["name"] for k in merged["kernels"]], ["a", "keep"])
+            self.assertEqual(merged["kernels"][0]["block_size"], 16)
+            self.assertEqual((root / "out/a.hsaco").read_bytes(), artifact.read_bytes())
+            self.assertEqual((root / "out/keep.hsaco").read_bytes(), (root / "base/keep.hsaco").read_bytes())
+            self.assertEqual((root / "out/table.bin").read_bytes(), b"reference-table")
+
+    def test_replace_existing_rejects_constant_file_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_package(root / "base", "a", package=True)
+            _write_package(root / "extension", "a", package=True)
+            _write_asset(root / "base", filename="conflict.hsaco")
+            path = root / "extension/manifest.json"
+            manifest = json.loads(path.read_text())
+            manifest["kernels"][0]["file"] = "conflict.hsaco"
+            path.write_text(json.dumps(manifest))
+            (root / "extension/a.hsaco").rename(root / "extension/conflict.hsaco")
+            result = self._merge(root / "base", root / "extension", root / "out", replace_existing=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("kernel and constant asset file collision", result.stderr)
+            self.assertFalse((root / "out").exists())
 
     def test_exact_block_contract_requires_boolean(self):
         with tempfile.TemporaryDirectory() as directory:
