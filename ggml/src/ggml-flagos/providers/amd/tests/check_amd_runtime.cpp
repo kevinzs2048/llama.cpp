@@ -85,16 +85,30 @@ hipError_t hipEventDestroy(hipEvent_t) { return hipSuccess; }
 hipError_t hipEventRecord(hipEvent_t, hipStream_t) { return hipSuccess; }
 hipError_t hipStreamWaitEvent(hipStream_t, hipEvent_t, unsigned int) { return hipSuccess; }
 hipError_t hipEventSynchronize(hipEvent_t) { return hipSuccess; }
+// Modules are identified by matching the image to a package artifact, since
+// an artifact's symbol may differ from the manifest kernel name.
+static std::map<uintptr_t, std::string> g_module_names;
 hipError_t hipModuleLoadData(hipModule_t * module, const void * image) {
     // A real HSACO is an ELF object.
     CHECK(std::memcmp(image, "\x7f" "ELF", 4) == 0);
+    std::string name;
+    for (const flagos_kernel_info & info : g_package.kernels()) {
+        std::vector<uint8_t> bytes;
+        std::string error;
+        if (g_package.read_artifact(info, bytes, error) && std::memcmp(bytes.data(), image, bytes.size()) == 0) {
+            name = info.name;
+            break;
+        }
+    }
+    CHECK(!name.empty());
     *module = reinterpret_cast<hipModule_t>(uintptr_t(++g_modules));
+    g_module_names[uintptr_t(g_modules)] = name;
     return hipSuccess;
 }
 hipError_t hipModuleUnload(hipModule_t) { return hipSuccess; }
-hipError_t hipModuleGetFunction(hipFunction_t * function, hipModule_t, const char * name) {
+hipError_t hipModuleGetFunction(hipFunction_t * function, hipModule_t module, const char *) {
     const uintptr_t id = g_functions.size() + 1;
-    g_functions[id] = name;
+    g_functions[id] = g_module_names.at(reinterpret_cast<uintptr_t>(module));
     *function = reinterpret_cast<hipFunction_t>(id);
     return hipSuccess;
 }
@@ -225,6 +239,13 @@ static void compare(ggml_backend_t device_backend, ggml_backend_dev_t device, co
         CHECK(buffer != nullptr);
         std::mt19937 rng(1234);
         std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::strcmp(ggml_get_name(t), "ids") == 0) {
+                std::vector<int32_t> ids(ggml_nelements(t));
+                for (size_t i = 0; i < ids.size(); ++i) ids[i] = int32_t((i * 5 + 3) % 8);
+                ggml_backend_tensor_set(t, ids.data(), 0, ggml_nbytes(t));
+            }
+        }
         for (ggml_tensor * input : inputs) {
             std::vector<float> data(ggml_nelements(input));
             for (float & v : data) v = dist(rng);
@@ -392,9 +413,23 @@ int main(int argc, char ** argv) {
         in = { ggml_new_tensor_2d(ctx, GGML_TYPE_F32, too_wide, 2) };
         return ggml_rms_norm(ctx, in[0], 1e-6f);
     }, false);
+    // Per-dimension broadcast runs through the strided repeat kernel.
     compare(backend, device, "ADD column broadcast", [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
         in = { ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 8), ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 8) };
         return ggml_add(ctx, in[0], in[1]);
+    });
+    // MoE experts: Q4_K is in the AMD package; Q6_K (the Qwen3.6-35B-A3B
+    // Q4_K_M ffn_down_exps type) is not, so it must fall back to the CPU.
+    compare(backend, device, "MUL_MAT_ID q4_K 8 experts", [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+        in = { ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, 256, 64, 8), ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 3) };
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 3);
+        ggml_set_name(ids, "ids");
+        return ggml_mul_mat_id(ctx, in[0], in[1], ids);
+    }, true, 5e-4);
+    compare(backend, device, "MUL_MAT_ID q6_K (no kernel)", [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+        in = { ggml_new_tensor_3d(ctx, GGML_TYPE_Q6_K, 256, 64, 8), ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 3) };
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 3);
+        return ggml_mul_mat_id(ctx, in[0], in[1], ids);
     }, false);
 
     ggml_backend_free(backend);
