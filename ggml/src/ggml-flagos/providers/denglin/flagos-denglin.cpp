@@ -3220,3 +3220,6 @@ const flagos_provider_v1 * flagos_denglin_provider() {
     };
     return &provider;
 }
+
+#include "../../flagos-plugin.h"
+FLAGOS_DEFINE_DEVICE_PROVIDER_ENTRY("denglin", flagos_denglin_provider)

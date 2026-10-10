@@ -238,3 +238,6 @@ const flagos_provider_v1 * flagos_spacemit_provider() {
     };
     return &provider;
 }
+
+#include "../../flagos-plugin.h"
+FLAGOS_DEFINE_DEVICE_PROVIDER_ENTRY("spacemit", flagos_spacemit_provider)

@@ -1,14 +1,24 @@
 cmake_minimum_required(VERSION 3.18)
 
-set(FLAGOS_SOURCES
+option(GGML_FLAGOS_PROVIDER_MODULES "ggml: build each FlagOS provider as a separately loaded plugin" OFF)
+
+# Common code that both the core and DEVICE-kind provider plugins compile in.
+set(FLAGOS_COMMON_SOURCES
     flagos-graph-plan.cpp
     flagos-graph-plan.h
     flagos-provider.cpp
     flagos-provider.h
-    flagos-registry.h
-    flagos-registry.cpp
     flagos-target.cpp
     flagos-target.h
+    flagos-plugin.h
+    flagos-runtime.h)
+
+set(FLAGOS_SOURCES
+    ${FLAGOS_COMMON_SOURCES}
+    flagos-loader.cpp
+    flagos-loader.h
+    flagos-registry.h
+    flagos-registry.cpp
     ggml-flagos.h)
 
 set(FLAGOS_PRIVATE_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/vendor")
@@ -31,16 +41,72 @@ if (GGML_FLAGOS_TRITON_JIT)
     add_subdirectory("${FLAGOS_TRITON_JIT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/libtriton_jit" EXCLUDE_FROM_ALL)
 endif()
 
+# Provider plugins are installed next to the core in a flagos-providers
+# directory, which is where the core looks for them at runtime.
+if (GGML_BACKEND_DL AND GGML_BACKEND_DIR)
+    set(FLAGOS_PROVIDER_INSTALL_DIR "${GGML_BACKEND_DIR}/flagos-providers")
+elseif (GGML_BACKEND_DL OR NOT BUILD_SHARED_LIBS)
+    set(FLAGOS_PROVIDER_INSTALL_DIR "${CMAKE_INSTALL_BINDIR}/flagos-providers")
+else()
+    set(FLAGOS_PROVIDER_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/flagos-providers")
+endif()
+if (BUILD_SHARED_LIBS AND NOT GGML_BACKEND_DL)
+    set(FLAGOS_PROVIDER_BUILD_DIR "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+else()
+    set(FLAGOS_PROVIDER_BUILD_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
+if (NOT FLAGOS_PROVIDER_BUILD_DIR)
+    set(FLAGOS_PROVIDER_BUILD_DIR "${CMAKE_BINARY_DIR}/bin")
+endif()
+set(FLAGOS_PROVIDER_BUILD_DIR "${FLAGOS_PROVIDER_BUILD_DIR}/flagos-providers")
+
+# Include one provider. Without GGML_FLAGOS_PROVIDER_MODULES its sources are
+# compiled into the core as before. With it, the provider becomes its own
+# MODULE library libflagos-provider-<name>.so that links only its SDK, and
+# the core loads it with dlopen(). This is a macro so that variables a
+# provider.cmake defines for its tests stay visible to this file.
+macro(flagos_add_provider FLAGOS_PROVIDER_NAME FLAGOS_PROVIDER_FILE)
+    if (GGML_FLAGOS_PROVIDER_MODULES)
+        set(_flagos_core_sources ${FLAGOS_SOURCES})
+        set(_flagos_core_libraries ${FLAGOS_PRIVATE_LIBRARIES})
+        set(_flagos_core_definitions ${FLAGOS_PRIVATE_DEFINITIONS})
+        set(FLAGOS_SOURCES)
+        set(FLAGOS_PRIVATE_LIBRARIES)
+        set(FLAGOS_PRIVATE_DEFINITIONS)
+        include(${FLAGOS_PROVIDER_FILE})
+        set(_flagos_target flagos-provider-${FLAGOS_PROVIDER_NAME})
+        add_library(${_flagos_target} MODULE ${FLAGOS_SOURCES} ${FLAGOS_COMMON_SOURCES})
+        set_target_properties(${_flagos_target} PROPERTIES
+            PREFIX "lib"
+            LIBRARY_OUTPUT_DIRECTORY "${FLAGOS_PROVIDER_BUILD_DIR}"
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON)
+        target_include_directories(${_flagos_target} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." ${FLAGOS_PRIVATE_INCLUDE_DIRS})
+        target_link_libraries(${_flagos_target} PRIVATE ggml-base ${FLAGOS_PRIVATE_LIBRARIES})
+        target_compile_definitions(${_flagos_target} PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS} GGML_FLAGOS_PROVIDER_MODULE)
+        install(TARGETS ${_flagos_target} LIBRARY DESTINATION "${FLAGOS_PROVIDER_INSTALL_DIR}")
+        list(APPEND FLAGOS_PROVIDER_MODULE_TARGETS ${_flagos_target})
+        set(FLAGOS_SOURCES ${_flagos_core_sources})
+        set(FLAGOS_PRIVATE_LIBRARIES ${_flagos_core_libraries})
+        set(FLAGOS_PRIVATE_DEFINITIONS ${_flagos_core_definitions})
+    else()
+        include(${FLAGOS_PROVIDER_FILE})
+    endif()
+endmacro()
+
+set(FLAGOS_PROVIDER_MODULE_TARGETS)
+
 if (GGML_FLAGOS_DENGLIN)
-    include(providers/denglin/provider.cmake)
+    flagos_add_provider(denglin providers/denglin/provider.cmake)
 endif()
 
 if (GGML_FLAGOS_AMD)
-    include(providers/amd/provider.cmake)
+    flagos_add_provider(amd providers/amd/provider.cmake)
 endif()
 
 if (GGML_FLAGOS_SPACEMIT)
-    include(providers/spacemit/provider.cmake)
+    flagos_add_provider(spacemit providers/spacemit/provider.cmake)
 endif()
 
 if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD AND NOT GGML_FLAGOS_SPACEMIT)
@@ -48,6 +114,10 @@ if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD AND NOT GGML_FLAGOS_SPACEMIT
 endif()
 
 ggml_add_backend_library(ggml-flagos ${FLAGOS_SOURCES})
+target_link_libraries(ggml-flagos PRIVATE ${CMAKE_DL_LIBS})
+foreach(_flagos_module IN LISTS FLAGOS_PROVIDER_MODULE_TARGETS)
+    add_dependencies(ggml-flagos ${_flagos_module})
+endforeach()
 target_include_directories(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_INCLUDE_DIRS})
 target_link_libraries(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_LIBRARIES})
 target_compile_definitions(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS})
@@ -95,15 +165,56 @@ target_include_directories(flagos-check-target PRIVATE
 add_executable(flagos-check-registry EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
+    flagos-loader.cpp
     flagos-registry.cpp
     tests/check_registry.cpp)
 target_include_directories(flagos-check-registry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_compile_definitions(flagos-check-registry PRIVATE GGML_FLAGOS_HAVE_DENGLIN GGML_FLAGOS_HAVE_AMD)
 target_link_libraries(flagos-check-registry PRIVATE ggml)
 
+# Provider plugin loader: three mock plugins (C runtime, C++ device, bad ABI)
+# plus a file the loader must ignore.
+set(FLAGOS_TEST_PLUGIN_DIR "${CMAKE_BINARY_DIR}/flagos-test-plugins")
+add_library(flagos-test-plugin-runtime MODULE EXCLUDE_FROM_ALL tests/plugins/mock_runtime_provider.c)
+add_library(flagos-test-plugin-bad MODULE EXCLUDE_FROM_ALL tests/plugins/mock_runtime_provider.c)
+target_compile_definitions(flagos-test-plugin-bad PRIVATE FLAGOS_MOCK_BAD_ABI)
+add_library(flagos-test-plugin-device MODULE EXCLUDE_FROM_ALL
+    tests/plugins/mock_device_provider.cpp flagos-provider.cpp flagos-target.cpp)
+target_compile_definitions(flagos-test-plugin-device PRIVATE GGML_FLAGOS_PROVIDER_MODULE)
+target_link_libraries(flagos-test-plugin-device PRIVATE ggml-base)
+foreach(_flagos_plugin runtime bad device)
+    set(_flagos_plugin_name ${_flagos_plugin})
+    if (_flagos_plugin STREQUAL "runtime")
+        set(_flagos_plugin_name mock-runtime)
+    elseif (_flagos_plugin STREQUAL "bad")
+        set(_flagos_plugin_name mock-bad)
+    else()
+        set(_flagos_plugin_name mock-device)
+    endif()
+    target_include_directories(flagos-test-plugin-${_flagos_plugin} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+    set_target_properties(flagos-test-plugin-${_flagos_plugin} PROPERTIES
+        PREFIX "lib" OUTPUT_NAME "flagos-provider-${_flagos_plugin_name}"
+        LIBRARY_OUTPUT_DIRECTORY "${FLAGOS_TEST_PLUGIN_DIR}"
+        C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden)
+endforeach()
+file(MAKE_DIRECTORY "${FLAGOS_TEST_PLUGIN_DIR}")
+file(WRITE "${FLAGOS_TEST_PLUGIN_DIR}/not-a-provider.so" "")
+
+add_executable(flagos-check-loader EXCLUDE_FROM_ALL
+    flagos-provider.cpp
+    flagos-target.cpp
+    flagos-loader.cpp
+    flagos-registry.cpp
+    tests/check_loader.cpp)
+target_include_directories(flagos-check-loader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_compile_definitions(flagos-check-loader PRIVATE FLAGOS_TEST_PLUGIN_DIR="${FLAGOS_TEST_PLUGIN_DIR}")
+target_link_libraries(flagos-check-loader PRIVATE ggml ${CMAKE_DL_LIBS})
+add_dependencies(flagos-check-loader flagos-test-plugin-runtime flagos-test-plugin-bad flagos-test-plugin-device)
+
 add_executable(flagos-check-spacemit-adapter EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
+    flagos-loader.cpp
     flagos-registry.cpp
     providers/spacemit/flagos-spacemit.cpp
     tests/check_spacemit_adapter.cpp)
@@ -121,6 +232,7 @@ if (GGML_FLAGOS_AMD)
     add_executable(flagos-check-amd EXCLUDE_FROM_ALL
         flagos-provider.cpp
         flagos-target.cpp
+        flagos-loader.cpp
         flagos-registry.cpp
         flagos-graph-plan.cpp
         providers/amd/flagos-amd.cpp
@@ -165,6 +277,7 @@ if (GGML_FLAGOS_AMD)
     add_executable(flagos-check-amd-qwen35-ffn EXCLUDE_FROM_ALL
         flagos-provider.cpp
         flagos-target.cpp
+        flagos-loader.cpp
         flagos-registry.cpp
         flagos-graph-plan.cpp
         providers/amd/flagos-amd.cpp

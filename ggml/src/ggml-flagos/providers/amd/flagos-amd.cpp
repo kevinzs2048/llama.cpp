@@ -6569,3 +6569,6 @@ const flagos_provider_v1 * flagos_amd_provider() {
     };
     return &provider;
 }
+
+#include "../../flagos-plugin.h"
+FLAGOS_DEFINE_DEVICE_PROVIDER_ENTRY("amd", flagos_amd_provider)

@@ -1,6 +1,7 @@
 #include "ggml-flagos.h"
 #include "flagos-provider.h"
 #include "flagos-registry.h"
+#include "flagos-loader.h"
 
 #include "../ggml-backend-impl.h"
 #include "../ggml-impl.h"
@@ -84,8 +85,30 @@ static std::vector<const flagos_provider_v1 *> flagos_compiled_providers() {
     return providers;
 }
 
+// Provider plugins found on the search path. Loaded once, on first use by
+// either the registry or the DL score function, and never unloaded.
+static const flagos_loader_result & flagos_plugins() {
+    static flagos_loader_result result;
+    static std::once_flag once;
+    std::call_once(once, []() {
+        result = flagos_loader_load_all();
+        for (const std::string & rejected : result.rejected) {
+            GGML_LOG_WARN("FlagOS: skipped provider plugin %s\n", rejected.c_str());
+        }
+        for (const flagos_loaded_provider & plugin : result.providers) {
+            GGML_LOG_DEBUG("FlagOS: loaded provider plugin '%s' from %s\n", plugin.name.c_str(), plugin.path.c_str());
+        }
+    });
+    return result;
+}
+
 static std::vector<const flagos_provider_v1 *> flagos_all_providers() {
     std::vector<const flagos_provider_v1 *> providers = flagos_compiled_providers();
+    for (const flagos_loaded_provider & plugin : flagos_plugins().providers) {
+        if (plugin.entry->kind == FLAGOS_PROVIDER_ENTRY_DEVICE) {
+            providers.push_back(plugin.entry->device);
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(flagos_provider_mutex);
         providers.insert(providers.end(), flagos_extra_providers.begin(), flagos_extra_providers.end());
