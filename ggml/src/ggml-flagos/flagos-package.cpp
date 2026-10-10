@@ -75,6 +75,18 @@ static bool flagos_get_int(const json & item, const char * key, T & out, std::st
 }
 
 bool flagos_kernel_package::open(const std::string & dir, std::string & error) {
+    // nlohmann::json throws on type mismatches; never let that escape into
+    // GGML registry initialization.
+    try {
+        return open_impl(dir, error);
+    } catch (const std::exception & e) {
+        *this = flagos_kernel_package();
+        error = std::string("malformed manifest: ") + e.what();
+        return false;
+    }
+}
+
+bool flagos_kernel_package::open_impl(const std::string & dir, std::string & error) {
     *this = flagos_kernel_package();
     std::vector<uint8_t> bytes;
     if (!flagos_read_file(fs::path(dir) / "manifest.json", FLAGOS_MAX_MANIFEST_BYTES, bytes, error)) {
@@ -142,7 +154,20 @@ const flagos_kernel_info * flagos_kernel_package::find(std::string_view name) co
 
 bool flagos_kernel_package::read_artifact(const flagos_kernel_info & kernel, std::vector<uint8_t> & bytes,
                                           std::string & error) const {
-    if (!flagos_read_file(fs::path(dir_) / kernel.file, FLAGOS_MAX_ARTIFACT_BYTES, bytes, error)) {
+    // Resolve symlinks and require the artifact to stay inside the package.
+    std::error_code ec;
+    const fs::path root = fs::canonical(fs::path(dir_), ec);
+    const fs::path file = ec ? fs::path() : fs::canonical(fs::path(dir_) / kernel.file, ec);
+    if (ec) {
+        error = "artifact not found: " + kernel.file;
+        return false;
+    }
+    const auto rel = file.lexically_relative(root);
+    if (rel.empty() || rel.is_absolute() || *rel.begin() == "..") {
+        error = "artifact outside the package: " + kernel.file;
+        return false;
+    }
+    if (!flagos_read_file(file, FLAGOS_MAX_ARTIFACT_BYTES, bytes, error)) {
         return false;
     }
     if (kernel.size_bytes != 0 && bytes.size() != kernel.size_bytes) {

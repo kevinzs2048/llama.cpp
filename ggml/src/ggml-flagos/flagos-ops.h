@@ -31,6 +31,10 @@ struct flagos_kernel_call {
 // Ops that need no kernel (views and reshapes). graph_compute skips them.
 bool flagos_op_is_noop(const ggml_tensor * op);
 
+// Largest explicit argument count a kernel may take (launchers append
+// compiler-managed arguments after these, e.g. two Triton scratch slots).
+static constexpr uint32_t FLAGOS_MAX_EXPLICIT_KERNEL_ARGS = 30;
+
 // Decide whether `op` maps to a kernel in `package`. When `call` is not
 // NULL, also fill in the kernel, grid and arguments; tensor data pointers
 // must then be set. supports_op calls this with call == NULL so the decision

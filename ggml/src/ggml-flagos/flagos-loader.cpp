@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -79,7 +80,8 @@ bool flagos_loader_entry_is_valid(const flagos_provider_entry_v1 * entry, std::s
         reason = "entry point returned NULL";
         return false;
     }
-    if (entry->struct_size < sizeof(flagos_provider_entry_v1)) {
+    // The entry is complete up to `device` in every v1 build.
+    if (entry->struct_size < offsetof(flagos_provider_entry_v1, device) + sizeof(entry->device)) {
         reason = "entry struct_size " + std::to_string(entry->struct_size) + " is too small";
         return false;
     }
@@ -105,9 +107,15 @@ bool flagos_loader_entry_is_valid(const flagos_provider_entry_v1 * entry, std::s
             return true;
         case FLAGOS_PROVIDER_ENTRY_RUNTIME: {
             const flagos_runtime_v1 * rt = entry->runtime;
-            if (rt == nullptr || rt->struct_size < sizeof(flagos_runtime_v1) ||
+            // Optional fields after `launch` may be absent in older builds;
+            // the core reads them only through FLAGOS_RT_HAS.
+            if (rt == nullptr || rt->struct_size < FLAGOS_RUNTIME_V1_MIN_SIZE ||
                 rt->abi_version != FLAGOS_PROVIDER_ABI_VERSION) {
                 reason = "invalid or incompatible flagos_runtime_v1 table";
+                return false;
+            }
+            if (rt->name == nullptr || rt->name[0] == '\0') {
+                reason = "flagos_runtime_v1 has no name";
                 return false;
             }
             const bool tier1 = rt->device_count && rt->device_open && rt->device_close && rt->device_props &&
@@ -154,10 +162,17 @@ static void flagos_try_load(const fs::path & path, flagos_loader_result & result
         dlclose(handle);
         return;
     }
-    if (!names.insert(entry->name).second) {
+    // Runtime device names derive from the runtime's own name, so both the
+    // entry name and the runtime name must be unique.
+    const bool runtime_name_taken = entry->kind == FLAGOS_PROVIDER_ENTRY_RUNTIME &&
+        names.count(std::string("runtime:") + entry->runtime->name) != 0;
+    if (runtime_name_taken || !names.insert(entry->name).second) {
         result.rejected.push_back(file + ": provider '" + entry->name + "' is already loaded");
         dlclose(handle);
         return;
+    }
+    if (entry->kind == FLAGOS_PROVIDER_ENTRY_RUNTIME) {
+        names.insert(std::string("runtime:") + entry->runtime->name);
     }
     result.providers.push_back({ file, path.parent_path().string(), entry->name, handle, entry });
 }

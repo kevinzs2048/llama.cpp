@@ -652,8 +652,14 @@ bool plan_ssm_conv(const flagos_kernel_package & package, const ggml_tensor * op
     return true;
 }
 
+// 16-byte alignment, decided structurally before allocation: allocations
+// are aligned to the buffer type (>= 32 bytes), so only a view's byte offset
+// can break it.
 bool aligned16(const ggml_tensor * t) {
-    return t->data == nullptr || reinterpret_cast<uintptr_t>(t->data) % 16 == 0;
+    if (t->data != nullptr) {
+        return reinterpret_cast<uintptr_t>(t->data) % 16 == 0;
+    }
+    return t->view_src == nullptr || t->view_offs % 16 == 0;
 }
 
 // GATED_DELTA_NET with a scalar gate per head and token (Qwen3.5/3.6
@@ -1041,8 +1047,10 @@ bool plan_binary_strided(const flagos_kernel_package & package, const ggml_tenso
             return false;
         }
     }
+    // In place over an input is safe when the kernel reads that input at the
+    // output's own index: a contiguous src0, or a src1 of the output's shape.
     if (partially_overlaps(op, a) || partially_overlaps(op, b) ||
-        (op->data != nullptr && op->data == b->data) ||
+        (op->data != nullptr && op->data == b->data && !(ggml_are_same_shape(op, b) && ggml_is_contiguous(b))) ||
         (op->data != nullptr && op->data == a->data && !ggml_is_contiguous(a))) {
         return false;
     }

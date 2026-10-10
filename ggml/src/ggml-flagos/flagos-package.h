@@ -50,6 +50,8 @@ public:
     bool read_artifact(const flagos_kernel_info & kernel, std::vector<uint8_t> & bytes, std::string & error) const;
 
 private:
+    bool open_impl(const std::string & dir, std::string & error);
+
     std::string dir_;
     std::string arch_;
     std::vector<flagos_kernel_info> kernels_;

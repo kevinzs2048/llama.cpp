@@ -76,7 +76,7 @@ hipError_t run(emu_function * f, unsigned gx, unsigned gy, unsigned gz, void ** 
     for (unsigned z = 0; z < gz; ++z) {
         for (unsigned y = 0; y < gy; ++y) {
             for (unsigned x = 0; x < gx; ++x) {
-                if (!flagos_ref::run(f->name, { x, y, z, uint32_t(f->info->block_size), uint32_t(f->info->tile_n), args })) {
+                if (!flagos_ref::run(f->name, { x, y, z, uint32_t(f->info->block_size), uint32_t(f->info->tile_n), uint32_t(f->info->tile_m), args })) {
                     std::fprintf(stderr, "hipemu: no host reference for %s\n", f->name.c_str());
                     return hipErrorInvalidValue;
                 }
@@ -122,6 +122,7 @@ hipError_t hipMemsetAsync(void * dst, int value, size_t size, hipStream_t) { std
 hipError_t hipStreamCreateWithFlags(hipStream_t * stream, unsigned int) { *stream = reinterpret_cast<hipStream_t>(new char); return hipSuccess; }
 hipError_t hipStreamDestroy(hipStream_t stream) { delete reinterpret_cast<char *>(stream); return hipSuccess; }
 hipError_t hipStreamSynchronize(hipStream_t) { return hipSuccess; }
+hipError_t hipDeviceSynchronize() { return hipSuccess; }
 hipError_t hipEventCreateWithFlags(hipEvent_t * event, unsigned int) { *event = reinterpret_cast<hipEvent_t>(new char); return hipSuccess; }
 hipError_t hipEventDestroy(hipEvent_t event) { delete reinterpret_cast<char *>(event); return hipSuccess; }
 hipError_t hipEventRecord(hipEvent_t, hipStream_t) { return hipSuccess; }

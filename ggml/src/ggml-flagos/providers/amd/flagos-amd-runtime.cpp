@@ -13,7 +13,9 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -111,10 +113,15 @@ void device_close(flagos_rt_device_t device) {
     delete reinterpret_cast<amd_device *>(device);
 }
 
-flagos_rt_status device_props(flagos_rt_device_t handle, flagos_rt_device_props * props) {
+flagos_rt_status device_props(flagos_rt_device_t handle, flagos_rt_device_props * out) {
     const amd_device * device = reinterpret_cast<amd_device *>(handle);
     const hipDeviceProp_t & p = device->prop;
-    std::memset(props, 0, sizeof(*props));
+    if (out == nullptr || out->struct_size < offsetof(flagos_rt_device_props, struct_size) + sizeof(uint32_t)) {
+        return FLAGOS_RT_INVALID_ARGUMENT;
+    }
+    // Write only what the caller's struct can hold (it may be older).
+    flagos_rt_device_props local {};
+    flagos_rt_device_props * props = &local;
     props->struct_size = sizeof(*props);
     props->type = p.integrated ? FLAGOS_RT_DEVICE_IGPU : FLAGOS_RT_DEVICE_GPU;
     props->name = device->arch.c_str();
@@ -133,6 +140,9 @@ flagos_rt_status device_props(flagos_rt_device_t handle, flagos_rt_device_props 
     props->compute_units = static_cast<uint32_t>(p.multiProcessorCount);
     props->shared_memory_per_block = static_cast<uint32_t>(p.sharedMemPerBlock);
     props->package_dir = g_default_package_dir.empty() ? nullptr : g_default_package_dir.c_str();
+    const uint32_t size = std::min<uint32_t>(out->struct_size, sizeof(local));
+    std::memcpy(out, &local, size);
+    out->struct_size = size;
     return FLAGOS_RT_OK;
 }
 
@@ -208,8 +218,10 @@ flagos_rt_status rt_memcpy(flagos_rt_stream_t handle, void * dst, const void * s
         return FLAGOS_RT_OK;
     }
     if (handle == nullptr) {
+        // hipMemcpy resolves the device from the pointers (unified addressing).
         return check(hipMemcpy(dst, src, size, copy_kind(kind)), "hipMemcpy");
     }
+    hipSetDevice(reinterpret_cast<amd_stream *>(handle)->device->ordinal);
     return check(hipMemcpyAsync(dst, src, size, copy_kind(kind), reinterpret_cast<amd_stream *>(handle)->stream),
                  "hipMemcpyAsync");
 }
@@ -219,8 +231,12 @@ flagos_rt_status rt_memset(flagos_rt_stream_t handle, void * dst, int value, siz
         return FLAGOS_RT_OK;
     }
     if (handle == nullptr) {
-        return check(hipMemset(dst, value, size), "hipMemset");
+        // hipMemset is asynchronous for device memory; complete it here so a
+        // NULL-stream call returns finished, as the ABI requires.
+        return check(hipMemset(dst, value, size), "hipMemset") == FLAGOS_RT_OK
+            ? check(hipDeviceSynchronize(), "hipDeviceSynchronize") : FLAGOS_RT_ERROR;
     }
+    hipSetDevice(reinterpret_cast<amd_stream *>(handle)->device->ordinal);
     return check(hipMemsetAsync(dst, value, size, reinterpret_cast<amd_stream *>(handle)->stream), "hipMemsetAsync");
 }
 
@@ -246,6 +262,9 @@ void module_unload(flagos_rt_module_t handle) {
 
 flagos_rt_status kernel_get(flagos_rt_module_t handle, const flagos_rt_kernel_desc * desc, flagos_rt_kernel_t * out) {
     auto * module = reinterpret_cast<amd_module *>(handle);
+    if (desc == nullptr || desc->struct_size < sizeof(flagos_rt_kernel_desc)) {
+        return FLAGOS_RT_INVALID_ARGUMENT;   // every field of the v1 descriptor is required
+    }
     const hipDeviceProp_t & p = module->device->prop;
     // No scratch allocator yet: the Triton scratch slots are passed as null,
     // which is only valid for kernels that request none.
@@ -268,6 +287,9 @@ flagos_rt_status kernel_get(flagos_rt_module_t handle, const flagos_rt_kernel_de
 flagos_rt_status launch(flagos_rt_stream_t handle, flagos_rt_kernel_t kernel_handle, const flagos_rt_launch * launch) {
     auto * stream = reinterpret_cast<amd_stream *>(handle);
     auto * kernel = reinterpret_cast<amd_kernel *>(kernel_handle);
+    if (launch == nullptr || launch->struct_size < sizeof(flagos_rt_launch)) {
+        return FLAGOS_RT_INVALID_ARGUMENT;
+    }
     const hipDeviceProp_t & p = kernel->device->prop;
     if (launch->n_args != kernel->n_args || launch->grid[0] == 0 || launch->grid[1] == 0 || launch->grid[2] == 0 ||
         launch->grid[0] > static_cast<uint32_t>(p.maxGridSize[0]) ||
@@ -381,6 +403,15 @@ void graph_destroy(flagos_rt_graph_t graph) {
     check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)), "hipGraphExecDestroy");
 }
 
+flagos_rt_status device_synchronize(flagos_rt_device_t handle) {
+    hipSetDevice(reinterpret_cast<amd_device *>(handle)->ordinal);
+    return check(hipDeviceSynchronize(), "hipDeviceSynchronize");
+}
+
+void kernel_release(flagos_rt_kernel_t kernel) {
+    delete reinterpret_cast<amd_kernel *>(kernel);
+}
+
 // Patterns (flagos_pattern_id) this runtime opts into. The core also needs
 // the fused kernel in the package and a fused contract in its op adapter.
 int fusion_supported(flagos_rt_device_t, uint32_t pattern_id) {
@@ -427,6 +458,8 @@ flagos_runtime_v1 make_runtime() {
     rt.graph_launch = graph_launch;
     rt.graph_destroy = graph_destroy;
     rt.graph_capture_end_update = graph_capture_end_update;
+    rt.device_synchronize = device_synchronize;
+    rt.kernel_release = kernel_release;
     return rt;
 }
 

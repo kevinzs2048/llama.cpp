@@ -62,7 +62,11 @@ static void check_entry_validation() {
     runtime.struct_size = sizeof(runtime);
     runtime.abi_version = FLAGOS_PROVIDER_ABI_VERSION;
     CHECK(!flagos_loader_entry_is_valid(&entry, reason));
+    CHECK(reason.find("no name") != std::string::npos);
+    runtime.name = "x";
+    CHECK(!flagos_loader_entry_is_valid(&entry, reason));
     CHECK(reason.find("tier 1") != std::string::npos);
+
 
     entry.kind = static_cast<flagos_provider_entry_kind>(7);
     CHECK(!flagos_loader_entry_is_valid(&entry, reason));
@@ -91,6 +95,20 @@ int main() {
 
     uint32_t count = 0;
     CHECK(runtime->entry->runtime->device_count(&count) == FLAGOS_RT_OK && count == 1);
+
+    // A runtime table from an older build that ends right after the Tier-1
+    // functions is accepted; the optional tail reads as absent.
+    {
+        flagos_runtime_v1 older = *runtime->entry->runtime;
+        older.struct_size = FLAGOS_RUNTIME_V1_MIN_SIZE;
+        flagos_provider_entry_v1 older_entry = *runtime->entry;
+        older_entry.runtime = &older;
+        std::string why;
+        CHECK(flagos_loader_entry_is_valid(&older_entry, why));
+        CHECK(!FLAGOS_RT_HAS(flagos_runtime_v1, &older, event_create));
+        older.struct_size = FLAGOS_RUNTIME_V1_MIN_SIZE - 1;
+        CHECK(!flagos_loader_entry_is_valid(&older_entry, why));
+    }
 
     // The registry exposes DEVICE-kind plugin devices directly and gives each
     // RUNTIME-kind device a core-owned GGML device. The mock runtime has no

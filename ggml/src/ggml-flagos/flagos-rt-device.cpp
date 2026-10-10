@@ -37,6 +37,13 @@ struct rt_device {
     ggml_backend_device dev {};
     ggml_backend_buffer_type buft {};
     flagos_kernel_package package;
+    // Optional runtime capabilities, resolved once against the table's
+    // struct_size (fields appended after a provider was built read as NULL).
+    bool has_events = false;
+    bool has_capture = false;
+    bool has_update = false;
+    bool has_fusion = false;
+    bool has_device_sync = false;
 
     std::mutex kernel_mutex;
     std::unordered_map<std::string, flagos_rt_module_t> modules;  // by artifact file
@@ -169,6 +176,10 @@ bool buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, gg
 
 void buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     rt_buffer * ctx = buffer_of(buffer);
+    // Clearing (e.g. the KV cache) must not race with queued kernels.
+    if (ctx->device->has_device_sync) {
+        rt_check(ctx->device->rt->device_synchronize(ctx->device->handle), ctx->device, "device_synchronize");
+    }
     rt_check(ctx->device->rt->memset(nullptr, ctx->base, value, buffer->size), ctx->device, "memset buffer");
 }
 
@@ -348,11 +359,23 @@ bool run_plan(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & 
     return true;
 }
 
-// Replay a recorded graph when the plan structure and every tensor address
-// match a recording; otherwise record it the second time the same structure
-// and bindings appear (one-off graphs are never recorded). Returns false
-// when the caller should execute the plan directly.
+// Graph capture policy. Recordings are kept per (structure, bindings):
+//  - exact match -> replay;
+//  - a structure seen before with new bindings -> record it as a new entry,
+//    or, once that structure already has kMaxPerStructure entries, re-record
+//    into its least recently used entry in place (graph_capture_end_update)
+//    and replace that entry if the runtime had to build a fresh graph;
+//  - a structure seen for the first time is only counted, so one-off graphs
+//    are never recorded.
+// Recording does not execute work, so a new or updated graph is launched
+// right away. Returns false when the caller should run the plan directly.
 bool run_captured(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & plan, bool & ok) {
+    constexpr size_t kCapacity = 128;
+    static const size_t kMaxPerStructure = [] {
+        const char * value = std::getenv("GGML_FLAGOS_GRAPH_CAPTURE_PER_STRUCTURE");
+        const long n = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+        return n > 0 ? size_t(n) : size_t(4);
+    }();
     const flagos_runtime_v1 * rt = ctx->device->rt;
     if (!plan.capture_safe() || cgraph->n_nodes < 4) {
         return false;
@@ -361,72 +384,72 @@ bool run_captured(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_pla
     if (!flagos_graph_binding_snapshot_create(cgraph, plan, &bindings)) {
         return false;
     }
+    rt_backend::capture_entry * lru_same = nullptr;
+    size_t same_count = 0;
     for (auto & entry : ctx->captures) {
-        if (entry.fingerprint == plan.structural_fingerprint && entry.bindings.fingerprint == bindings.fingerprint &&
+        if (entry.fingerprint != plan.structural_fingerprint) {
+            continue;
+        }
+        if (entry.bindings.fingerprint == bindings.fingerprint &&
             flagos_graph_binding_snapshot_matches(cgraph, plan, entry.bindings)) {
             entry.last_used = ++ctx->capture_tick;
             ok = rt_check(rt->graph_launch(ctx->stream, entry.graph), ctx->device, "graph_launch");
             ctx->replays += ok;
             return true;
         }
-    }
-    // A structure seen before with other addresses (decode: KV views and
-    // lengths move every token) is re-recorded into its existing graph when
-    // the runtime can update graphs in place; otherwise a structure/binding
-    // pair is recorded the second time it appears.
-    rt_backend::capture_entry * same_structure = nullptr;
-    for (auto & entry : ctx->captures) {
-        if (entry.fingerprint == plan.structural_fingerprint) {
-            same_structure = &entry;
-            break;
+        ++same_count;
+        if (lru_same == nullptr || entry.last_used < lru_same->last_used) {
+            lru_same = &entry;
         }
     }
-    const bool can_update = rt->graph_capture_end_update != nullptr && same_structure != nullptr;
-    const uint64_t key = plan.structural_fingerprint ^ (bindings.fingerprint * 0x9e3779b97f4a7c15ull);
     if (ctx->capture_sightings.size() > 4096) {
         ctx->capture_sightings.clear();  // bounded; a cleared key only delays recording
     }
-    if (!can_update && ++ctx->capture_sightings[key] < 2) {
+    if (same_count == 0 && ++ctx->capture_sightings[plan.structural_fingerprint] < 2) {
         return false;
+    }
+    const bool update = ctx->device->has_update && same_count >= kMaxPerStructure;
+    if (update) {
+        // The executable may still be running its previous launch.
+        if (!rt_check(rt->stream_synchronize(ctx->stream), ctx->device, "stream_synchronize")) {
+            return false;
+        }
     }
     if (rt->graph_capture_begin(ctx->stream) != FLAGOS_RT_OK) {
         return false;
     }
     const bool recorded = run_plan(ctx, cgraph, plan);
     flagos_rt_graph_t graph = nullptr;
-    bool ended;
-    if (can_update) {
-        ended = rt->graph_capture_end_update(ctx->stream, same_structure->graph, &graph) == FLAGOS_RT_OK && graph != nullptr;
-    } else {
-        ended = rt->graph_capture_end(ctx->stream, &graph) == FLAGOS_RT_OK && graph != nullptr;
-    }
+    const bool ended = update
+        ? rt->graph_capture_end_update(ctx->stream, lru_same->graph, &graph) == FLAGOS_RT_OK && graph != nullptr
+        : rt->graph_capture_end(ctx->stream, &graph) == FLAGOS_RT_OK && graph != nullptr;
     if (!recorded || !ended) {
-        if (graph != nullptr && !(can_update && graph == same_structure->graph)) {
+        if (graph != nullptr && !(update && graph == lru_same->graph)) {
             rt->graph_destroy(graph);
         }
         // Nothing ran while recording; fall back to direct execution.
         return false;
     }
-    if (can_update && graph == same_structure->graph) {
-        same_structure->bindings = std::move(bindings);
-        same_structure->last_used = ++ctx->capture_tick;
-        ++ctx->updates;
-        ok = rt_check(rt->graph_launch(ctx->stream, graph), ctx->device, "graph_launch");
-        ctx->replays += ok;
-        return true;
+    if (update) {
+        if (graph != lru_same->graph) {
+            rt->graph_destroy(lru_same->graph);   // the stream was synchronized above
+            lru_same->graph = graph;
+        } else {
+            ++ctx->updates;
+        }
+        lru_same->bindings = std::move(bindings);
+        lru_same->last_used = ++ctx->capture_tick;
+    } else {
+        if (ctx->captures.size() >= kCapacity) {
+            auto lru = std::min_element(ctx->captures.begin(), ctx->captures.end(),
+                [](const auto & a, const auto & b) { return a.last_used < b.last_used; });
+            rt->stream_synchronize(ctx->stream);
+            rt->graph_destroy(lru->graph);
+            ctx->captures.erase(lru);
+        }
+        ctx->captures.push_back({ plan.structural_fingerprint, std::move(bindings), graph, ++ctx->capture_tick });
+        ++ctx->recordings;
     }
-    // Bound the cache; a decode round can touch one split per layer.
-    constexpr size_t capacity = 128;
-    if (ctx->captures.size() >= capacity) {
-        auto lru = std::min_element(ctx->captures.begin(), ctx->captures.end(),
-            [](const auto & a, const auto & b) { return a.last_used < b.last_used; });
-        rt->stream_synchronize(ctx->stream);
-        rt->graph_destroy(lru->graph);
-        ctx->captures.erase(lru);
-    }
-    ctx->captures.push_back({ plan.structural_fingerprint, std::move(bindings), graph, ++ctx->capture_tick });
-    ++ctx->recordings;
-    // Recording does not execute the work; launch it now.
     ok = rt_check(rt->graph_launch(ctx->stream, graph), ctx->device, "graph_launch");
     ctx->replays += ok;
     return true;
@@ -436,7 +459,7 @@ enum ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgr
     rt_backend * ctx = backend_of(backend);
     ctx->graphs += ctx->stats ? 1 : 0;
     // Without fusion or capture there is nothing to plan; run node by node.
-    if (ctx->device->rt->fusion_supported == nullptr && !ctx->capture) {
+    if (!ctx->device->has_fusion && !ctx->capture) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (!compute_node(ctx, cgraph->nodes[i])) {
                 return GGML_STATUS_FAILED;
@@ -465,7 +488,7 @@ void backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
 }
 
 ggml_backend_i backend_interface(const rt_device * device) {
-    const bool events = device->rt->event_create != nullptr;
+    const bool events = device->has_events;
     return {
         /* .get_name            = */ backend_get_name,
         /* .free                = */ backend_free,
@@ -533,18 +556,37 @@ void dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
         /* .async                = */ true,
         /* .host_buffer          = */ false,
         /* .buffer_from_host_ptr = */ false,
-        /* .events               = */ device->rt->event_create != nullptr,
+        /* .events               = */ device->has_events,
         /* .mmap_support         = */ false,
     };
+}
+
+// Check the kernel a plan selected against its manifest metadata and the
+// device limits, so supports_op never accepts a node the runtime would
+// refuse at launch: the manifest must declare the argument count and the
+// launch geometry, and the kernel may not need compiler scratch (no runtime
+// allocates it yet).
+bool kernel_launchable(const rt_device * device, const flagos_kernel_call & call) {
+    const flagos_kernel_info * k = call.kernel;
+    if (k == nullptr || k->argument_count < 0 || uint32_t(k->argument_count) != call.n_args ||
+        call.n_args > FLAGOS_MAX_EXPLICIT_KERNEL_ARGS || k->num_warps <= 0 || k->warp_size <= 0 ||
+        k->global_scratch_size != 0 || k->profile_scratch_size != 0) {
+        return false;
+    }
+    const uint32_t threads = uint32_t(k->num_warps * k->warp_size);
+    const flagos_rt_device_props & p = device->props;
+    return (p.max_threads_per_block == 0 || threads <= p.max_threads_per_block) &&
+        (p.shared_memory_per_block == 0 || uint32_t(k->shared_memory) <= p.shared_memory_per_block);
 }
 
 flagos_lowering_choice fusion_query(void * user_data, const ggml_cgraph * graph, const flagos_pattern_candidate & candidate) {
     auto * ctx = static_cast<rt_backend *>(user_data);
     rt_device * device = ctx->device;
     flagos_lowering_choice choice;
-    if (device->rt->fusion_supported != nullptr &&
+    flagos_kernel_call probe;
+    if (device->has_fusion &&
         device->rt->fusion_supported(device->handle, static_cast<uint32_t>(candidate.id)) &&
-        flagos_fusion_plan(device->package, graph, candidate, nullptr)) {
+        flagos_fusion_plan(device->package, graph, candidate, &probe) && kernel_launchable(device, probe)) {
         choice.supported = true;
         choice.capture_safe = true;
         choice.implementation_id = static_cast<uint64_t>(candidate.id);
@@ -600,8 +642,8 @@ rt_backend * make_backend_context(rt_device * device, flagos_rt_stream_t stream)
     ctx->fusion.user_data = ctx;
     const flagos_runtime_v1 * rt = device->rt;
     const char * capture = std::getenv("GGML_FLAGOS_GRAPH_CAPTURE");
-    ctx->capture = capture != nullptr && capture[0] == '1' && rt->graph_capture_begin != nullptr &&
-        rt->graph_capture_end != nullptr && rt->graph_launch != nullptr && rt->graph_destroy != nullptr;
+    (void) rt;
+    ctx->capture = capture != nullptr && capture[0] == '1' && device->has_capture;
     return ctx;
 }
 
@@ -681,7 +723,11 @@ bool dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     }
     // Empty nodes (for example cache copies while GGML reserves a graph for
     // zero sequences) need no kernel; graph_compute skips them.
-    if (ggml_is_empty(op) || flagos_op_is_noop(op) || flagos_op_plan(device->package, op, nullptr)) {
+    if (ggml_is_empty(op) || flagos_op_is_noop(op)) {
+        return true;
+    }
+    flagos_kernel_call probe;
+    if (flagos_op_plan(device->package, op, &probe) && kernel_launchable(device, probe)) {
         return true;
     }
     trace_declined(device, op);
@@ -695,7 +741,7 @@ bool dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) 
 ggml_backend_event_t dev_event_new(ggml_backend_dev_t dev) {
     rt_device * device = device_of(dev);
     flagos_rt_event_t event = nullptr;
-    if (device->rt->event_create == nullptr ||
+    if (!device->has_events ||
         !rt_check(device->rt->event_create(device->handle, &event), device, "event_create")) {
         return nullptr;
     }
@@ -713,7 +759,7 @@ void dev_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
 }
 
 ggml_backend_device_i device_interface(const rt_device * device) {
-    const bool events = device->rt->event_create != nullptr;
+    const bool events = device->has_events;
     return {
         /* .get_name             = */ dev_get_name,
         /* .get_description      = */ dev_get_description,
@@ -808,10 +854,10 @@ bool adapter_device_caps(size_t index, flagos_device_caps * caps) {
         memory |= FLAGOS_MEMORY_HOST_VISIBLE;
     }
     uint64_t execution = FLAGOS_EXECUTION_ASYNC_QUEUE | FLAGOS_EXECUTION_AOT_MODULE;
-    if (device.rt->event_create != nullptr) {
+    if (device.has_events) {
         execution |= FLAGOS_EXECUTION_EVENTS;
     }
-    if (device.rt->graph_capture_begin != nullptr) {
+    if (device.has_capture) {
         execution |= FLAGOS_EXECUTION_NATIVE_GRAPH;
     }
     *caps = { kind, memory, execution, device.package_format.c_str() };
@@ -894,6 +940,16 @@ const flagos_provider_v1 * flagos_runtime_adapter(const std::vector<flagos_runti
                     rt->device_close(device->handle);
                     continue;
                 }
+                using rt_t = flagos_runtime_v1;
+                device->has_events = FLAGOS_RT_HAS(rt_t, rt, event_create) && FLAGOS_RT_HAS(rt_t, rt, event_destroy) &&
+                    FLAGOS_RT_HAS(rt_t, rt, event_record) && FLAGOS_RT_HAS(rt_t, rt, event_wait) &&
+                    FLAGOS_RT_HAS(rt_t, rt, event_synchronize);
+                device->has_capture = FLAGOS_RT_HAS(rt_t, rt, graph_capture_begin) &&
+                    FLAGOS_RT_HAS(rt_t, rt, graph_capture_end) && FLAGOS_RT_HAS(rt_t, rt, graph_launch) &&
+                    FLAGOS_RT_HAS(rt_t, rt, graph_destroy);
+                device->has_update = device->has_capture && FLAGOS_RT_HAS(rt_t, rt, graph_capture_end_update);
+                device->has_fusion = FLAGOS_RT_HAS(rt_t, rt, fusion_supported);
+                device->has_device_sync = FLAGOS_RT_HAS(rt_t, rt, device_synchronize);
                 const flagos_rt_device_props & p = device->props;
                 device->target = p.target ? p.target : "";
                 device->package_format = p.package_format ? p.package_format : "";

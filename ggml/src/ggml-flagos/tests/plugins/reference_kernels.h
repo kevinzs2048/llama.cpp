@@ -22,6 +22,7 @@ struct program {
     uint32_t pid_z;
     uint32_t block;           // Triton BLOCK of the kernel
     uint32_t tile_n;          // columns per program for tiled kernels, 0 if unused
+    uint32_t tile_m;          // rows per program for tiled kernels, 0 if unused
     void * const * args;      // pointers to argument values, as in hipModuleLaunchKernel
 };
 
@@ -537,8 +538,8 @@ inline bool run(const std::string & name, const program & p) {
         const int64_t expert = ids[pick * si0 + token * si1];
         const bool valid = expert >= 0 && expert < experts;
         const int64_t xb = token * sx2 + (pick % input_picks) * sx1;
-        const int64_t r0 = f32w ? int64_t(p.pid_x) * p.tile_n : p.pid_x;
-        const int64_t r1 = f32w ? std::min<int64_t>(r0 + std::max<uint32_t>(p.tile_n, 1), rows) : r0 + 1;
+        const int64_t r0 = f32w ? int64_t(p.pid_x) * std::max<uint32_t>(p.tile_m, 1) : p.pid_x;
+        const int64_t r1 = f32w ? std::min<int64_t>(r0 + std::max<uint32_t>(p.tile_m, 1), rows) : r0 + 1;
         for (int64_t row = r0; row < r1; ++row) {
             double acc = 0.0;
             if (valid) {

@@ -17,8 +17,15 @@
 //     a GGML ABI tag that must match the core. This kind exists for vendor
 //     native backends and for providers that have not migrated yet.
 //
-// Every struct starts with struct_size so fields can only be appended. All
-// functions return a flagos_rt_status; handles are opaque.
+// Compatibility rules (fields are only ever appended):
+//  - Tables the provider returns (flagos_runtime_v1, flagos_provider_entry_v1):
+//    the provider sets struct_size to the size it was built with; the core
+//    reads a field only when struct_size covers it (FLAGOS_RT_HAS) and treats
+//    absent fields as NULL. Everything after `launch` is optional.
+//  - Structs the caller passes in (props, kernel_desc, launch): the caller
+//    sets struct_size; the callee reads and writes only the first
+//    min(caller struct_size, its own sizeof) bytes.
+// All functions return a flagos_rt_status; handles are opaque.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -191,7 +198,9 @@ typedef struct flagos_runtime_v1 {
     void (*stream_destroy)(flagos_rt_stream_t stream);
     flagos_rt_status (*stream_synchronize)(flagos_rt_stream_t stream);
 
-    // Copies are ordered on the stream. A NULL stream means a synchronous copy.
+    // Copies are ordered on the stream. A NULL stream means a synchronous copy
+    // that is complete on return; it is not ordered with other streams (the
+    // core synchronizes them first when that matters).
     flagos_rt_status (*memcpy)(flagos_rt_stream_t stream, void * dst, const void * src, size_t size,
                                flagos_rt_copy_kind kind);
     flagos_rt_status (*memset)(flagos_rt_stream_t stream, void * dst, int value, size_t size);
@@ -234,7 +243,21 @@ typedef struct flagos_runtime_v1 {
     // on this device. The core additionally requires the fused kernel in the
     // device's package.
     int (*fusion_supported)(flagos_rt_device_t device, uint32_t pattern_id);
+    // Wait for all work on all streams of the device (used around buffer
+    // clears). May be NULL; the core then synchronizes its own streams.
+    flagos_rt_status (*device_synchronize)(flagos_rt_device_t device);
+    // Release a kernel handle from kernel_get. May be NULL.
+    void (*kernel_release)(flagos_rt_kernel_t kernel);
 } flagos_runtime_v1;
+
+// Size of flagos_runtime_v1 up to and including `launch` (all Tier-1
+// functions); a provider table must be at least this large.
+#define FLAGOS_RUNTIME_V1_MIN_SIZE (offsetof(flagos_runtime_v1, launch) + sizeof(void *))
+
+// True when a provider table of type `type` built with its struct_size
+// includes `field` and the field is set.
+#define FLAGOS_RT_HAS(type, table, field) \
+    ((table)->struct_size >= offsetof(type, field) + sizeof((table)->field) && (table)->field != NULL)
 
 // ---------------------------------------------------------------------------
 // Plugin entry.

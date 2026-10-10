@@ -148,6 +148,7 @@ extern "C" hipError_t hipGraphInstantiate(hipGraphExec_t * exec, hipGraph_t grap
     ++g_graph_instantiations;
     return hipSuccess;
 }
+extern "C" hipError_t hipDeviceSynchronize() { return hipSuccess; }
 extern "C" hipError_t hipGraphDestroy(hipGraph_t graph) { delete reinterpret_cast<mock_graph *>(graph); return hipSuccess; }
 static int g_graph_updates = 0;
 extern "C" hipError_t hipGraphExecUpdate(hipGraphExec_t exec, hipGraph_t graph, hipGraphNode_t * error_node,
@@ -209,7 +210,7 @@ static hipError_t execute_launch(hipFunction_t function, unsigned gx, unsigned g
     for (uint32_t z = 0; z < gz; ++z) {
         for (uint32_t y = 0; y < gy; ++y) {
             for (uint32_t x = 0; x < gx; ++x) {
-                CHECK(flagos_ref::run(name, { x, y, z, uint32_t(info->block_size), uint32_t(info->tile_n), args }));
+                CHECK(flagos_ref::run(name, { x, y, z, uint32_t(info->block_size), uint32_t(info->tile_n), uint32_t(info->tile_m), args }));
             }
         }
     }
@@ -299,6 +300,8 @@ int main(int argc, char ** argv) {
     CHECK(g_package.open(argv[1], error));
     CHECK(setenv("GGML_FLAGOS_KERNEL_DIR", argv[1], 1) == 0);
     CHECK(setenv("GGML_FLAGOS_GRAPH_CAPTURE", "1", 1) == 0);
+    // Update recorded graphs in place as soon as a structure has one entry.
+    CHECK(setenv("GGML_FLAGOS_GRAPH_CAPTURE_PER_STRUCTURE", "1", 1) == 0);
 
     const flagos_host_v1 host = { sizeof(flagos_host_v1), FLAGOS_PROVIDER_ABI_VERSION, nullptr, host_log };
     const flagos_runtime_v1 * runtime = flagos_amd_runtime(&host);

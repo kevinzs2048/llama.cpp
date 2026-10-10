@@ -12,6 +12,7 @@
 #include "flagos-runtime.h"
 #include "reference_kernels.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -26,12 +27,14 @@ namespace {
 struct hs_module {
     std::unordered_map<std::string, uint32_t> blocks;  // symbol -> BLOCK baked into the "binary"
     std::unordered_map<std::string, uint32_t> tiles;   // symbol -> tile_n, 0 if untiled
+    std::unordered_map<std::string, uint32_t> tiles_m; // symbol -> tile_m, 0 if untiled
 };
 
 struct hs_kernel {
     std::string name;
     uint32_t block;
     uint32_t tile_n;
+    uint32_t tile_m;
     uint32_t n_args;
 };
 
@@ -54,8 +57,9 @@ flagos_rt_status device_open(uint32_t index, flagos_rt_device_t * device) {
 
 void device_close(flagos_rt_device_t) {}
 
-flagos_rt_status device_props(flagos_rt_device_t, flagos_rt_device_props * props) {
-    std::memset(props, 0, sizeof(*props));
+flagos_rt_status device_props(flagos_rt_device_t, flagos_rt_device_props * out) {
+    flagos_rt_device_props local {};
+    flagos_rt_device_props * props = &local;
     props->struct_size = sizeof(*props);
     props->type = FLAGOS_RT_DEVICE_OTHER;
     props->name = "host";
@@ -70,6 +74,9 @@ flagos_rt_status device_props(flagos_rt_device_t, flagos_rt_device_props * props
     props->warp_size = 1;
     props->compute_units = 1;
     props->package_dir = g_package_dir.empty() ? nullptr : g_package_dir.c_str();
+    const uint32_t size = std::min<uint32_t>(out->struct_size, sizeof(local));   // caller may be older
+    std::memcpy(out, &local, size);
+    out->struct_size = size;
     return FLAGOS_RT_OK;
 }
 
@@ -136,20 +143,22 @@ flagos_rt_status rt_memset(flagos_rt_stream_t, void * dst, int value, size_t siz
     return FLAGOS_RT_OK;
 }
 
-// Artifact format: first line "hostsim-module v1", then "<symbol> <BLOCK> <tile_n>".
+// Artifact format: first line "hostsim-module v1", then "<symbol> <BLOCK> <tile_n> <tile_m>".
 flagos_rt_status module_load(flagos_rt_device_t, const void * image, size_t size, flagos_rt_module_t * module) {
     std::istringstream in(std::string(static_cast<const char *>(image), size));
     std::string header;
     std::getline(in, header);
     if (header != "hostsim-module v1") return FLAGOS_RT_INVALID_ARGUMENT;
     auto * m = new hs_module;
-    // Each line: "<symbol> <BLOCK> <tile_n>".
+    // Each line: "<symbol> <BLOCK> <tile_n> <tile_m>".
     std::string symbol;
     uint32_t block = 0;
     uint32_t tile = 0;
-    while (in >> symbol >> block >> tile) {
+    uint32_t tile_m = 0;
+    while (in >> symbol >> block >> tile >> tile_m) {
         m->blocks[symbol] = block;
         m->tiles[symbol] = tile;
+        m->tiles_m[symbol] = tile_m;
     }
     *module = reinterpret_cast<flagos_rt_module_t>(m);
     return FLAGOS_RT_OK;
@@ -167,7 +176,7 @@ flagos_rt_status kernel_get(flagos_rt_module_t module, const flagos_rt_kernel_de
     // compiled Triton kernel.
     if (desc->block_size != 0 && desc->block_size != in_module->second) return FLAGOS_RT_INVALID_ARGUMENT;
     *kernel = reinterpret_cast<flagos_rt_kernel_t>(
-        new hs_kernel { desc->symbol, in_module->second, m->tiles[desc->symbol], desc->n_args });
+        new hs_kernel { desc->symbol, in_module->second, m->tiles[desc->symbol], m->tiles_m[desc->symbol], desc->n_args });
     return FLAGOS_RT_OK;
 }
 
@@ -196,7 +205,7 @@ flagos_rt_status run_kernel(hs_kernel * k, const uint32_t grid[3], const flagos_
     for (uint32_t z = 0; z < launch->grid[2]; ++z) {
         for (uint32_t y = 0; y < launch->grid[1]; ++y) {
             for (uint32_t x = 0; x < launch->grid[0]; ++x) {
-                if (!flagos_ref::run(k->name, { x, y, z, k->block, k->tile_n, values })) return FLAGOS_RT_NOT_FOUND;
+                if (!flagos_ref::run(k->name, { x, y, z, k->block, k->tile_n, k->tile_m, values })) return FLAGOS_RT_NOT_FOUND;
             }
         }
     }
@@ -277,6 +286,7 @@ flagos_runtime_v1 make_runtime() {
     rt.graph_launch = graph_launch;
     rt.graph_destroy = graph_destroy;
     rt.graph_capture_end_update = graph_capture_end_update;
+    rt.device_synchronize = [](flagos_rt_device_t) -> flagos_rt_status { return FLAGOS_RT_OK; };
     return rt;
 }
 
