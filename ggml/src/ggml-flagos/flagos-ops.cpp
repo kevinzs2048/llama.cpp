@@ -2,6 +2,8 @@
 
 #include "flagos-graph-plan.h"
 
+#include "../ggml-impl.h"
+
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -375,6 +377,126 @@ bool plan_get_rows(const flagos_kernel_package & package, const ggml_tensor * op
     }
     return true;
 }
+
+// required_output_node_indices lists graph node indices; compare them with
+// the candidate nodes at the given positions.
+bool outputs_are(const flagos_pattern_candidate & c, std::initializer_list<size_t> positions) {
+    if (c.required_output_node_indices.size() != positions.size()) {
+        return false;
+    }
+    size_t i = 0;
+    for (size_t position : positions) {
+        if (position >= c.node_indices.size() || c.required_output_node_indices[i++] != c.node_indices[position]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Shared checks for RMS_NORM -> MUL(weight row). Returns the weight.
+const ggml_tensor * norm_mul_weight(const ggml_tensor * norm, const ggml_tensor * mul, float & eps) {
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return nullptr;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : (mul->src[1] == norm ? mul->src[0] : nullptr);
+    if (x == nullptr || weight == nullptr || !is_contiguous_f32(norm) || !is_contiguous_f32(x) ||
+        !is_contiguous_f32(mul) || !is_contiguous_f32(weight) || !ggml_are_same_shape(norm, x) ||
+        !ggml_are_same_shape(mul, norm) || weight->ne[0] != norm->ne[0] || weight->ne[1] != 1 ||
+        weight->ne[2] != 1 || weight->ne[3] != 1 || !fits_i32(norm->ne[0]) || norm->ne[0] % 4 != 0 ||
+        !fits_i32(ggml_nelements(norm))) {
+        return nullptr;
+    }
+    std::memcpy(&eps, norm->op_params, sizeof(eps));
+    return std::isfinite(eps) && eps >= 0.0f ? weight : nullptr;
+}
+
+bool same_or_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
+    return !partially_overlaps(a, b);
+}
+
+bool distinct(const ggml_tensor * a, const ggml_tensor * b) {
+    return !partially_overlaps(a, b) && (a->data == nullptr || a->data != b->data);
+}
+
+// RMS_NORM followed by MUL with a broadcast row of weights. One program per
+// row; the row must fit in one BLOCK.
+// - Separate outputs: flagos_rms_norm_mul_f32(norm_out, mul_out, x, weight, n, eps),
+//   for "product only" or "norm and product" required outputs.
+// - GGML reused the dead norm buffer for the product (mul aliases norm):
+//   flagos_rms_norm_mul_inplace_f32(out, x, weight, n, eps), product only.
+bool plan_rms_norm_mul(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                       const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    if (c.node_indices.size() != 2) {
+        return false;
+    }
+    const ggml_tensor * norm = graph->nodes[c.node_indices[0]];
+    const ggml_tensor * mul = graph->nodes[c.node_indices[1]];
+    float eps = 0.0f;
+    const ggml_tensor * weight = norm_mul_weight(norm, mul, eps);
+    if (weight == nullptr) {
+        return false;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const int64_t rows = ggml_nelements(norm) / norm->ne[0];
+    const bool aliased = norm->data != nullptr && norm->data == mul->data;
+    if (aliased) {
+        if (!outputs_are(c, { 1 }) || !distinct(mul, x) || !distinct(mul, weight)) {
+            return false;
+        }
+        const flagos_kernel_info * kernel = find_kernel(package, "flagos_rms_norm_mul_inplace_f32", 5, rows);
+        if (kernel == nullptr || kernel->block_size < norm->ne[0]) {
+            return false;
+        }
+        set_call(call, kernel, rows, { ptr(mul), ptr(x), ptr(weight), i32(norm->ne[0]), f32(eps) });
+        return true;
+    }
+    if (!(outputs_are(c, { 1 }) || outputs_are(c, { 0, 1 })) || !distinct(norm, mul) || !distinct(norm, x) ||
+        !distinct(norm, weight) || !distinct(mul, x) || !distinct(mul, weight)) {
+        return false;
+    }
+    const flagos_kernel_info * kernel = find_kernel(package, "flagos_rms_norm_mul_f32", 6, rows);
+    if (kernel == nullptr || kernel->block_size < norm->ne[0]) {
+        return false;
+    }
+    set_call(call, kernel, rows, { ptr(norm), ptr(mul), ptr(x), ptr(weight), i32(norm->ne[0]), f32(eps) });
+    return true;
+}
+
+// ADD (residual) -> RMS_NORM -> MUL(weight row), keeping the residual sum:
+// flagos_add_rms_norm_mul_residual_f32(residual_out, mul_out, x, bias, weight, n, eps).
+// Each program reads its row before writing, so the residual may reuse an
+// input buffer exactly; any partial overlap is refused.
+bool plan_add_rms_norm_mul(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                           const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    if (c.node_indices.size() != 3 || !outputs_are(c, { 0, 2 })) {
+        return false;
+    }
+    const ggml_tensor * add = graph->nodes[c.node_indices[0]];
+    const ggml_tensor * norm = graph->nodes[c.node_indices[1]];
+    const ggml_tensor * mul = graph->nodes[c.node_indices[2]];
+    float eps = 0.0f;
+    const ggml_tensor * weight = norm_mul_weight(norm, mul, eps);
+    if (weight == nullptr || add->op != GGML_OP_ADD || norm->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    if (a == nullptr || b == nullptr || !is_contiguous_f32(add) || !is_contiguous_f32(a) || !is_contiguous_f32(b) ||
+        !ggml_are_same_shape(add, a) || !ggml_are_same_shape(add, b) ||
+        !distinct(add, mul) || !distinct(add, weight) || !distinct(mul, weight) ||
+        !same_or_disjoint(add, a) || !same_or_disjoint(add, b) ||
+        !same_or_disjoint(mul, a) || !same_or_disjoint(mul, b)) {
+        return false;
+    }
+    const int64_t rows = ggml_nelements(norm) / norm->ne[0];
+    const flagos_kernel_info * kernel = find_kernel(package, "flagos_add_rms_norm_mul_residual_f32", 7, rows);
+    if (kernel == nullptr || kernel->block_size < norm->ne[0]) {
+        return false;
+    }
+    set_call(call, kernel, rows, { ptr(add), ptr(mul), ptr(a), ptr(b), ptr(weight), i32(norm->ne[0]), f32(eps) });
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -401,6 +523,21 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
             return plan_set_rows(package, op, call);
         case GGML_OP_GET_ROWS:
             return plan_get_rows(package, op, call);
+        default:
+            return false;
+    }
+}
+
+bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                        const flagos_pattern_candidate & candidate, flagos_kernel_call * call) {
+    if (graph == nullptr || !package.is_open()) {
+        return false;
+    }
+    switch (candidate.id) {
+        case flagos_pattern_id::rms_norm_mul:
+            return plan_rms_norm_mul(package, graph, candidate, call);
+        case flagos_pattern_id::add_rms_norm_mul:
+            return plan_add_rms_norm_mul(package, graph, candidate, call);
         default:
             return false;
     }

@@ -324,6 +324,18 @@ flagos_rt_status event_synchronize(flagos_rt_event_t event) {
     return check(hipEventSynchronize(reinterpret_cast<amd_event *>(event)->event), "hipEventSynchronize");
 }
 
+// Patterns (flagos_pattern_id) this runtime opts into. The core also needs
+// the fused kernel in the package and a fused contract in its op adapter.
+int fusion_supported(flagos_rt_device_t, uint32_t pattern_id) {
+    switch (pattern_id) {
+        case 1:  // rms_norm_mul
+        case 2:  // add_rms_norm_mul
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 flagos_runtime_v1 make_runtime() {
     flagos_runtime_v1 rt {};
     rt.struct_size = sizeof(rt);
@@ -352,6 +364,7 @@ flagos_runtime_v1 make_runtime() {
     rt.event_record = event_record;
     rt.event_wait = event_wait;
     rt.event_synchronize = event_synchronize;
+    rt.fusion_supported = fusion_supported;
     return rt;
 }
 

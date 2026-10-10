@@ -245,6 +245,40 @@ inline bool run(const std::string & name, const program & p) {
         for (int32_t i = 0; i < n; ++i) y[i] = x[i] * s;
         return true;
     }
+    if (name == "flagos_rms_norm_mul_f32") {   // (norm_out, mul_out, x, weight, n_cols, eps); one program per row
+        const int32_t n = I(4);
+        const float * x = F(2) + int64_t(p.pid_x) * n;
+        const float * w = F(3);
+        float * norm = F(0) + int64_t(p.pid_x) * n;
+        float * out = F(1) + int64_t(p.pid_x) * n;
+        double sum = 0.0;
+        for (int32_t i = 0; i < n; ++i) sum += double(x[i]) * x[i];
+        const float s = 1.0f / std::sqrt(float(sum / n) + S(5));
+        for (int32_t i = 0; i < n; ++i) { norm[i] = x[i] * s; out[i] = norm[i] * w[i]; }
+        return true;
+    }
+    if (name == "flagos_rms_norm_mul_inplace_f32") {   // (out, x, weight, n_cols, eps)
+        const int32_t n = I(3);
+        const float * x = F(1) + int64_t(p.pid_x) * n;
+        const float * w = F(2);
+        float * out = F(0) + int64_t(p.pid_x) * n;
+        double sum = 0.0;
+        for (int32_t i = 0; i < n; ++i) sum += double(x[i]) * x[i];
+        const float s = 1.0f / std::sqrt(float(sum / n) + S(4));
+        for (int32_t i = 0; i < n; ++i) out[i] = x[i] * s * w[i];
+        return true;
+    }
+    if (name == "flagos_add_rms_norm_mul_residual_f32") {   // (residual, out, x, bias, weight, n_cols, eps)
+        const int32_t n = I(5);
+        const int64_t base = int64_t(p.pid_x) * n;
+        float row[8192];
+        if (n > 8192) return false;
+        double sum = 0.0;
+        for (int32_t i = 0; i < n; ++i) { row[i] = F(2)[base + i] + F(3)[base + i]; sum += double(row[i]) * row[i]; }
+        const float s = 1.0f / std::sqrt(float(sum / n) + S(6));
+        for (int32_t i = 0; i < n; ++i) { F(0)[base + i] = row[i]; F(1)[base + i] = row[i] * s * F(4)[i]; }
+        return true;
+    }
     if (name == "flagos_copy_strided_f32") {   // (src, dst, src_ne[4], dst_ne[4], src_stride[4], dst_stride[4], n)
         range(p, I(18), b, e);
         const float * src = F(0);

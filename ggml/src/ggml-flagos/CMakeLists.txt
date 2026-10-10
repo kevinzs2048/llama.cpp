@@ -238,7 +238,9 @@ set(_flagos_hostsim_kernels
     "flagos_add_f32 64 4" "flagos_add_repeat_f32 64 5" "flagos_mul_f32 64 5" "flagos_scale_f32 64 5"
     "flagos_rms_norm_f32 4096 4" "flagos_silu_f32 64 3" "flagos_sigmoid_f32 64 3" "flagos_tanh_f32 64 3")
 list(APPEND _flagos_hostsim_kernels
-    "flagos_copy_strided_f32 64 19" "flagos_set_rows_f32_f16 64 6" "flagos_get_rows_f32 64 4")
+    "flagos_copy_strided_f32 64 19" "flagos_set_rows_f32_f16 64 6" "flagos_get_rows_f32 64 4"
+    "flagos_rms_norm_mul_f32 4096 6" "flagos_rms_norm_mul_inplace_f32 4096 5"
+    "flagos_add_rms_norm_mul_residual_f32 4096 7")
 foreach(_q q4_0 q4_1 q8_0 q4_k q5_k q6_k)
     list(APPEND _flagos_hostsim_kernels "flagos_mul_mat_${_q}_f32 1 6" "flagos_mul_mat_${_q}_f32_batched 4 7")
 endforeach()

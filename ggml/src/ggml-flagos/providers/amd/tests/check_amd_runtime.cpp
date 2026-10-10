@@ -47,6 +47,7 @@ static flagos_kernel_package g_package;
 static std::map<uintptr_t, std::string> g_functions;
 static int g_modules = 0;
 static int g_launches = 0;
+static int g_fused_rms_norm_mul = 0;
 static int g_allocations = 0;
 static int g_frees = 0;
 
@@ -117,6 +118,7 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function, unsigned gx,
         }
     }
     ++g_launches;
+    g_fused_rms_norm_mul += name == "flagos_rms_norm_mul_f32";
     return hipSuccess;
 }
 
@@ -267,6 +269,9 @@ int main(int argc, char ** argv) {
 
     ggml_backend_free(backend);
     CHECK(g_launches > 0 && g_modules > 0);
+    // The norm*w+x chain goes through the Common planner and the fused
+    // RMS_NORM+MUL kernel the AMD package ships.
+    CHECK(g_fused_rms_norm_mul == 1);
     CHECK(g_allocations == g_frees);
     std::printf("amd-rt checks passed: %d launches, %d modules loaded\n", g_launches, g_modules);
     return 0;

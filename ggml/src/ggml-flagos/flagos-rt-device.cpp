@@ -1,5 +1,6 @@
 #include "flagos-rt-device.h"
 
+#include "flagos-graph-plan.h"
 #include "flagos-ops.h"
 #include "flagos-package.h"
 
@@ -227,6 +228,11 @@ const ggml_backend_buffer_type_i buft_interface = {
 struct rt_backend {
     rt_device * device;
     flagos_rt_stream_t stream;
+    // Fusion: the Common planner finds candidates, the provider opts in per
+    // pattern, the shared L2 decides whether the package can run it. Plans
+    // are cached per graph structure (decode graphs repeat every token).
+    flagos_graph_plan_cache plans;
+    flagos_fusion_interface fusion {};
     // GGML_FLAGOS_STATS=1: executed nodes per op, printed when the backend
     // is freed, to measure how much of a model runs on the device.
     bool stats = false;
@@ -277,38 +283,55 @@ void backend_synchronize(ggml_backend_t backend) {
     rt_check(ctx->device->rt->stream_synchronize(ctx->stream), ctx->device, "stream_synchronize");
 }
 
+bool launch_call(rt_backend * ctx, const flagos_kernel_call & call);
+
+// Execute one node through the shared op adapter.
+bool compute_node(rt_backend * ctx, ggml_tensor * node) {
+    if (ggml_is_empty(node) || flagos_op_is_noop(node)) {
+        return true;
+    }
+    flagos_kernel_call call;
+    if (!flagos_op_plan(ctx->device->package, node, &call)) {
+        // supports_op promised this node; refusing here means the graph
+        // changed after placement.
+        GGML_LOG_ERROR("FlagOS %s: no kernel for %s (%s)\n", ctx->device->name.c_str(), ggml_op_desc(node), node->name);
+        return false;
+    }
+    if (!launch_call(ctx, call)) {
+        return false;
+    }
+    if (ctx->stats) {
+        ++ctx->executed[ggml_op_desc(node)];
+    }
+    return true;
+}
+
 enum ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     rt_backend * ctx = backend_of(backend);
-    rt_device * device = ctx->device;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        ggml_tensor * node = cgraph->nodes[i];
-        if (ggml_is_empty(node) || flagos_op_is_noop(node)) {
+    ctx->graphs += ctx->stats ? 1 : 0;
+    // Without a provider opt-in there is nothing to fuse; skip planning.
+    if (ctx->device->rt->fusion_supported == nullptr) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (!compute_node(ctx, cgraph->nodes[i])) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+    const flagos_graph_plan & plan = ctx->plans.get_or_create(cgraph, ctx->fusion);
+    for (const flagos_plan_step & step : plan.steps) {
+        if (step.kind == flagos_execution_kind::pattern) {
+            if (!flagos_execute_fusion_step(ctx->fusion, cgraph, step)) {
+                GGML_LOG_ERROR("FlagOS %s: fused %s failed\n", ctx->device->name.c_str(),
+                               flagos_pattern_name(step.candidate.id));
+                return GGML_STATUS_FAILED;
+            }
             continue;
         }
-        flagos_kernel_call call;
-        if (!flagos_op_plan(device->package, node, &call)) {
-            // supports_op promised this node; refusing here means the graph
-            // changed after placement.
-            GGML_LOG_ERROR("FlagOS %s: no kernel for %s (%s)\n", device->name.c_str(), ggml_op_desc(node), node->name);
+        if (!compute_node(ctx, cgraph->nodes[step.candidate.node_indices[0]])) {
             return GGML_STATUS_FAILED;
-        }
-        flagos_rt_kernel_t kernel = resolve_kernel(device, call);
-        if (kernel == nullptr) {
-            return GGML_STATUS_FAILED;
-        }
-        flagos_rt_launch launch {};
-        launch.struct_size = sizeof(launch);
-        std::memcpy(launch.grid, call.grid, sizeof(launch.grid));
-        launch.n_args = call.n_args;
-        launch.args = call.args;
-        if (!rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str())) {
-            return GGML_STATUS_FAILED;
-        }
-        if (ctx->stats) {
-            ++ctx->executed[ggml_op_desc(node)];
         }
     }
-    ctx->graphs += ctx->stats ? 1 : 0;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -398,6 +421,69 @@ void dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
     };
 }
 
+flagos_lowering_choice fusion_query(void * user_data, const ggml_cgraph * graph, const flagos_pattern_candidate & candidate) {
+    auto * ctx = static_cast<rt_backend *>(user_data);
+    rt_device * device = ctx->device;
+    flagos_lowering_choice choice;
+    if (device->rt->fusion_supported != nullptr &&
+        device->rt->fusion_supported(device->handle, static_cast<uint32_t>(candidate.id)) &&
+        flagos_fusion_plan(device->package, graph, candidate, nullptr)) {
+        choice.supported = true;
+        choice.capture_safe = true;
+        choice.implementation_id = static_cast<uint64_t>(candidate.id);
+        choice.score = 1;
+    }
+    static const bool trace = [] {
+        const char * value = std::getenv("GGML_FLAGOS_TRACE_SUPPORT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (trace) {
+        std::fprintf(stderr, "FlagOS %s: pattern %s (%zu nodes, %zu required outputs) %s\n", device->name.c_str(),
+                     flagos_pattern_name(candidate.id), candidate.node_indices.size(),
+                     candidate.required_output_node_indices.size(), choice.supported ? "accepted" : "declined");
+    }
+    return choice;
+}
+
+bool launch_call(rt_backend * ctx, const flagos_kernel_call & call) {
+    rt_device * device = ctx->device;
+    flagos_rt_kernel_t kernel = resolve_kernel(device, call);
+    if (kernel == nullptr) {
+        return false;
+    }
+    flagos_rt_launch launch {};
+    launch.struct_size = sizeof(launch);
+    std::memcpy(launch.grid, call.grid, sizeof(launch.grid));
+    launch.n_args = call.n_args;
+    launch.args = call.args;
+    return rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str());
+}
+
+bool fusion_execute(void * user_data, ggml_cgraph * graph, const flagos_plan_step & step) {
+    auto * ctx = static_cast<rt_backend *>(user_data);
+    flagos_kernel_call call;
+    if (!flagos_fusion_plan(ctx->device->package, graph, step.candidate, &call) || !launch_call(ctx, call)) {
+        return false;
+    }
+    if (ctx->stats) {
+        ++ctx->executed[std::string("fused:") + flagos_pattern_name(step.candidate.id)];
+    }
+    return true;
+}
+
+rt_backend * make_backend_context(rt_device * device, flagos_rt_stream_t stream) {
+    auto * ctx = new rt_backend;
+    ctx->device = device;
+    ctx->stream = stream;
+    const char * stats = std::getenv("GGML_FLAGOS_STATS");
+    ctx->stats = stats != nullptr && stats[0] != '\0' && stats[0] != '0';
+    ctx->fusion.query_lowering = fusion_query;
+    ctx->fusion.validate_lowering = fusion_query;
+    ctx->fusion.execute_fusion = fusion_execute;
+    ctx->fusion.user_data = ctx;
+    return ctx;
+}
+
 ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char *) {
     rt_device * device = device_of(dev);
     flagos_rt_stream_t stream = nullptr;
@@ -408,10 +494,7 @@ ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char *) {
         /* .guid    = */ backend_guid(),
         /* .iface   = */ backend_interface(device),
         /* .device  = */ dev,
-        /* .context = */ new rt_backend { device, stream, [] {
-            const char * value = std::getenv("GGML_FLAGOS_STATS");
-            return value != nullptr && value[0] != '\0' && value[0] != '0';
-        }() },
+        /* .context = */ make_backend_context(device, stream),
     };
 }
 

@@ -36,3 +36,15 @@ bool flagos_op_is_noop(const ggml_tensor * op);
 // must then be set. supports_op calls this with call == NULL so the decision
 // and the launch can never disagree.
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call);
+
+struct ggml_cgraph;
+struct flagos_pattern_candidate;
+
+// Fused patterns found by the Common planner (flagos-graph-plan.h). Same
+// contract as flagos_op_plan: with call == NULL it only decides; otherwise it
+// fills the fused kernel call. The candidate's required outputs must be ones
+// the fused kernel writes. Whether a pattern is attempted at all is the
+// provider's choice (flagos_runtime_v1::fusion_supported); whether it can run
+// depends on the package containing the fused kernel.
+bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                        const flagos_pattern_candidate & candidate, flagos_kernel_call * call);

@@ -161,6 +161,12 @@ flagos_rt_status launch(flagos_rt_stream_t, flagos_rt_kernel_t kernel, const fla
     return FLAGOS_RT_OK;
 }
 
+// hostsim accepts every pattern; the core still requires the fused kernel
+// in the package, so the package decides what is fused.
+int fusion_supported(flagos_rt_device_t, uint32_t) {
+    return 1;
+}
+
 flagos_runtime_v1 make_runtime() {
     flagos_runtime_v1 rt {};
     rt.struct_size = sizeof(rt);
@@ -184,6 +190,7 @@ flagos_runtime_v1 make_runtime() {
     rt.module_unload = module_unload;
     rt.kernel_get = kernel_get;
     rt.launch = launch;
+    rt.fusion_supported = fusion_supported;
     return rt;
 }
 
