@@ -15,8 +15,6 @@ bool flagos_provider_is_valid(const flagos_provider_v1 * provider) {
         provider->device_identity != nullptr &&
         provider->device_caps != nullptr &&
         provider->is_backend != nullptr &&
-        provider->set_device != nullptr &&
-        provider->get_device != nullptr &&
         provider->score != nullptr;
 }
 

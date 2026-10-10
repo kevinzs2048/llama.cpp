@@ -214,14 +214,6 @@ bool is_backend(ggml_backend_t backend) {
     return backend && flagos_spacemit_native_is_backend(backend);
 }
 
-bool set_device(size_t index) {
-    return device_get(index) != nullptr;
-}
-
-int get_device() {
-    return device_count() == 1 ? 0 : -1;
-}
-
 int score() {
     return 0;
 }
@@ -239,8 +231,8 @@ const flagos_provider_v1 * flagos_spacemit_provider() {
         device_identity,
         device_caps,
         is_backend,
-        set_device,
-        get_device,
+        nullptr,
+        nullptr,
         score,
         device_profile,
     };

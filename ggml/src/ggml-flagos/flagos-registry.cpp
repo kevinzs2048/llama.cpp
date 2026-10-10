@@ -336,11 +336,14 @@ ggml_backend_t ggml_backend_flagos_init(int device) {
         return nullptr;
     }
     const flagos_registered_device & selected = flagos_devices[device];
-    if (!selected.provider->set_device(selected.local_index)) {
+    if (selected.provider->set_device && !selected.provider->set_device(selected.local_index)) {
         return nullptr;
     }
-    flagos_active_device.store(device);
-    return ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, device), nullptr);
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, device), nullptr);
+    if (backend) {
+        flagos_active_device.store(device);
+    }
+    return backend;
 }
 
 bool ggml_backend_is_flagos(ggml_backend_t backend) {
@@ -370,7 +373,7 @@ void ggml_backend_flagos_set_device(int device) {
         GGML_ABORT("FlagOS: invalid device %d", device);
     }
     const flagos_registered_device & selected = flagos_devices[device];
-    if (!selected.provider->set_device(selected.local_index)) {
+    if (selected.provider->set_device && !selected.provider->set_device(selected.local_index)) {
         GGML_ABORT("FlagOS: failed to select device %d", device);
     }
     flagos_active_device.store(device);
@@ -381,7 +384,8 @@ int ggml_backend_flagos_get_device() {
     const int active = flagos_active_device.load();
     if (active >= 0 && static_cast<size_t>(active) < flagos_devices.size()) {
         const flagos_registered_device & selected = flagos_devices[active];
-        if (selected.provider->get_device() == static_cast<int>(selected.local_index)) {
+        if (!selected.provider->get_device ||
+            selected.provider->get_device() == static_cast<int>(selected.local_index)) {
             return active;
         }
     }

@@ -148,6 +148,12 @@ int main() {
     CHECK(flagos_provider_is_valid(&provider));
     provider.struct_size = sizeof(flagos_provider_v1);
 
+    provider.set_device = nullptr;
+    provider.get_device = nullptr;
+    CHECK(flagos_provider_is_valid(&provider));
+    provider.set_device = set_device;
+    provider.get_device = get_device;
+
     flagos_device_profile profile {};
     CHECK(flagos_provider_get_device_profile(&provider, 0, &profile));
     CHECK(profile.engine == flagos_engine_kind::cpu);

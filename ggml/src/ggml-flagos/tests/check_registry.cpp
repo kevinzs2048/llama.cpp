@@ -29,7 +29,6 @@ static ggml_backend_device amd_devices[2] {};
 static ggml_backend_device arm_accel_devices[1] {};
 static int denglin_current_device = 0;
 static int amd_current_device = 0;
-static int arm_accel_current_device = 0;
 
 static bool mock_probe(ggml_backend_reg_t) {
     return true;
@@ -137,18 +136,6 @@ static bool arm_accel_device_caps(size_t index, flagos_device_caps * caps) {
     return true;
 }
 
-static bool arm_accel_set_device(size_t index) {
-    if (index != 0) {
-        return false;
-    }
-    arm_accel_current_device = 0;
-    return true;
-}
-
-static int arm_accel_get_device() {
-    return arm_accel_current_device;
-}
-
 static int mock_score() {
     return 0;
 }
@@ -253,8 +240,8 @@ static const flagos_provider_v1 * mock_arm_accel_provider() {
         arm_accel_device_identity,
         arm_accel_device_caps,
         mock_is_backend,
-        arm_accel_set_device,
-        arm_accel_get_device,
+        nullptr,
+        nullptr,
         mock_score,
         arm_accel_device_profile,
     };
@@ -337,6 +324,13 @@ int main() {
     CHECK(ggml_backend_flagos_get_device() == 2);
     CHECK(denglin_current_device == 0);
     CHECK(amd_current_device == 0);
+
+    // Providers may omit the legacy selection hooks; a failed backend
+    // initialization must not change the active device.
+    ggml_backend_flagos_set_device(3);
+    CHECK(ggml_backend_flagos_get_device() == 3);
+    CHECK(ggml_backend_flagos_init(2) == nullptr);
+    CHECK(ggml_backend_flagos_get_device() == 3);
 
     flagos_device_profile profile {};
     CHECK(flagos_registry_get_device_profile(2, &profile));

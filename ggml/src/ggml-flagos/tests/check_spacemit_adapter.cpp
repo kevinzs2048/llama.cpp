@@ -27,6 +27,9 @@ bool flagos_spacemit_native_query(flagos_spacemit_native_info * info) {
 }
 
 static const char * name(ggml_backend_dev_t) { return "SPACEMIT0"; }
+static const char * description(ggml_backend_dev_t) { return "Mock SpaceMiT device"; }
+static void memory(ggml_backend_dev_t, size_t * free, size_t * total) { *free = *total = 0; }
+static void props(ggml_backend_dev_t, ggml_backend_dev_props *) {}
 static const char * backend_name(ggml_backend_t) { return "SPACEMIT0"; }
 static enum ggml_backend_dev_type device_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_ACCEL; }
 static ggml_backend_buffer_type_t buffer_type(ggml_backend_dev_t) { return &native_buft; }
@@ -68,7 +71,10 @@ ggml_backend_reg_t flagos_spacemit_native_registry() {
     reg.iface.get_device = [](ggml_backend_reg_t, size_t index) { return index == 0 ? &native_device : nullptr; };
     native_device.reg = &reg;
     native_device.iface.get_name = name;
+    native_device.iface.get_description = description;
+    native_device.iface.get_memory = memory;
     native_device.iface.get_type = device_type;
+    native_device.iface.get_props = props;
     native_device.iface.get_buffer_type = buffer_type;
     native_device.iface.supports_op = supports_op;
     native_device.iface.supports_buft = supports_buft;
@@ -90,18 +96,20 @@ int main(int argc, char ** argv) {
     }
     const auto provider = flagos_spacemit_provider();
     CHECK(flagos_provider_is_valid(provider));
+    CHECK(provider->set_device == nullptr);
+    CHECK(provider->get_device == nullptr);
     CHECK(provider->score() == 0);
     CHECK(query_calls == 0);
     auto reg = ggml_backend_flagos_reg();
     if (!available || invalid_registry || disabled) {
         CHECK(ggml_backend_reg_dev_count(reg) == 0);
         CHECK(provider->device_count() == 0);
-        CHECK(provider->get_device() == -1);
-        CHECK(!provider->set_device(0));
+        CHECK(ggml_backend_flagos_get_device() == -1);
         CHECK(!provider->device_get(0));
         CHECK(!ggml_backend_flagos_init(0));
     } else {
         CHECK(ggml_backend_reg_dev_count(reg) == 1);
+        CHECK(ggml_backend_flagos_get_device() == 0);
         CHECK(ggml_backend_reg_dev_get(reg, 0) == &native_device);
         CHECK(ggml_backend_dev_backend_reg(&native_device) == reg);
         CHECK(ggml_backend_dev_type(&native_device) == GGML_BACKEND_DEVICE_TYPE_ACCEL);
@@ -332,11 +340,10 @@ int main(int argc, char ** argv) {
         CHECK(compute_calls == 1);
         ggml_free(ctx);
         ggml_backend_free(backend);
-        CHECK(provider->set_device(0));
-        CHECK(provider->get_device() == 0);
+        ggml_backend_flagos_set_device(0);
+        CHECK(ggml_backend_flagos_get_device() == 0);
     }
     CHECK(!provider->device_get(1));
-    CHECK(!provider->set_device(1));
     CHECK(!provider->device_identity(0, nullptr));
     CHECK(!provider->device_caps(0, nullptr));
     CHECK(!provider->get_device_profile(0, nullptr));

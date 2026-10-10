@@ -62,6 +62,8 @@ struct flagos_device_caps {
 using flagos_get_device_profile_fn = bool (*) (
         size_t index, flagos_device_profile * profile);
 
+// Registers complete GGML devices. Operation, buffer, and compute callbacks
+// belong to each device and backend, not to this descriptor.
 struct flagos_provider_v1 {
     uint32_t api_version;
     uint32_t struct_size;
@@ -74,6 +76,8 @@ struct flagos_provider_v1 {
     bool (*device_caps)(size_t index, flagos_device_caps * caps);
 
     bool (*is_backend)(ggml_backend_t backend);
+    // Optional legacy global selection hooks. GGML selects the device returned
+    // by device_get() directly; providers without global device state omit these.
     bool (*set_device)(size_t index);
     int (*get_device)();
     int (*score)();
