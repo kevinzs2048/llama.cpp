@@ -324,6 +324,38 @@ flagos_rt_status event_synchronize(flagos_rt_event_t event) {
     return check(hipEventSynchronize(reinterpret_cast<amd_event *>(event)->event), "hipEventSynchronize");
 }
 
+// Graph capture with HIP stream capture. Recorded work does not run until
+// the executable graph is launched.
+flagos_rt_status graph_capture_begin(flagos_rt_stream_t handle) {
+    return check(hipStreamBeginCapture(reinterpret_cast<amd_stream *>(handle)->stream, hipStreamCaptureModeRelaxed),
+                 "hipStreamBeginCapture");
+}
+
+flagos_rt_status graph_capture_end(flagos_rt_stream_t handle, flagos_rt_graph_t * out) {
+    hipGraph_t graph = nullptr;
+    if (check(hipStreamEndCapture(reinterpret_cast<amd_stream *>(handle)->stream, &graph), "hipStreamEndCapture") !=
+            FLAGOS_RT_OK || graph == nullptr) {
+        return FLAGOS_RT_ERROR;
+    }
+    hipGraphExec_t exec = nullptr;
+    const flagos_rt_status status = check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "hipGraphInstantiate");
+    check(hipGraphDestroy(graph), "hipGraphDestroy");
+    if (status != FLAGOS_RT_OK) {
+        return status;
+    }
+    *out = reinterpret_cast<flagos_rt_graph_t>(exec);
+    return FLAGOS_RT_OK;
+}
+
+flagos_rt_status graph_launch(flagos_rt_stream_t handle, flagos_rt_graph_t graph) {
+    return check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), reinterpret_cast<amd_stream *>(handle)->stream),
+                 "hipGraphLaunch");
+}
+
+void graph_destroy(flagos_rt_graph_t graph) {
+    check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)), "hipGraphExecDestroy");
+}
+
 // Patterns (flagos_pattern_id) this runtime opts into. The core also needs
 // the fused kernel in the package and a fused contract in its op adapter.
 int fusion_supported(flagos_rt_device_t, uint32_t pattern_id) {
@@ -365,6 +397,10 @@ flagos_runtime_v1 make_runtime() {
     rt.event_wait = event_wait;
     rt.event_synchronize = event_synchronize;
     rt.fusion_supported = fusion_supported;
+    rt.graph_capture_begin = graph_capture_begin;
+    rt.graph_capture_end = graph_capture_end;
+    rt.graph_launch = graph_launch;
+    rt.graph_destroy = graph_destroy;
     return rt;
 }
 

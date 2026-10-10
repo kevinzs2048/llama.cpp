@@ -7,6 +7,7 @@
 #include "../ggml-backend-impl.h"
 #include "../ggml-impl.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -238,6 +239,21 @@ struct rt_backend {
     bool stats = false;
     uint64_t graphs = 0;
     std::unordered_map<std::string, uint64_t> executed;
+    // Graph capture (Tier 2): the core decides when a plan may be recorded
+    // and replayed; the provider records and replays (HIP Graph, CUDA Graph,
+    // NPU graph offload). Opt-in with GGML_FLAGOS_GRAPH_CAPTURE=1.
+    struct capture_entry {
+        uint64_t fingerprint;
+        flagos_graph_binding_snapshot bindings;
+        flagos_rt_graph_t graph;
+        uint64_t last_used;
+    };
+    bool capture = false;
+    std::vector<capture_entry> captures;
+    std::unordered_map<uint64_t, uint32_t> capture_sightings;
+    uint64_t capture_tick = 0;
+    uint64_t replays = 0;
+    uint64_t recordings = 0;
 };
 
 rt_backend * backend_of(ggml_backend_t backend) {
@@ -261,6 +277,13 @@ void backend_free(ggml_backend_t backend) {
                      (unsigned long long) ctx->graphs, (unsigned long long) total, text.c_str());
     }
     ctx->device->rt->stream_synchronize(ctx->stream);
+    for (const auto & entry : ctx->captures) {
+        ctx->device->rt->graph_destroy(entry.graph);
+    }
+    if (ctx->stats && ctx->capture) {
+        std::fprintf(stderr, "FlagOS %s: graph capture: %llu recorded, %llu replayed\n", ctx->device->name.c_str(),
+                     (unsigned long long) ctx->recordings, (unsigned long long) ctx->replays);
+    }
     ctx->device->rt->stream_destroy(ctx->stream);
     delete ctx;
     delete backend;
@@ -306,11 +329,87 @@ bool compute_node(rt_backend * ctx, ggml_tensor * node) {
     return true;
 }
 
+bool run_plan(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & plan) {
+    for (const flagos_plan_step & step : plan.steps) {
+        if (step.kind == flagos_execution_kind::pattern) {
+            if (!flagos_execute_fusion_step(ctx->fusion, cgraph, step)) {
+                GGML_LOG_ERROR("FlagOS %s: fused %s failed\n", ctx->device->name.c_str(),
+                               flagos_pattern_name(step.candidate.id));
+                return false;
+            }
+            continue;
+        }
+        if (!compute_node(ctx, cgraph->nodes[step.candidate.node_indices[0]])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Replay a recorded graph when the plan structure and every tensor address
+// match a recording; otherwise record it the second time the same structure
+// and bindings appear (one-off graphs are never recorded). Returns false
+// when the caller should execute the plan directly.
+bool run_captured(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & plan, bool & ok) {
+    const flagos_runtime_v1 * rt = ctx->device->rt;
+    if (!plan.capture_safe() || cgraph->n_nodes < 4) {
+        return false;
+    }
+    flagos_graph_binding_snapshot bindings;
+    if (!flagos_graph_binding_snapshot_create(cgraph, plan, &bindings)) {
+        return false;
+    }
+    for (auto & entry : ctx->captures) {
+        if (entry.fingerprint == plan.structural_fingerprint && entry.bindings.fingerprint == bindings.fingerprint &&
+            flagos_graph_binding_snapshot_matches(cgraph, plan, entry.bindings)) {
+            entry.last_used = ++ctx->capture_tick;
+            ok = rt_check(rt->graph_launch(ctx->stream, entry.graph), ctx->device, "graph_launch");
+            ctx->replays += ok;
+            return true;
+        }
+    }
+    const uint64_t key = plan.structural_fingerprint ^ (bindings.fingerprint * 0x9e3779b97f4a7c15ull);
+    if (ctx->capture_sightings.size() > 4096) {
+        ctx->capture_sightings.clear();  // bounded; a cleared key only delays recording
+    }
+    if (++ctx->capture_sightings[key] < 2) {
+        return false;
+    }
+    if (rt->graph_capture_begin(ctx->stream) != FLAGOS_RT_OK) {
+        return false;
+    }
+    const bool recorded = run_plan(ctx, cgraph, plan);
+    flagos_rt_graph_t graph = nullptr;
+    const bool ended = rt->graph_capture_end(ctx->stream, &graph) == FLAGOS_RT_OK && graph != nullptr;
+    if (!recorded || !ended) {
+        if (graph != nullptr) {
+            rt->graph_destroy(graph);
+        }
+        // Nothing ran while recording; fall back to direct execution.
+        return false;
+    }
+    // Bound the cache; a decode round can touch one split per layer.
+    constexpr size_t capacity = 128;
+    if (ctx->captures.size() >= capacity) {
+        auto lru = std::min_element(ctx->captures.begin(), ctx->captures.end(),
+            [](const auto & a, const auto & b) { return a.last_used < b.last_used; });
+        rt->stream_synchronize(ctx->stream);
+        rt->graph_destroy(lru->graph);
+        ctx->captures.erase(lru);
+    }
+    ctx->captures.push_back({ plan.structural_fingerprint, std::move(bindings), graph, ++ctx->capture_tick });
+    ++ctx->recordings;
+    // Recording does not execute the work; launch it now.
+    ok = rt_check(rt->graph_launch(ctx->stream, graph), ctx->device, "graph_launch");
+    ctx->replays += ok;
+    return true;
+}
+
 enum ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     rt_backend * ctx = backend_of(backend);
     ctx->graphs += ctx->stats ? 1 : 0;
-    // Without a provider opt-in there is nothing to fuse; skip planning.
-    if (ctx->device->rt->fusion_supported == nullptr) {
+    // Without fusion or capture there is nothing to plan; run node by node.
+    if (ctx->device->rt->fusion_supported == nullptr && !ctx->capture) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (!compute_node(ctx, cgraph->nodes[i])) {
                 return GGML_STATUS_FAILED;
@@ -319,20 +418,11 @@ enum ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgr
         return GGML_STATUS_SUCCESS;
     }
     const flagos_graph_plan & plan = ctx->plans.get_or_create(cgraph, ctx->fusion);
-    for (const flagos_plan_step & step : plan.steps) {
-        if (step.kind == flagos_execution_kind::pattern) {
-            if (!flagos_execute_fusion_step(ctx->fusion, cgraph, step)) {
-                GGML_LOG_ERROR("FlagOS %s: fused %s failed\n", ctx->device->name.c_str(),
-                               flagos_pattern_name(step.candidate.id));
-                return GGML_STATUS_FAILED;
-            }
-            continue;
-        }
-        if (!compute_node(ctx, cgraph->nodes[step.candidate.node_indices[0]])) {
-            return GGML_STATUS_FAILED;
-        }
+    bool ok = true;
+    if (ctx->capture && run_captured(ctx, cgraph, plan, ok)) {
+        return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
     }
-    return GGML_STATUS_SUCCESS;
+    return run_plan(ctx, cgraph, plan) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 }
 
 void backend_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -481,6 +571,10 @@ rt_backend * make_backend_context(rt_device * device, flagos_rt_stream_t stream)
     ctx->fusion.validate_lowering = fusion_query;
     ctx->fusion.execute_fusion = fusion_execute;
     ctx->fusion.user_data = ctx;
+    const flagos_runtime_v1 * rt = device->rt;
+    const char * capture = std::getenv("GGML_FLAGOS_GRAPH_CAPTURE");
+    ctx->capture = capture != nullptr && capture[0] == '1' && rt->graph_capture_begin != nullptr &&
+        rt->graph_capture_end != nullptr && rt->graph_launch != nullptr && rt->graph_destroy != nullptr;
     return ctx;
 }
 

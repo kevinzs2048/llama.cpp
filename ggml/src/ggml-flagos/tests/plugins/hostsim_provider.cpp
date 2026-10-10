@@ -94,12 +94,34 @@ void * buffer_base(flagos_rt_buffer_t buffer) {
     return reinterpret_cast<hs_buffer *>(buffer)->data;
 }
 
+// A stream records launches while capturing; a graph replays them. This is
+// the host analogue of HIP/CUDA stream capture and keeps the same rule:
+// recorded work does not run until the graph is launched.
+struct hs_record {
+    hs_kernel * kernel;
+    uint32_t grid[3];
+    std::vector<flagos_rt_arg> args;   // copied by value at record time
+};
+
+struct hs_graph {
+    std::vector<hs_record> records;
+};
+
+struct hs_stream {
+    hs_graph * recording = nullptr;
+};
+
 flagos_rt_status stream_create(flagos_rt_device_t, flagos_rt_stream_t * stream) {
-    *stream = reinterpret_cast<flagos_rt_stream_t>(uintptr_t(1));
+    *stream = reinterpret_cast<flagos_rt_stream_t>(new hs_stream);
     return FLAGOS_RT_OK;
 }
 
-void stream_destroy(flagos_rt_stream_t) {}
+void stream_destroy(flagos_rt_stream_t stream) {
+    auto * s = reinterpret_cast<hs_stream *>(stream);
+    delete s->recording;
+    delete s;
+}
+
 flagos_rt_status stream_synchronize(flagos_rt_stream_t) { return FLAGOS_RT_OK; }
 
 flagos_rt_status rt_memcpy(flagos_rt_stream_t, void * dst, const void * src, size_t size, flagos_rt_copy_kind) {
@@ -143,9 +165,23 @@ flagos_rt_status kernel_get(flagos_rt_module_t module, const flagos_rt_kernel_de
     return FLAGOS_RT_OK;
 }
 
-flagos_rt_status launch(flagos_rt_stream_t, flagos_rt_kernel_t kernel, const flagos_rt_launch * launch) {
+flagos_rt_status run_kernel(hs_kernel * k, const uint32_t grid[3], const flagos_rt_arg * args, uint32_t n_args);
+
+flagos_rt_status launch(flagos_rt_stream_t stream, flagos_rt_kernel_t kernel, const flagos_rt_launch * launch) {
     auto * k = reinterpret_cast<hs_kernel *>(kernel);
     if (launch->n_args != k->n_args || launch->n_args > 32) return FLAGOS_RT_INVALID_ARGUMENT;
+    auto * s = reinterpret_cast<hs_stream *>(stream);
+    if (s != nullptr && s->recording != nullptr) {
+        s->recording->records.push_back({ k, { launch->grid[0], launch->grid[1], launch->grid[2] },
+                                          std::vector<flagos_rt_arg>(launch->args, launch->args + launch->n_args) });
+        return FLAGOS_RT_OK;
+    }
+    return run_kernel(k, launch->grid, launch->args, launch->n_args);
+}
+
+flagos_rt_status run_kernel(hs_kernel * k, const uint32_t grid[3], const flagos_rt_arg * args, uint32_t n_args) {
+    struct { uint32_t grid[3]; uint32_t n_args; const flagos_rt_arg * args; } l = { { grid[0], grid[1], grid[2] }, n_args, args };
+    const auto * launch = &l;
     // Same argument passing as hipModuleLaunchKernel: one pointer per value.
     void * values[32];
     for (uint32_t i = 0; i < launch->n_args; ++i) {
@@ -165,6 +201,33 @@ flagos_rt_status launch(flagos_rt_stream_t, flagos_rt_kernel_t kernel, const fla
 // in the package, so the package decides what is fused.
 int fusion_supported(flagos_rt_device_t, uint32_t) {
     return 1;
+}
+
+flagos_rt_status graph_capture_begin(flagos_rt_stream_t stream) {
+    auto * s = reinterpret_cast<hs_stream *>(stream);
+    if (s->recording != nullptr) return FLAGOS_RT_INVALID_ARGUMENT;
+    s->recording = new hs_graph;
+    return FLAGOS_RT_OK;
+}
+
+flagos_rt_status graph_capture_end(flagos_rt_stream_t stream, flagos_rt_graph_t * graph) {
+    auto * s = reinterpret_cast<hs_stream *>(stream);
+    if (s->recording == nullptr) return FLAGOS_RT_INVALID_ARGUMENT;
+    *graph = reinterpret_cast<flagos_rt_graph_t>(s->recording);
+    s->recording = nullptr;
+    return FLAGOS_RT_OK;
+}
+
+flagos_rt_status graph_launch(flagos_rt_stream_t, flagos_rt_graph_t graph) {
+    for (const hs_record & r : reinterpret_cast<hs_graph *>(graph)->records) {
+        const flagos_rt_status status = run_kernel(r.kernel, r.grid, r.args.data(), uint32_t(r.args.size()));
+        if (status != FLAGOS_RT_OK) return status;
+    }
+    return FLAGOS_RT_OK;
+}
+
+void graph_destroy(flagos_rt_graph_t graph) {
+    delete reinterpret_cast<hs_graph *>(graph);
 }
 
 flagos_runtime_v1 make_runtime() {
@@ -191,6 +254,10 @@ flagos_runtime_v1 make_runtime() {
     rt.kernel_get = kernel_get;
     rt.launch = launch;
     rt.fusion_supported = fusion_supported;
+    rt.graph_capture_begin = graph_capture_begin;
+    rt.graph_capture_end = graph_capture_end;
+    rt.graph_launch = graph_launch;
+    rt.graph_destroy = graph_destroy;
     return rt;
 }
 

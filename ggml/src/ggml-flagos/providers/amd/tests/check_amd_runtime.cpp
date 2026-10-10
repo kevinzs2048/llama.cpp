@@ -28,9 +28,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <map>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 const flagos_runtime_v1 * flagos_amd_runtime(const flagos_host_v1 * host);
@@ -98,7 +100,71 @@ hipError_t hipModuleGetFunction(hipFunction_t * function, hipModule_t, const cha
 }
 }
 
+// HIP graph capture: launches on a capturing stream are recorded with their
+// argument values copied (hipModuleLaunchKernel copies kernel parameters at
+// capture), and replayed by hipGraphLaunch.
+struct mock_launch {
+    hipFunction_t function;
+    unsigned gx, gy, gz, bx, by, bz, shared;
+    std::vector<std::array<unsigned char, 8>> values;
+};
+struct mock_graph {
+    std::vector<mock_launch> launches;
+};
+static mock_graph * g_capturing = nullptr;
+static int g_graph_launches = 0;
+static int g_graph_instantiations = 0;
+static hipError_t execute_launch(hipFunction_t function, unsigned gx, unsigned gy, unsigned gz,
+                                 unsigned bx, unsigned by, unsigned bz, unsigned shared,
+                                 hipStream_t stream, void ** args, void ** extra);
+extern "C" hipError_t hipStreamBeginCapture(hipStream_t, hipStreamCaptureMode) {
+    CHECK(g_capturing == nullptr);
+    g_capturing = new mock_graph;
+    return hipSuccess;
+}
+extern "C" hipError_t hipStreamEndCapture(hipStream_t, hipGraph_t * graph) {
+    CHECK(g_capturing != nullptr);
+    *graph = reinterpret_cast<hipGraph_t>(g_capturing);
+    g_capturing = nullptr;
+    return hipSuccess;
+}
+extern "C" hipError_t hipGraphInstantiate(hipGraphExec_t * exec, hipGraph_t graph, hipGraphNode_t *, char *, size_t) {
+    // The executable owns a copy, as in HIP; the graph itself is destroyed.
+    *exec = reinterpret_cast<hipGraphExec_t>(new mock_graph(*reinterpret_cast<mock_graph *>(graph)));
+    ++g_graph_instantiations;
+    return hipSuccess;
+}
+extern "C" hipError_t hipGraphDestroy(hipGraph_t graph) { delete reinterpret_cast<mock_graph *>(graph); return hipSuccess; }
+extern "C" hipError_t hipGraphExecDestroy(hipGraphExec_t exec) { delete reinterpret_cast<mock_graph *>(exec); return hipSuccess; }
+extern "C" hipError_t hipGraphLaunch(hipGraphExec_t exec, hipStream_t stream) {
+    ++g_graph_launches;
+    for (mock_launch & l : reinterpret_cast<mock_graph *>(exec)->launches) {
+        std::vector<void *> args;
+        for (auto & v : l.values) args.push_back(v.data());
+        CHECK(execute_launch(l.function, l.gx, l.gy, l.gz, l.bx, l.by, l.bz, l.shared, stream, args.data(), nullptr) == hipSuccess);
+    }
+    return hipSuccess;
+}
+
 extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function, unsigned gx, unsigned gy, unsigned gz,
+                                            unsigned bx, unsigned by, unsigned bz, unsigned shared,
+                                            hipStream_t stream, void ** args, void ** extra) {
+    if (g_capturing != nullptr) {
+        const flagos_kernel_info * info = g_package.find(g_functions.at(reinterpret_cast<uintptr_t>(function)));
+        CHECK(info != nullptr && info->argument_count >= 0);
+        mock_launch l { function, gx, gy, gz, bx, by, bz, shared, {} };
+        for (int i = 0; i < info->argument_count + 2; ++i) {
+            std::array<unsigned char, 8> v {};
+            std::memcpy(v.data(), args[i], v.size());
+            l.values.push_back(v);
+        }
+        g_capturing->launches.push_back(l);
+        return hipSuccess;
+    }
+    return execute_launch(function, gx, gy, gz, bx, by, bz, shared, stream, args, extra);
+}
+
+static hipError_t execute_launch(hipFunction_t function, unsigned gx, unsigned gy, unsigned gz,
                                             unsigned bx, unsigned by, unsigned bz, unsigned shared,
                                             hipStream_t stream, void ** args, void ** extra) {
     const std::string & name = g_functions.at(reinterpret_cast<uintptr_t>(function));
@@ -195,6 +261,7 @@ int main(int argc, char ** argv) {
     std::string error;
     CHECK(g_package.open(argv[1], error));
     CHECK(setenv("GGML_FLAGOS_KERNEL_DIR", argv[1], 1) == 0);
+    CHECK(setenv("GGML_FLAGOS_GRAPH_CAPTURE", "1", 1) == 0);
 
     const flagos_host_v1 host = { sizeof(flagos_host_v1), FLAGOS_PROVIDER_ABI_VERSION, nullptr, host_log };
     const flagos_runtime_v1 * runtime = flagos_amd_runtime(&host);
@@ -242,6 +309,9 @@ int main(int argc, char ** argv) {
         in = { ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 4), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024) };
         return ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, in[0], 1e-5f), in[1]), in[0]);
     });
+    // The norm*w+x chain went through the Common planner and the fused
+    // RMS_NORM+MUL kernel the AMD package ships.
+    CHECK(g_fused_rms_norm_mul == 1);
     // Quantized MUL_MAT: decode GEMV (1 column) and batched prefill.
     const ggml_type quant_types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0,
                                       GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
@@ -253,6 +323,64 @@ int main(int argc, char ** argv) {
                 return ggml_mul_mat(ctx, in[0], in[1]);
             }, true, 5e-4);
         }
+    }
+    // Graph capture: the same graph with the same buffers runs three times
+    // with new input values each time. Run 1 executes directly, run 2 is
+    // recorded and launched, run 3 replays; all must match the CPU.
+    {
+        ggml_backend_t cpu = ggml_backend_cpu_init();
+        ggml_init_params params = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * dctx = ggml_init(params);
+        ggml_context * cctx = ggml_init(params);
+        auto build = [](ggml_context * ctx, ggml_tensor *& x, ggml_tensor *& w, ggml_tensor *& q) {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 3);
+            w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 512);
+            q = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 512, 64);
+            ggml_tensor * h = ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), x);
+            return ggml_mul_mat(ctx, q, ggml_silu(ctx, h));
+        };
+        ggml_tensor *dx, *dw, *dq, *cx, *cw, *cq;
+        ggml_tensor * dout = build(dctx, dx, dw, dq);
+        ggml_tensor * cout = build(cctx, cx, cw, cq);
+        ggml_cgraph * dg = ggml_new_graph(dctx);
+        ggml_cgraph * cg = ggml_new_graph(cctx);
+        ggml_build_forward_expand(dg, dout);
+        ggml_build_forward_expand(cg, cout);
+        ggml_backend_buffer_t db = ggml_backend_alloc_ctx_tensors(dctx, backend);
+        ggml_backend_buffer_t cb = ggml_backend_alloc_ctx_tensors(cctx, cpu);
+        CHECK(db != nullptr && cb != nullptr);
+        for (int run = 0; run < 3; ++run) {
+            std::mt19937 rng(100 + run);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            std::vector<float> xv(512 * 3), wv(512), qv(512 * 64);
+            for (float & v : xv) v = dist(rng);
+            for (float & v : wv) v = dist(rng);
+            for (float & v : qv) v = dist(rng);
+            std::vector<uint8_t> qb(ggml_nbytes(dq));
+            ggml_quantize_chunk(GGML_TYPE_Q4_K, qv.data(), qb.data(), 0, 64, 512, nullptr);
+            for (auto [d, c, data, bytes] : { std::tuple{ dx, cx, (const void *) xv.data(), ggml_nbytes(dx) },
+                                              std::tuple{ dw, cw, (const void *) wv.data(), ggml_nbytes(dw) },
+                                              std::tuple{ dq, cq, (const void *) qb.data(), qb.size() } }) {
+                ggml_backend_tensor_set(d, data, 0, bytes);
+                ggml_backend_tensor_set(c, data, 0, bytes);
+            }
+            CHECK(ggml_backend_graph_compute(backend, dg) == GGML_STATUS_SUCCESS);
+            CHECK(ggml_backend_graph_compute(cpu, cg) == GGML_STATUS_SUCCESS);
+            std::vector<float> a(ggml_nelements(dout)), b(ggml_nelements(cout));
+            ggml_backend_tensor_get(dout, a.data(), 0, ggml_nbytes(dout));
+            ggml_backend_tensor_get(cout, b.data(), 0, ggml_nbytes(cout));
+            double num = 0, den = 0;
+            for (size_t i = 0; i < a.size(); ++i) { num += (a[i] - b[i]) * double(a[i] - b[i]); den += double(b[i]) * b[i]; }
+            std::printf("  %-28s nmse %.3g\n", ("captured graph run " + std::to_string(run + 1)).c_str(), num / den);
+            CHECK(num / den < 5e-4);
+        }
+        CHECK(g_graph_instantiations == 1);
+        CHECK(g_graph_launches == 2);
+        ggml_backend_buffer_free(db);
+        ggml_backend_buffer_free(cb);
+        ggml_free(dctx);
+        ggml_free(cctx);
+        ggml_backend_free(cpu);
     }
     // Contract boundaries the package cannot satisfy fall back to the CPU.
     const flagos_kernel_info * norm = g_package.find("flagos_rms_norm_f32");
@@ -269,9 +397,6 @@ int main(int argc, char ** argv) {
 
     ggml_backend_free(backend);
     CHECK(g_launches > 0 && g_modules > 0);
-    // The norm*w+x chain goes through the Common planner and the fused
-    // RMS_NORM+MUL kernel the AMD package ships.
-    CHECK(g_fused_rms_norm_mul == 1);
     CHECK(g_allocations == g_frees);
     std::printf("amd-rt checks passed: %d launches, %d modules loaded\n", g_launches, g_modules);
     return 0;
