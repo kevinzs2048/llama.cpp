@@ -334,6 +334,39 @@ inline bool run(const std::string & name, const program & p) {
         }
         return true;
     }
+    if (name == "flagos_rope_ggml_recurrence_f32" || name == "flagos_rope_ggml_neox_recurrence_f32") {
+        // (x, pos, factors, out, ne0, ne1, ne2, n_dims, mode, has_factors, sx1, sx2, sx3, s0..s3,
+        //  theta_scale, freq_scale, attn_factor); one program per row, BLOCK pairs
+        const bool neox_kernel = name == "flagos_rope_ggml_neox_recurrence_f32";
+        const int32_t ne0 = I(4), ne1 = I(5), ne2 = I(6), n_dims = I(7), mode = I(8), has_factors = I(9);
+        const int32_t st = I(13), sh = I(14), sw = I(15), se = I(16);
+        const float theta_scale = arg<float>(p, 17), freq_scale = arg<float>(p, 18), attn_factor = arg<float>(p, 19);
+        const float * x = F(0);
+        const auto * positions = arg<const int32_t *>(p, 1);
+        const float * factors = F(2);
+        float * out = F(3);
+        const int64_t row = p.pid_x, head = row % ne1, token = (row / ne1) % ne2, batch = row / (int64_t(ne1) * ne2);
+        const int64_t src = head * I(10) + token * I(11) + batch * I(12);
+        for (int32_t pr = 0; pr < int32_t(p.block) && pr < ne0 / 2; ++pr) {
+            const bool rotated = pr < n_dims / 2;
+            int32_t first = 2 * pr, second = 2 * pr + 1, axis = 0;
+            if (rotated && (neox_kernel || mode == 40)) { first = pr; second = pr + n_dims / 2; }
+            if (!neox_kernel && mode == 40) {
+                const int32_t sect = pr % (st + sh + sw + se);
+                axis = (sect % 3 == 1 && sect < 3 * sh) ? 1 : (sect % 3 == 2 && sect < 3 * sw) ? 2
+                     : (sect % 3 == 0 && sect < 3 * st) ? 0 : 3;
+            }
+            float theta = float(positions[token + int64_t(axis) * ne2]);
+            for (int32_t i = 1; i < n_dims / 2; ++i) if (pr >= i) theta *= theta_scale;
+            if (has_factors) theta = theta / (rotated ? factors[pr] : 1.0f);
+            theta *= freq_scale;
+            const float cs = std::cos(theta) * attn_factor, sn = std::sin(theta) * attn_factor;
+            const float a = x[src + first], bv = x[src + second];
+            out[row * ne0 + first] = rotated ? a * cs - bv * sn : a;
+            out[row * ne0 + second] = rotated ? a * sn + bv * cs : bv;
+        }
+        return true;
+    }
     if (name == "flagos_rms_norm_mul_f32") {   // (norm_out, mul_out, x, weight, n_cols, eps); one program per row
         const int32_t n = I(4);
         const float * x = F(2) + int64_t(p.pid_x) * n;

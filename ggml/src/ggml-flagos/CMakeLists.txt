@@ -243,7 +243,8 @@ list(APPEND _flagos_hostsim_kernels
     "flagos_add_rms_norm_mul_residual_f32 4096 7"
     "flagos_softplus_f32 64 3" "flagos_swiglu_split_f32 64 4" "flagos_concat_f32 64 21"
     "flagos_l2_norm_strided_f32 512 9" "flagos_rms_norm_ggml_strided_f32 256 9" "flagos_ssm_conv_f32 64 12"
-    "flagos_gated_delta_net_scalar_f32 128 24 4")
+    "flagos_gated_delta_net_scalar_f32 128 24 4"
+    "flagos_rope_ggml_recurrence_f32 128 20" "flagos_rope_ggml_neox_recurrence_f32 128 20")
 foreach(_q q4_0 q4_1 q8_0 q4_k q5_k q6_k)
     list(APPEND _flagos_hostsim_kernels "flagos_mul_mat_${_q}_f32 1 6" "flagos_mul_mat_${_q}_f32_batched 4 7")
 endforeach()

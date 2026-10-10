@@ -713,6 +713,76 @@ bool plan_gated_delta_net(const flagos_kernel_package & package, const ggml_tens
     }
     return true;
 }
+
+// ROPE with the CPU's ordered-multiply theta recurrence, for NORMAL, NEOX
+// and IMROPE (Qwen3.5/3.6 text). One program per row, BLOCK pairs:
+// flagos_rope_ggml_recurrence_f32 / flagos_rope_ggml_neox_recurrence_f32
+// (x, positions, factors|x, out, ne0, ne1, ne2, n_dims, mode, has_factors,
+//  sx1, sx2, sx3, sections[4], theta_scale, freq_scale, attn_factor).
+// YaRN (ext_factor != 0), MROPE and VISION are not covered.
+bool plan_rope(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * x = op->src[0];
+    const ggml_tensor * pos = op->src[1];
+    const ggml_tensor * factors = op->src[2];
+    int32_t p[15];
+    std::memcpy(p, op->op_params, sizeof(p));
+    float freq_base, freq_scale, ext_factor, attn_factor;
+    std::memcpy(&freq_base, &p[5], sizeof(float));
+    std::memcpy(&freq_scale, &p[6], sizeof(float));
+    std::memcpy(&ext_factor, &p[7], sizeof(float));
+    std::memcpy(&attn_factor, &p[8], sizeof(float));
+    const int32_t n_dims = p[1];
+    const int32_t mode = p[2];
+    const bool neox = mode == GGML_ROPE_TYPE_NEOX;
+    const bool imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    if (x == nullptr || pos == nullptr || (mode != 0 && !neox && !imrope) || op->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || pos->type != GGML_TYPE_I32 || !ggml_are_same_shape(op, x) ||
+        !ggml_is_contiguous(op) || x->nb[0] != sizeof(float) || !ggml_is_contiguous(pos) ||
+        pos->ne[1] != 1 || pos->ne[2] != 1 || pos->ne[3] != 1 || pos->ne[0] != op->ne[2] * (imrope ? 4 : 1) ||
+        op->ne[0] <= 0 || op->ne[0] % 2 != 0 || n_dims <= 0 || n_dims % 2 != 0 || n_dims > op->ne[0] ||
+        !element_offsets_fit_i32(x, sizeof(float)) || !fits_i32(ggml_nelements(op)) ||
+        !std::isfinite(freq_base) || freq_base <= 0.0f || !std::isfinite(freq_scale) || freq_scale <= 0.0f ||
+        ext_factor != 0.0f || !std::isfinite(attn_factor) ||
+        !std::isnormal(std::pow(freq_base, -2.0f / n_dims))) {
+        return false;
+    }
+    if (imrope) {
+        int64_t sum = 0;
+        for (int i = 11; i < 15; ++i) {
+            if (p[i] < 0) return false;
+            sum += p[i];
+        }
+        if (sum != n_dims / 2 || (p[11] == 0 && p[12] == 0 && p[13] == 0)) {
+            return false;
+        }
+    }
+    if (factors != nullptr && (factors->type != GGML_TYPE_F32 || !ggml_is_contiguous(factors) ||
+                               factors->ne[0] < (neox ? n_dims : op->ne[0]) / 2 || factors->ne[1] != 1 ||
+                               factors->ne[2] != 1 || factors->ne[3] != 1)) {
+        return false;
+    }
+    // Writing the output may not clobber positions or factors; in place over
+    // x is fine when x is contiguous (each program reads its row first).
+    if (partially_overlaps(op, x) || (op->data != nullptr && op->data == x->data && !ggml_is_contiguous(x)) ||
+        partially_overlaps(op, pos) || (op->data != nullptr && op->data == pos->data) ||
+        (factors != nullptr && (partially_overlaps(op, factors) || (op->data != nullptr && op->data == factors->data)))) {
+        return false;
+    }
+    const int64_t rows = ggml_nrows(op);
+    const char * name = neox ? "flagos_rope_ggml_neox_recurrence_f32" : "flagos_rope_ggml_recurrence_f32";
+    const flagos_kernel_info * kernel = find_kernel(package, name, 20, rows);
+    if (kernel == nullptr || kernel->block_size * 2 < op->ne[0]) {
+        return false;
+    }
+    if (call != nullptr) {
+        const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
+        set_call(call, kernel, rows, { ptr(x), ptr(pos), ptr(factors != nullptr ? factors : x), ptr(op),
+                 i32(op->ne[0]), i32(op->ne[1]), i32(op->ne[2]), i32(n_dims), i32(mode), i32(factors != nullptr),
+                 i32(x->nb[1] / sizeof(float)), i32(x->nb[2] / sizeof(float)), i32(x->nb[3] / sizeof(float)),
+                 i32(p[11]), i32(p[12]), i32(p[13]), i32(p[14]), f32(theta_scale), f32(freq_scale), f32(attn_factor) });
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -737,6 +807,8 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
             return plan_ssm_conv(package, op, call);
         case GGML_OP_GATED_DELTA_NET:
             return plan_gated_delta_net(package, op, call);
+        case GGML_OP_ROPE:
+            return plan_rope(package, op, call);
         case GGML_OP_UNARY:
             return plan_unary(package, op, call);
         case GGML_OP_MUL_MAT:
