@@ -72,6 +72,12 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t f,
         int    rows = *static_cast<int *>(args[4]), cols = *static_cast<int *>(args[5]);
         std::fill(out, out + rows * cols, 42.f);
         ++matmul_writes;
+    } else if (name == "flagos_add_f32" || name == "flagos_mul_f32") {
+        auto * out = *static_cast<float **>(args[2]);
+        std::fill(out, out + *static_cast<int *>(args[3]), 1.f);
+    } else if (name == "flagos_rms_norm_f32") {
+        auto * out = *static_cast<float **>(args[1]);
+        std::fill(out, out + *static_cast<int *>(args[2]), 1.f);
     } else {
         std::abort();
     }
@@ -152,6 +158,31 @@ int main(int argc, char ** argv) {
     prior = launches;
     check(amd_backend_graph_compute(&backend, &graph) == GGML_STATUS_SUCCESS, "valid policy change");
     check(launches - prior == 2, "valid policy retains computation");
+    auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    auto * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    auto * add = ggml_add(ctx, input, weight);
+    auto * norm = ggml_rms_norm(ctx, add, 1e-6f);
+    auto * mul = ggml_mul(ctx, norm, weight);
+    std::vector<float> input_data(128, 1.f), weight_data(128, 1.f), rotated_weight(128, 2.f);
+    std::vector<float> add_data(128), norm_data(128), mul_data(128);
+    input->data = input_data.data();
+    add->data = add_data.data();
+    norm->data = norm_data.data();
+    mul->data = mul_data.data();
+    auto * disabled_graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(disabled_graph, mul);
+    for (int mode = 0; mode < 2; ++mode) {
+        setenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS", mode == 0 ? "0" : "1", 1);
+        setenv("FLAGOS_AMD_FUSIONS", mode == 0 ? "all" : "none", 1);
+        weight->data = weight_data.data();
+        const uint64_t misses = context.graph_plans.misses();
+        prior = launches;
+        check(amd_backend_graph_compute(&backend, disabled_graph) == GGML_STATUS_SUCCESS, "disabled fusion first graph");
+        weight->data = rotated_weight.data();
+        check(amd_backend_graph_compute(&backend, disabled_graph) == GGML_STATUS_SUCCESS, "disabled fusion rotated binding");
+        check(launches - prior == 6, "disabled fusion retains direct node launches");
+        check(context.graph_plans.misses() == misses + 1, "disabled fusion reuses direct plan across bindings");
+    }
     context.graph_plans.clear();
     cold.graph_plans.clear();
     device.aot.reset();

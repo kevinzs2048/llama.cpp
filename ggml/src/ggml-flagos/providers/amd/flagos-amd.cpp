@@ -4978,9 +4978,14 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
     if (!amd_prepare_splitkv_workspace(backend_context, cgraph)) {
         return GGML_STATUS_FAILED;
     }
+    const char * selected_fusions = std::getenv("FLAGOS_AMD_FUSIONS");
+    const flagos_query_lowering_fn query_lowering =
+        amd_experimental_fusions_enabled(backend_context->device) &&
+        (selected_fusions == nullptr || std::strcmp(selected_fusions, "none") != 0)
+        ? amd_query_fusion : nullptr;
     const flagos_fusion_interface fusion_interface {
-        /* .query_lowering = */ amd_query_fusion,
-        /* .validate_lowering = */ amd_query_fusion,
+        /* .query_lowering = */ query_lowering,
+        /* .validate_lowering = */ query_lowering,
         /* .execute_fusion = */ amd_execute_fusion,
         /* .user_data      = */ backend_context,
         /* .configuration_id = */ amd_fusion_config_key(backend_context),
