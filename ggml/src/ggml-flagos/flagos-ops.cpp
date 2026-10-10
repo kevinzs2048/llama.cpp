@@ -176,6 +176,7 @@ bool plan_unary(const flagos_kernel_package & package, const ggml_tensor * op, f
         case GGML_UNARY_OP_SILU:    name = "flagos_silu_f32"; break;
         case GGML_UNARY_OP_SIGMOID: name = "flagos_sigmoid_f32"; break;
         case GGML_UNARY_OP_TANH:    name = "flagos_tanh_f32"; break;
+        case GGML_UNARY_OP_SOFTPLUS: name = "flagos_softplus_f32"; break;
         default: return false;
     }
     const ggml_tensor * src = op->src[0];
@@ -497,6 +498,146 @@ bool plan_add_rms_norm_mul(const flagos_kernel_package & package, const ggml_cgr
     set_call(call, kernel, rows, { ptr(add), ptr(mul), ptr(a), ptr(b), ptr(weight), i32(norm->ne[0]), f32(eps) });
     return true;
 }
+
+// GLU SWIGLU, split form (gate and up are separate tensors):
+// flagos_swiglu_split_f32(gate, up, out, n) computes g * sigmoid(g) * up.
+bool plan_glu(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * gate = op->src[0];
+    const ggml_tensor * up = op->src[1];
+    if (ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU || gate == nullptr || up == nullptr ||
+        !is_contiguous_f32(op) || !is_contiguous_f32(gate) || !is_contiguous_f32(up) ||
+        !ggml_are_same_shape(op, gate) || !ggml_are_same_shape(op, up) || !fits_i32(ggml_nelements(op)) ||
+        partially_overlaps(op, gate) || partially_overlaps(op, up)) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(op);
+    const flagos_kernel_info * kernel = find_elementwise(package, "flagos_swiglu_split_f32", 4, n);
+    if (kernel == nullptr) {
+        return false;
+    }
+    set_call(call, kernel, programs_for(kernel, n), { ptr(gate), ptr(up), ptr(op), i32(n) });
+    return true;
+}
+
+// CONCAT of two F32 tensors along op_params[0]; inputs may be strided, the
+// output is dense. 21 arguments: pointers, dim, output and first-input
+// extents, input strides, element count.
+bool plan_concat(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    int32_t dim = 0;
+    std::memcpy(&dim, op->op_params, sizeof(dim));
+    if (a == nullptr || b == nullptr || !is_contiguous_f32(op) || a->type != GGML_TYPE_F32 ||
+        b->type != GGML_TYPE_F32 || dim < 0 || dim > 3 || !fits_i32(ggml_nelements(op)) ||
+        !element_offsets_fit_i32(a, sizeof(float)) || !element_offsets_fit_i32(b, sizeof(float)) ||
+        partially_overlaps(op, a) || partially_overlaps(op, b) ||
+        (op->data != nullptr && (op->data == a->data || op->data == b->data))) {
+        return false;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (op->ne[d] != (d == dim ? a->ne[d] + b->ne[d] : a->ne[d]) || (d != dim && a->ne[d] != b->ne[d])) {
+            return false;
+        }
+    }
+    const int64_t n = ggml_nelements(op);
+    const flagos_kernel_info * kernel = find_elementwise(package, "flagos_concat_f32", 21, n);
+    if (kernel == nullptr) {
+        return false;
+    }
+    static_assert(3 + 1 + 4 * GGML_MAX_DIMS + 1 <= FLAGOS_MAX_KERNEL_ARGS, "concat arguments exceed the call capacity");
+    if (call != nullptr) {
+        set_call(call, kernel, programs_for(kernel, n), { ptr(a), ptr(b), ptr(op), i32(dim) });
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(op->ne[d]);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(a->ne[d]);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(a->nb[d] / sizeof(float));
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) call->args[call->n_args++] = i32(b->nb[d] / sizeof(float));
+        call->args[call->n_args++] = i32(n);
+    }
+    return true;
+}
+
+// L2_NORM over rows of a possibly strided F32 input into a dense output:
+// flagos_l2_norm_strided_f32(x, out, n_cols, s1, s2, s3, eps, ne1, ne2), grid (ne1, ne2, ne3).
+bool plan_l2_norm(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * src = op->src[0];
+    float eps = 0.0f;
+    std::memcpy(&eps, op->op_params, sizeof(eps));
+    if (src == nullptr || !is_contiguous_f32(op) || src->type != GGML_TYPE_F32 || !ggml_are_same_shape(op, src) ||
+        src->nb[0] != sizeof(float) || !element_offsets_fit_i32(src, sizeof(float)) ||
+        !fits_i32(ggml_nelements(op)) || op->ne[1] > INT32_MAX || op->ne[2] > 65535 || op->ne[3] > 65535 ||
+        !std::isfinite(eps) || eps < 0.0f || partially_overlaps(op, src) ||
+        (op->data != nullptr && op->data == src->data)) {
+        return false;
+    }
+    const flagos_kernel_info * kernel = find_kernel(package, "flagos_l2_norm_strided_f32", 9, op->ne[1]);
+    if (kernel == nullptr || kernel->block_size < op->ne[0]) {
+        return false;
+    }
+    set_call(call, kernel, op->ne[1], { ptr(src), ptr(op), i32(op->ne[0]), i32(src->nb[1] / sizeof(float)),
+             i32(src->nb[2] / sizeof(float)), i32(src->nb[3] / sizeof(float)), f32(eps), i32(op->ne[1]), i32(op->ne[2]) });
+    if (call != nullptr) {
+        call->grid[1] = static_cast<uint32_t>(op->ne[2]);
+        call->grid[2] = static_cast<uint32_t>(op->ne[3]);
+    }
+    return true;
+}
+
+// RMS_NORM of a non-contiguous F32 input (for example per-head norms on a
+// view) into a dense output: flagos_rms_norm_ggml_strided_f32(out, x, n_cols,
+// ne1, ne2, s1, s2, s3, eps), one program per row. eps must be > 0.
+bool plan_rms_norm_strided(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * src = op->src[0];
+    float eps = 0.0f;
+    std::memcpy(&eps, op->op_params, sizeof(eps));
+    if (src == nullptr || ggml_is_contiguous(src) || !is_contiguous_f32(op) || src->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(op, src) || src->nb[0] != sizeof(float) || !element_offsets_fit_i32(src, sizeof(float)) ||
+        !fits_i32(ggml_nelements(op)) || !std::isfinite(eps) || eps <= 0.0f || partially_overlaps(op, src) ||
+        (op->data != nullptr && op->data == src->data)) {
+        return false;
+    }
+    const int64_t rows = ggml_nelements(op) / op->ne[0];
+    const flagos_kernel_info * kernel = find_kernel(package, "flagos_rms_norm_ggml_strided_f32", 9, rows);
+    if (kernel == nullptr || kernel->block_size < op->ne[0]) {
+        return false;
+    }
+    set_call(call, kernel, rows, { ptr(op), ptr(src), i32(op->ne[0]), i32(op->ne[1]), i32(op->ne[2]),
+             i32(src->nb[1] / sizeof(float)), i32(src->nb[2] / sizeof(float)), i32(src->nb[3] / sizeof(float)), f32(eps) });
+    return true;
+}
+
+// SSM_CONV (Mamba / Gated DeltaNet short convolution):
+// flagos_ssm_conv_f32(s, c, out, d_conv, d_inner, n_tokens, n_seqs, ss1, ss2, sc1, so0, so1),
+// grid (n_tokens, n_seqs, ceil(d_inner / BLOCK)).
+bool plan_ssm_conv(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * s = op->src[0];
+    const ggml_tensor * c = op->src[1];
+    if (s == nullptr || c == nullptr || op->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 ||
+        c->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || s->nb[0] != sizeof(float) || c->nb[0] != sizeof(float) ||
+        !element_offsets_fit_i32(s, sizeof(float)) || !element_offsets_fit_i32(c, sizeof(float)) ||
+        c->ne[2] != 1 || c->ne[3] != 1 || s->ne[0] != c->ne[0] - 1 + op->ne[1] || s->ne[1] != c->ne[1] ||
+        s->ne[2] != op->ne[2] || s->ne[3] != 1 || op->ne[0] != c->ne[1] || op->ne[3] != 1 ||
+        !fits_i32(ggml_nelements(op)) || op->ne[1] > INT32_MAX || op->ne[2] > 65535 ||
+        partially_overlaps(op, s) || partially_overlaps(op, c) ||
+        (op->data != nullptr && (op->data == s->data || op->data == c->data))) {
+        return false;
+    }
+    const flagos_kernel_info * kernel = find_kernel(package, "flagos_ssm_conv_f32", 12, op->ne[1]);
+    if (kernel == nullptr || kernel->block_size <= 0) {
+        return false;
+    }
+    const int64_t channel_programs = (op->ne[0] + kernel->block_size - 1) / kernel->block_size;
+    if (channel_programs > 65535) {
+        return false;
+    }
+    set_call(call, kernel, op->ne[1], { ptr(s), ptr(c), ptr(op), i32(c->ne[0]), i32(op->ne[0]), i32(op->ne[1]),
+             i32(op->ne[2]), i32(s->nb[1] / sizeof(float)), i32(s->nb[2] / sizeof(float)), i32(c->nb[1] / sizeof(float)),
+             i32(op->nb[1] / sizeof(float)), i32(op->nb[2] / sizeof(float)) });
+    if (call != nullptr) {
+        call->grid[1] = static_cast<uint32_t>(op->ne[2]);
+        call->grid[2] = static_cast<uint32_t>(channel_programs);
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -510,7 +651,15 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
         case GGML_OP_SCALE:
             return plan_scale(package, op, call);
         case GGML_OP_RMS_NORM:
-            return plan_rms_norm(package, op, call);
+            return plan_rms_norm(package, op, call) || plan_rms_norm_strided(package, op, call);
+        case GGML_OP_GLU:
+            return plan_glu(package, op, call);
+        case GGML_OP_CONCAT:
+            return plan_concat(package, op, call);
+        case GGML_OP_L2_NORM:
+            return plan_l2_norm(package, op, call);
+        case GGML_OP_SSM_CONV:
+            return plan_ssm_conv(package, op, call);
         case GGML_OP_UNARY:
             return plan_unary(package, op, call);
         case GGML_OP_MUL_MAT:

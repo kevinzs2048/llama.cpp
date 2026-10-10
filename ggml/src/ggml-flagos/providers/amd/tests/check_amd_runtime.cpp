@@ -171,16 +171,18 @@ static hipError_t execute_launch(hipFunction_t function, unsigned gx, unsigned g
     const flagos_kernel_info * info = g_package.find(name);
     CHECK(info != nullptr);
     CHECK(stream == reinterpret_cast<hipStream_t>(uintptr_t(0x51)));
-    CHECK(extra == nullptr && gz == 1 && by == 1 && bz == 1);
+    CHECK(extra == nullptr && by == 1 && bz == 1);
     CHECK(bx == uint32_t(info->num_warps * info->warp_size));
     CHECK(shared == uint32_t(info->shared_memory));
     // Triton scratch slots follow the declared arguments and are null.
     CHECK(info->argument_count > 0);
     CHECK(*static_cast<void **>(args[info->argument_count]) == nullptr);
     CHECK(*static_cast<void **>(args[info->argument_count + 1]) == nullptr);
-    for (uint32_t y = 0; y < gy; ++y) {
-        for (uint32_t x = 0; x < gx; ++x) {
-            CHECK(flagos_ref::run(name, { x, y, uint32_t(info->block_size), args }));
+    for (uint32_t z = 0; z < gz; ++z) {
+        for (uint32_t y = 0; y < gy; ++y) {
+            for (uint32_t x = 0; x < gx; ++x) {
+                CHECK(flagos_ref::run(name, { x, y, z, uint32_t(info->block_size), args }));
+            }
         }
     }
     ++g_launches;

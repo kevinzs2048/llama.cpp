@@ -18,6 +18,7 @@ namespace flagos_ref {
 struct program {
     uint32_t pid_x;
     uint32_t pid_y;
+    uint32_t pid_z;
     uint32_t block;           // Triton BLOCK of the kernel
     void * const * args;      // pointers to argument values, as in hipModuleLaunchKernel
 };
@@ -243,6 +244,58 @@ inline bool run(const std::string & name, const program & p) {
         for (int32_t i = 0; i < n; ++i) sum += double(x[i]) * x[i];
         const float s = 1.0f / std::sqrt(float(sum / n) + S(3));
         for (int32_t i = 0; i < n; ++i) y[i] = x[i] * s;
+        return true;
+    }
+    if (name == "flagos_softplus_f32") { range(p, I(2), b, e); for (int64_t i = b; i < e; ++i) { const float v = F(0)[i]; F(1)[i] = v > 20.0f ? v : std::log(1.0f + std::exp(v)); } return true; }
+    if (name == "flagos_swiglu_split_f32") { range(p, I(3), b, e); for (int64_t i = b; i < e; ++i) { const float g = F(0)[i]; F(2)[i] = g / (1.0f + std::exp(-g)) * F(1)[i]; } return true; }
+    if (name == "flagos_concat_f32") {   // (a, b, out, dim, ye[4], ae[4], as[4], bs[4], n)
+        range(p, I(20), b, e);
+        const int dim = I(3);
+        for (int64_t o = b; o < e; ++o) {
+            int64_t y[4], r = o;
+            for (int d = 0; d < 4; ++d) { y[d] = r % I(4 + d); r /= I(4 + d); }
+            const int64_t aext = I(8 + dim);
+            if (y[dim] < aext) {
+                F(2)[o] = F(0)[y[0] * I(12) + y[1] * I(13) + y[2] * I(14) + y[3] * I(15)];
+            } else {
+                y[dim] -= aext;
+                F(2)[o] = F(1)[y[0] * I(16) + y[1] * I(17) + y[2] * I(18) + y[3] * I(19)];
+            }
+        }
+        return true;
+    }
+    if (name == "flagos_l2_norm_strided_f32") {   // (x, out, n_cols, s1, s2, s3, eps, ne1, ne2); grid (ne1, ne2, ne3)
+        const int64_t row = p.pid_x, ch = p.pid_y, smp = p.pid_z;
+        const int32_t n = I(2);
+        const float * x = F(0) + row * I(3) + ch * I(4) + smp * I(5);
+        float sum = 0.0f;
+        for (int32_t c = 0; c < n; ++c) sum += x[c] * x[c];
+        const float scale = 1.0f / std::max(std::sqrt(sum), S(6));
+        float * out = F(1) + ((smp * I(8) + ch) * I(7) + row) * n;
+        for (int32_t c = 0; c < n; ++c) out[c] = x[c] * scale;
+        return true;
+    }
+    if (name == "flagos_rms_norm_ggml_strided_f32") {   // (out, x, n_cols, ne1, ne2, s1, s2, s3, eps)
+        const int32_t n = I(2), ne1 = I(3), ne2 = I(4);
+        const int64_t row = p.pid_x;
+        const int64_t i1 = row % ne1, i2 = (row / ne1) % ne2, i3 = row / (int64_t(ne1) * ne2);
+        const float * x = F(1) + i1 * I(5) + i2 * I(6) + i3 * I(7);
+        double sum = 0.0;
+        for (int32_t c = 0; c < n; ++c) { const float sq = x[c] * x[c]; sum += sq; }
+        const float mean = float(sum / n);
+        const float scale = 1.0f / std::sqrt(mean + S(8));
+        for (int32_t c = 0; c < n; ++c) F(0)[row * n + c] = x[c] * scale;
+        return true;
+    }
+    if (name == "flagos_ssm_conv_f32") {   // (s, c, out, d_conv, d_inner, n_tokens, n_seqs, ss1, ss2, sc1, so0, so1)
+        const int64_t t = p.pid_x, seq = p.pid_y;
+        const int32_t d_conv = I(3), d_inner = I(4);
+        const int64_t c0 = int64_t(p.pid_z) * p.block, c1 = std::min<int64_t>(c0 + p.block, d_inner);
+        for (int64_t ch = c0; ch < c1; ++ch) {
+            float acc = 0.0f;
+            for (int32_t tap = 0; tap < d_conv; ++tap) acc += F(0)[seq * I(8) + ch * I(7) + t + tap] * F(1)[ch * I(9) + tap];
+            F(2)[seq * I(11) + t * I(10) + ch] = acc;
+        }
         return true;
     }
     if (name == "flagos_rms_norm_mul_f32") {   // (norm_out, mul_out, x, weight, n_cols, eps); one program per row

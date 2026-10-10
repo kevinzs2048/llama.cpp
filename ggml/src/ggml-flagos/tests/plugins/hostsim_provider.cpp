@@ -190,7 +190,7 @@ flagos_rt_status run_kernel(hs_kernel * k, const uint32_t grid[3], const flagos_
     for (uint32_t z = 0; z < launch->grid[2]; ++z) {
         for (uint32_t y = 0; y < launch->grid[1]; ++y) {
             for (uint32_t x = 0; x < launch->grid[0]; ++x) {
-                if (!flagos_ref::run(k->name, { x, y, k->block, values })) return FLAGOS_RT_NOT_FOUND;
+                if (!flagos_ref::run(k->name, { x, y, z, k->block, values })) return FLAGOS_RT_NOT_FOUND;
             }
         }
     }
