@@ -178,6 +178,7 @@ target_include_directories(flagos-check-target PRIVATE
 add_executable(flagos-check-registry EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
+    flagos-graph-plan.cpp
     ${FLAGOS_CORE_SOURCES}
     tests/check_registry.cpp)
 target_include_directories(flagos-check-registry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
@@ -215,6 +216,7 @@ file(WRITE "${FLAGOS_TEST_PLUGIN_DIR}/not-a-provider.so" "")
 add_executable(flagos-check-loader EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
+    flagos-graph-plan.cpp
     ${FLAGOS_CORE_SOURCES}
     tests/check_loader.cpp)
 target_include_directories(flagos-check-loader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
@@ -227,7 +229,7 @@ add_dependencies(flagos-check-loader flagos-test-plugin-runtime flagos-test-plug
 #   GGML_FLAGOS_PROVIDER_PATH=<build>/flagos-hostsim test-backend-ops -b FlagOS-hostsim0
 set(FLAGOS_HOSTSIM_DIR "${CMAKE_BINARY_DIR}/flagos-hostsim")
 add_library(flagos-provider-hostsim MODULE EXCLUDE_FROM_ALL tests/plugins/hostsim_provider.cpp)
-target_include_directories(flagos-provider-hostsim PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(flagos-provider-hostsim PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins")
 set_target_properties(flagos-provider-hostsim PROPERTIES
     PREFIX "lib" OUTPUT_NAME "flagos-provider-hostsim"
     LIBRARY_OUTPUT_DIRECTORY "${FLAGOS_HOSTSIM_DIR}"
@@ -235,6 +237,9 @@ set_target_properties(flagos-provider-hostsim PROPERTIES
 set(_flagos_hostsim_kernels
     "flagos_add_f32 64 4" "flagos_add_repeat_f32 64 5" "flagos_mul_f32 64 5" "flagos_scale_f32 64 5"
     "flagos_rms_norm_f32 4096 4" "flagos_silu_f32 64 3" "flagos_sigmoid_f32 64 3" "flagos_tanh_f32 64 3")
+foreach(_q q4_0 q4_1 q8_0 q4_k q5_k q6_k)
+    list(APPEND _flagos_hostsim_kernels "flagos_mul_mat_${_q}_f32 1 6" "flagos_mul_mat_${_q}_f32_batched 4 7")
+endforeach()
 set(_flagos_hostsim_module "hostsim-module v1\n")
 foreach(_k IN LISTS _flagos_hostsim_kernels)
     string(REPLACE " " ";" _k "${_k}")
@@ -262,6 +267,7 @@ file(WRITE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/manifest.json"
 add_executable(flagos-check-spacemit-adapter EXCLUDE_FROM_ALL
     flagos-provider.cpp
     flagos-target.cpp
+    flagos-graph-plan.cpp
     ${FLAGOS_CORE_SOURCES}
     providers/spacemit/flagos-spacemit.cpp
     tests/check_spacemit_adapter.cpp)
@@ -299,11 +305,13 @@ if (GGML_FLAGOS_AMD)
     add_executable(flagos-check-amd-runtime EXCLUDE_FROM_ALL
         providers/amd/flagos-amd-runtime.cpp
         providers/amd/tests/check_amd_runtime.cpp
+        flagos-graph-plan.cpp
         flagos-ops.cpp
         flagos-package.cpp
         flagos-rt-device.cpp)
     target_include_directories(flagos-check-amd-runtime PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins")
     target_link_libraries(flagos-check-amd-runtime PRIVATE ggml-base ggml-cpu hip::host)
 
     # Opt-in plugin for the migration period. It is built into a separate

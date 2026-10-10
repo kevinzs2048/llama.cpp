@@ -10,6 +10,7 @@
 // The plugin does not link GGML.
 
 #include "flagos-runtime.h"
+#include "reference_kernels.h"
 
 #include <cmath>
 #include <cstdint>
@@ -22,80 +23,12 @@
 
 namespace {
 
-struct program_args {
-    uint32_t pid;
-    uint32_t block;
-    const flagos_rt_arg * args;
-};
-
-using kernel_fn = void (*)(const program_args &);
-
-template <typename T> T * p(const program_args & a, int i) { return static_cast<T *>(a.args[i].value.ptr); }
-int32_t i32(const program_args & a, int i) { return a.args[i].value.i32; }
-float f32(const program_args & a, int i) { return a.args[i].value.f32; }
-
-// Element range of program `pid` for a flat kernel over n elements.
-void range(const program_args & a, int32_t n, int64_t & begin, int64_t & end) {
-    begin = static_cast<int64_t>(a.pid) * a.block;
-    end = std::min<int64_t>(begin + a.block, n);
-}
-
-void add_f32(const program_args & a) {          // (x, y, out, n)
-    int64_t b, e; range(a, i32(a, 3), b, e);
-    for (int64_t i = b; i < e; ++i) p<float>(a, 2)[i] = p<float>(a, 0)[i] + p<float>(a, 1)[i];
-}
-void add_repeat_f32(const program_args & a) {   // (x, y, out, n, y_elements)
-    int64_t b, e; range(a, i32(a, 3), b, e);
-    const int32_t ny = i32(a, 4);
-    for (int64_t i = b; i < e; ++i) p<float>(a, 2)[i] = p<float>(a, 0)[i] + p<float>(a, 1)[i % ny];
-}
-void mul_f32(const program_args & a) {          // (x, y, out, n, y_elements)
-    int64_t b, e; range(a, i32(a, 3), b, e);
-    const int32_t ny = i32(a, 4);
-    for (int64_t i = b; i < e; ++i) p<float>(a, 2)[i] = p<float>(a, 0)[i] * p<float>(a, 1)[i % ny];
-}
-void scale_f32(const program_args & a) {        // (x, out, scale, bias, n)
-    int64_t b, e; range(a, i32(a, 4), b, e);
-    for (int64_t i = b; i < e; ++i) p<float>(a, 1)[i] = p<float>(a, 0)[i] * f32(a, 2) + f32(a, 3);
-}
-void rms_norm_f32(const program_args & a) {     // (out, x, n_cols, eps); one program per row
-    const int32_t n = i32(a, 2);
-    const float * x = p<float>(a, 1) + static_cast<int64_t>(a.pid) * n;
-    float * y = p<float>(a, 0) + static_cast<int64_t>(a.pid) * n;
-    double sum = 0.0;
-    for (int32_t i = 0; i < n; ++i) sum += static_cast<double>(x[i]) * x[i];
-    const float scale = 1.0f / std::sqrt(static_cast<float>(sum / n) + f32(a, 3));
-    for (int32_t i = 0; i < n; ++i) y[i] = x[i] * scale;
-}
-template <float (*F)(float)>
-void unary_f32(const program_args & a) {        // (x, out, n)
-    int64_t b, e; range(a, i32(a, 2), b, e);
-    for (int64_t i = b; i < e; ++i) p<float>(a, 1)[i] = F(p<float>(a, 0)[i]);
-}
-float silu(float x) { return x / (1.0f + std::exp(-x)); }
-float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
-float tanh_(float x) { return std::tanh(x); }
-
-const std::unordered_map<std::string, kernel_fn> & kernel_table() {
-    static const std::unordered_map<std::string, kernel_fn> table = {
-        { "flagos_add_f32", add_f32 },
-        { "flagos_add_repeat_f32", add_repeat_f32 },
-        { "flagos_mul_f32", mul_f32 },
-        { "flagos_scale_f32", scale_f32 },
-        { "flagos_rms_norm_f32", rms_norm_f32 },
-        { "flagos_silu_f32", unary_f32<silu> },
-        { "flagos_sigmoid_f32", unary_f32<sigmoid> },
-        { "flagos_tanh_f32", unary_f32<tanh_> },
-    };
-    return table;
-}
-
 struct hs_module {
     std::unordered_map<std::string, uint32_t> blocks;  // symbol -> BLOCK baked into the "binary"
 };
 
 struct hs_kernel {
-    kernel_fn fn;
+    std::string name;
     uint32_t block;
     uint32_t n_args;
 };
@@ -202,21 +135,28 @@ void module_unload(flagos_rt_module_t module) {
 flagos_rt_status kernel_get(flagos_rt_module_t module, const flagos_rt_kernel_desc * desc, flagos_rt_kernel_t * kernel) {
     auto * m = reinterpret_cast<hs_module *>(module);
     const auto in_module = m->blocks.find(desc->symbol);
-    const auto impl = kernel_table().find(desc->symbol);
-    if (in_module == m->blocks.end() || impl == kernel_table().end()) return FLAGOS_RT_NOT_FOUND;
+    if (in_module == m->blocks.end()) return FLAGOS_RT_NOT_FOUND;
     // The manifest and the artifact must agree on BLOCK, as they would for a
     // compiled Triton kernel.
     if (desc->block_size != 0 && desc->block_size != in_module->second) return FLAGOS_RT_INVALID_ARGUMENT;
-    *kernel = reinterpret_cast<flagos_rt_kernel_t>(new hs_kernel { impl->second, in_module->second, desc->n_args });
+    *kernel = reinterpret_cast<flagos_rt_kernel_t>(new hs_kernel { desc->symbol, in_module->second, desc->n_args });
     return FLAGOS_RT_OK;
 }
 
 flagos_rt_status launch(flagos_rt_stream_t, flagos_rt_kernel_t kernel, const flagos_rt_launch * launch) {
     auto * k = reinterpret_cast<hs_kernel *>(kernel);
-    if (launch->n_args != k->n_args) return FLAGOS_RT_INVALID_ARGUMENT;
-    const uint64_t programs = uint64_t(launch->grid[0]) * launch->grid[1] * launch->grid[2];
-    for (uint64_t pid = 0; pid < programs; ++pid) {
-        k->fn({ static_cast<uint32_t>(pid), k->block, launch->args });
+    if (launch->n_args != k->n_args || launch->n_args > 32) return FLAGOS_RT_INVALID_ARGUMENT;
+    // Same argument passing as hipModuleLaunchKernel: one pointer per value.
+    void * values[32];
+    for (uint32_t i = 0; i < launch->n_args; ++i) {
+        values[i] = const_cast<void *>(static_cast<const void *>(&launch->args[i].value));
+    }
+    for (uint32_t z = 0; z < launch->grid[2]; ++z) {
+        for (uint32_t y = 0; y < launch->grid[1]; ++y) {
+            for (uint32_t x = 0; x < launch->grid[0]; ++x) {
+                if (!flagos_ref::run(k->name, { x, y, k->block, values })) return FLAGOS_RT_NOT_FOUND;
+            }
+        }
     }
     return FLAGOS_RT_OK;
 }

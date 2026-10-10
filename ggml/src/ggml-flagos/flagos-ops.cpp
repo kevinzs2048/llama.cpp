@@ -1,7 +1,10 @@
 #include "flagos-ops.h"
 
+#include "flagos-graph-plan.h"
+
 #include <cmath>
 #include <cstring>
+#include <string>
 
 bool flagos_op_is_noop(const ggml_tensor * op) {
     switch (op->op) {
@@ -186,6 +189,67 @@ bool plan_unary(const flagos_kernel_package & package, const ggml_tensor * op, f
     return true;
 }
 
+
+// Quantized MUL_MAT with GGUF weights (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K)
+// and F32 activations. Arguments are (weights as bytes, weights as f16 for
+// the block scales, x, y, k, rows[, columns]); the kernels address with
+// 32-bit offsets, so every pairwise product must fit in int32.
+const char * quant_name(flagos_quantized_matmul_kind kind) {
+    switch (kind) {
+        case flagos_quantized_matmul_kind::q4_0: return "q4_0";
+        case flagos_quantized_matmul_kind::q4_1: return "q4_1";
+        case flagos_quantized_matmul_kind::q8_0: return "q8_0";
+        case flagos_quantized_matmul_kind::q4_k: return "q4_k";
+        case flagos_quantized_matmul_kind::q5_k: return "q5_k";
+        case flagos_quantized_matmul_kind::q6_k: return "q6_k";
+        default: return nullptr;
+    }
+}
+
+bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    int32_t precision = 0;
+    std::memcpy(&precision, op->op_params, sizeof(precision));
+    if (precision != GGML_PREC_DEFAULT && precision != GGML_PREC_F32) {
+        return false;
+    }
+    flagos_quantized_matmul_signature sig;
+    if (!flagos_describe_quantized_matmul(op, &sig) || quant_name(sig.weight_kind) == nullptr) {
+        return false;
+    }
+    const int64_t limit = INT32_MAX;
+    if (sig.k > limit || sig.rows > limit || sig.columns > limit || sig.k > limit / sig.rows ||
+        sig.k > limit / sig.columns || sig.rows > limit / sig.columns) {
+        return false;
+    }
+    const std::string base = std::string("flagos_mul_mat_") + quant_name(sig.weight_kind) + "_f32";
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    if (sig.columns == 1) {
+        // Decode GEMV: one program per output row.
+        const flagos_kernel_info * kernel = find_kernel(package, base.c_str(), 6, sig.rows);
+        if (kernel == nullptr) {
+            return false;
+        }
+        set_call(call, kernel, sig.rows, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
+        return true;
+    }
+    // Batched (prefill): grid (rows, ceil(columns / BLOCK)).
+    const std::string batched = base + "_batched";
+    const flagos_kernel_info * kernel = package.find(batched);
+    if (kernel == nullptr || kernel->block_size <= 0 ||
+        (kernel->argument_count >= 0 && kernel->argument_count != 7)) {
+        return false;
+    }
+    const int64_t col_programs = (sig.columns + kernel->block_size - 1) / kernel->block_size;
+    if (col_programs > 65535) {
+        return false;
+    }
+    set_call(call, kernel, sig.rows, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows), i32(sig.columns) });
+    if (call != nullptr) {
+        call->grid[1] = static_cast<uint32_t>(col_programs);
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -202,6 +266,8 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
             return plan_rms_norm(package, op, call);
         case GGML_OP_UNARY:
             return plan_unary(package, op, call);
+        case GGML_OP_MUL_MAT:
+            return plan_mul_mat(package, op, call);
         default:
             return false;
     }

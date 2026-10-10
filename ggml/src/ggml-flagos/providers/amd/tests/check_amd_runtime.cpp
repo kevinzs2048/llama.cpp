@@ -22,6 +22,8 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include "reference_kernels.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -95,32 +97,6 @@ hipError_t hipModuleGetFunction(hipFunction_t * function, hipModule_t, const cha
 }
 }
 
-// Host evaluation of the FlagGems kernels, one Triton program at a time.
-static void run_program(const std::string & name, uint32_t pid, uint32_t block, void ** a) {
-    auto P = [&](int i) { return *static_cast<float **>(a[i]); };
-    auto I = [&](int i) { return *static_cast<int32_t *>(a[i]); };
-    auto F = [&](int i) { return *static_cast<float *>(a[i]); };
-    auto span = [&](int32_t n, int64_t & b, int64_t & e) { b = int64_t(pid) * block; e = std::min<int64_t>(b + block, n); };
-    int64_t b, e;
-    if (name == "flagos_add_f32") { span(I(3), b, e); for (int64_t i = b; i < e; ++i) P(2)[i] = P(0)[i] + P(1)[i]; }
-    else if (name == "flagos_add_repeat_f32") { span(I(3), b, e); for (int64_t i = b; i < e; ++i) P(2)[i] = P(0)[i] + P(1)[i % I(4)]; }
-    else if (name == "flagos_mul_f32") { span(I(3), b, e); for (int64_t i = b; i < e; ++i) P(2)[i] = P(0)[i] * P(1)[i % I(4)]; }
-    else if (name == "flagos_scale_f32") { span(I(4), b, e); for (int64_t i = b; i < e; ++i) P(1)[i] = P(0)[i] * F(2) + F(3); }
-    else if (name == "flagos_silu_f32") { span(I(2), b, e); for (int64_t i = b; i < e; ++i) P(1)[i] = P(0)[i] / (1.0f + std::exp(-P(0)[i])); }
-    else if (name == "flagos_rms_norm_f32") {
-        const int32_t n = I(2);
-        const float * x = P(1) + int64_t(pid) * n;
-        float * y = P(0) + int64_t(pid) * n;
-        double sum = 0;
-        for (int32_t i = 0; i < n; ++i) sum += double(x[i]) * x[i];
-        const float s = 1.0f / std::sqrt(float(sum / n) + F(3));
-        for (int32_t i = 0; i < n; ++i) y[i] = x[i] * s;
-    } else {
-        std::fprintf(stderr, "unexpected kernel %s\n", name.c_str());
-        std::exit(1);
-    }
-}
-
 extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function, unsigned gx, unsigned gy, unsigned gz,
                                             unsigned bx, unsigned by, unsigned bz, unsigned shared,
                                             hipStream_t stream, void ** args, void ** extra) {
@@ -128,15 +104,17 @@ extern "C" hipError_t hipModuleLaunchKernel(hipFunction_t function, unsigned gx,
     const flagos_kernel_info * info = g_package.find(name);
     CHECK(info != nullptr);
     CHECK(stream == reinterpret_cast<hipStream_t>(uintptr_t(0x51)));
-    CHECK(extra == nullptr && gy == 1 && gz == 1 && by == 1 && bz == 1);
+    CHECK(extra == nullptr && gz == 1 && by == 1 && bz == 1);
     CHECK(bx == uint32_t(info->num_warps * info->warp_size));
     CHECK(shared == uint32_t(info->shared_memory));
     // Triton scratch slots follow the declared arguments and are null.
     CHECK(info->argument_count > 0);
     CHECK(*static_cast<void **>(args[info->argument_count]) == nullptr);
     CHECK(*static_cast<void **>(args[info->argument_count + 1]) == nullptr);
-    for (uint32_t pid = 0; pid < gx; ++pid) {
-        run_program(name, pid, uint32_t(info->block_size), args);
+    for (uint32_t y = 0; y < gy; ++y) {
+        for (uint32_t x = 0; x < gx; ++x) {
+            CHECK(flagos_ref::run(name, { x, y, uint32_t(info->block_size), args }));
+        }
     }
     ++g_launches;
     return hipSuccess;
@@ -149,7 +127,7 @@ static void host_log(flagos_log_level, const char * provider, const char * messa
 // Run `build` on the AMD runtime device and on the CPU, compare outputs.
 template <typename Build>
 static void compare(ggml_backend_t device_backend, ggml_backend_dev_t device, const char * label, Build build,
-                    bool expect_supported = true) {
+                    bool expect_supported = true, double max_nmse = 1e-10) {
     // Use the CPU backend directly: going through the backend registry would
     // initialize every registered backend, including real GPU providers.
     ggml_backend_t cpu = ggml_backend_cpu_init();
@@ -180,7 +158,13 @@ static void compare(ggml_backend_t device_backend, ggml_backend_dev_t device, co
         for (ggml_tensor * input : inputs) {
             std::vector<float> data(ggml_nelements(input));
             for (float & v : data) v = dist(rng);
-            ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+            if (input->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+            } else {
+                std::vector<uint8_t> q(ggml_nbytes(input));
+                ggml_quantize_chunk(input->type, data.data(), q.data(), 0, ggml_nrows(input), input->ne[0], nullptr);
+                ggml_backend_tensor_set(input, q.data(), 0, q.size());
+            }
         }
         CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
         results[pass].resize(ggml_nelements(out));
@@ -188,12 +172,19 @@ static void compare(ggml_backend_t device_backend, ggml_backend_dev_t device, co
         ggml_backend_buffer_free(buffer);
         ggml_free(ctx);
     }
-    double err = 0;
+    // Normalized mean squared error, as test-backend-ops uses. The CPU
+    // backend quantizes activations to Q8 for quantized dot products, so
+    // those cases get a looser bound than exact float operations.
+    double num = 0;
+    double den = 0;
     for (size_t i = 0; i < results[0].size(); ++i) {
-        err = std::max(err, double(std::fabs(results[0][i] - results[1][i])));
+        const double d = double(results[0][i]) - results[1][i];
+        num += d * d;
+        den += double(results[1][i]) * results[1][i];
     }
-    std::printf("  %-28s max |diff| %.3g\n", label, err);
-    CHECK(err < 1e-4);
+    const double nmse = den > 0 ? num / den : num;
+    std::printf("  %-28s nmse %.3g\n", label, nmse);
+    CHECK(nmse <= max_nmse);
     ggml_backend_free(cpu);
 }
 
@@ -249,6 +240,18 @@ int main(int argc, char ** argv) {
         in = { ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 4), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024) };
         return ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, in[0], 1e-5f), in[1]), in[0]);
     });
+    // Quantized MUL_MAT: decode GEMV (1 column) and batched prefill.
+    const ggml_type quant_types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0,
+                                      GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
+    for (ggml_type type : quant_types) {
+        for (int64_t columns : { int64_t(1), int64_t(5), int64_t(37) }) {
+            const std::string label = std::string("MUL_MAT ") + ggml_type_name(type) + " cols=" + std::to_string(columns);
+            compare(backend, device, label.c_str(), [type, columns](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+                in = { ggml_new_tensor_2d(ctx, type, 512, 96), ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, columns) };
+                return ggml_mul_mat(ctx, in[0], in[1]);
+            }, true, 5e-4);
+        }
+    }
     // Contract boundaries the package cannot satisfy fall back to the CPU.
     const flagos_kernel_info * norm = g_package.find("flagos_rms_norm_f32");
     CHECK(norm != nullptr);
