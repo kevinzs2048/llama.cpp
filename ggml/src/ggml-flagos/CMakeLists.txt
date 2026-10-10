@@ -342,6 +342,15 @@ if (GGML_FLAGOS_AMD)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins")
     target_link_libraries(flagos-check-amd-runtime PRIVATE ggml-base ggml-cpu hip::host)
 
+    # Host emulation of the HIP subset amd-rt uses, for running whole models
+    # through the AMD runtime and package without a GPU:
+    #   LD_PRELOAD=libflagos-hip-hostemu.so FLAGOS_HIPEMU_PACKAGE=<pkg> ...
+    add_library(flagos-hip-hostemu SHARED EXCLUDE_FROM_ALL
+        providers/amd/tests/hip_hostemu.cpp flagos-package.cpp)
+    target_include_directories(flagos-hip-hostemu PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/vendor" "${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins")
+    target_link_libraries(flagos-hip-hostemu PRIVATE hip::host)
+
     # Opt-in plugin for the migration period. It is built into a separate
     # directory so it is not auto-loaded next to the DEVICE-kind AMD
     # provider (both would expose the same GPU); point

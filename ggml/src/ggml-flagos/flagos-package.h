@@ -44,6 +44,7 @@ public:
     size_t size() const { return kernels_.size(); }
 
     const flagos_kernel_info * find(std::string_view name) const;
+    const std::vector<flagos_kernel_info> & kernels() const { return kernels_; }
 
     // Read an artifact and check its size and SHA-256 against the manifest.
     bool read_artifact(const flagos_kernel_info & kernel, std::vector<uint8_t> & bytes, std::string & error) const;
