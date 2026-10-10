@@ -422,6 +422,36 @@ inline bool run(const std::string & name, const program & p) {
         }
         return true;
     }
+    if (name == "flagos_soft_max_unmasked_f32" || name == "flagos_soft_max_masked_f32_f16") {
+        // (x, mask|null, out, n_cols, scale); one program per row
+        const int32_t n = I(3);
+        const float scale = S(4);
+        const float * x = F(0) + int64_t(p.pid_x) * n;
+        const auto * mask = arg<const uint16_t *>(p, 1);
+        float * out = F(2) + int64_t(p.pid_x) * n;
+        std::vector<float> v(n);
+        float m = -INFINITY;
+        for (int32_t c = 0; c < n; ++c) {
+            v[c] = x[c] * scale + (mask != nullptr ? f16_to_f32(mask[int64_t(p.pid_x) * n + c]) : 0.0f);
+            m = std::max(m, v[c]);
+        }
+        float sum = 0.0f;
+        for (int32_t c = 0; c < n; ++c) { v[c] = std::exp(v[c] - m); sum += v[c]; }
+        for (int32_t c = 0; c < n; ++c) out[c] = v[c] / sum;
+        return true;
+    }
+    if (name.rfind("flagos_get_rows_q", 0) == 0) {   // (w_u8, w_f16, idx, out, n_cols); grid (rows, n_cols / QK)
+        quant_format f;
+        if (!quant_format_of(name, f)) return false;
+        const int32_t n = I(4);
+        const auto * w = arg<const uint8_t *>(p, 0);
+        const auto * idx = arg<const int32_t *>(p, 2);
+        float * out = F(3);
+        const int64_t row = idx[p.pid_x];
+        const int64_t blk = row * (n / f.block_elems) + p.pid_y;
+        f.dequant(w + blk * f.block_bytes, out + int64_t(p.pid_x) * n + int64_t(p.pid_y) * f.block_elems);
+        return true;
+    }
     if (name == "flagos_rms_norm_mul_f32") {   // (norm_out, mul_out, x, weight, n_cols, eps); one program per row
         const int32_t n = I(4);
         const float * x = F(2) + int64_t(p.pid_x) * n;

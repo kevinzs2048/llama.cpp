@@ -858,6 +858,82 @@ bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * 
     }
     return true;
 }
+
+// SOFT_MAX over rows of a contiguous F32 tensor, without a mask or with an
+// F16 mask of exactly the op's shape (the MoE router uses the unmasked
+// form). The row (a power of two) must fit in one BLOCK; no sinks or ALiBi:
+// flagos_soft_max_unmasked_f32 / flagos_soft_max_masked_f32_f16
+// (x, mask|null, out, n_cols, scale), one program per row.
+bool plan_soft_max(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * x = op->src[0];
+    const ggml_tensor * mask = op->src[1];
+    float params[2];
+    std::memcpy(params, op->op_params, sizeof(params));
+    const float scale = params[0], max_bias = params[1];
+    const int64_t n = op->ne[0];
+    if (x == nullptr || op->src[2] != nullptr || !is_contiguous_f32(op) || !is_contiguous_f32(x) ||
+        !ggml_are_same_shape(op, x) || !fits_i32(ggml_nelements(op)) || n <= 0 || (n & (n - 1)) != 0 ||
+        !std::isfinite(scale) || scale == 0.0f || max_bias != 0.0f || partially_overlaps(op, x)) {
+        return false;
+    }
+    if (mask != nullptr && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) || !ggml_are_same_shape(mask, op) ||
+                            partially_overlaps(op, mask) || (op->data != nullptr && op->data == mask->data))) {
+        return false;
+    }
+    const int64_t rows = ggml_nrows(op);
+    const char * name = mask == nullptr ? "flagos_soft_max_unmasked_f32" : "flagos_soft_max_masked_f32_f16";
+    const flagos_kernel_info * kernel = find_kernel(package, name, 5, rows);
+    if (kernel == nullptr || kernel->block_size < n) {
+        return false;
+    }
+    if (call != nullptr) {
+        flagos_rt_arg mask_arg {};
+        mask_arg.kind = FLAGOS_RT_ARG_PTR;
+        mask_arg.value.ptr = mask != nullptr ? mask->data : nullptr;
+        set_call(call, kernel, rows, { ptr(x), mask_arg, ptr(op), i32(n), f32(scale) });
+    }
+    return true;
+}
+
+// GET_ROWS from a GGUF-quantized table (token embeddings): one program per
+// (row, quant block). flagos_get_rows_<type>_f32(w_u8, w_f16, idx, out, n_cols),
+// grid (rows, n_cols / QK).
+bool plan_get_rows_quant(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * table = op->src[0];
+    const ggml_tensor * index = op->src[1];
+    if (table == nullptr || index == nullptr) {
+        return false;
+    }
+    const char * type = nullptr;
+    int64_t qk = 0;
+    switch (table->type) {
+        case GGML_TYPE_Q4_0: type = "q4_0"; qk = 32; break;
+        case GGML_TYPE_Q4_1: type = "q4_1"; qk = 32; break;
+        case GGML_TYPE_Q8_0: type = "q8_0"; qk = 32; break;
+        case GGML_TYPE_Q4_K: type = "q4_k"; qk = 256; break;
+        case GGML_TYPE_Q5_K: type = "q5_k"; qk = 256; break;
+        case GGML_TYPE_Q6_K: type = "q6_k"; qk = 256; break;
+        default: return false;
+    }
+    if (op->type != GGML_TYPE_F32 || index->type != GGML_TYPE_I32 || op->ne[0] <= 0 || op->ne[0] % qk != 0 ||
+        op->ne[1] <= 0 || table->ne[0] != op->ne[0] || op->ne[2] != 1 || op->ne[3] != 1 || table->ne[1] <= 0 ||
+        table->ne[2] != 1 || table->ne[3] != 1 || ggml_nelements(index) != op->ne[1] || !ggml_is_contiguous(op) ||
+        !ggml_is_contiguous(table) || !ggml_is_contiguous(index) || !fits_i32(ggml_nelements(op)) ||
+        ggml_nbytes(table) > size_t(INT32_MAX) || op->ne[0] / qk > 65535 ||
+        partially_overlaps(op, table) || partially_overlaps(op, index)) {
+        return false;
+    }
+    const std::string name = std::string("flagos_get_rows_") + type + "_f32";
+    const flagos_kernel_info * kernel = find_kernel(package, name.c_str(), 5, op->ne[1]);
+    if (kernel == nullptr || kernel->block_size != qk) {
+        return false;
+    }
+    set_call(call, kernel, op->ne[1], { ptr(table), ptr(table), ptr(index), ptr(op), i32(op->ne[0]) });
+    if (call != nullptr) {
+        call->grid[1] = static_cast<uint32_t>(op->ne[0] / qk);
+    }
+    return true;
+}
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -897,7 +973,9 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
         case GGML_OP_SET_ROWS:
             return plan_set_rows(package, op, call);
         case GGML_OP_GET_ROWS:
-            return plan_get_rows(package, op, call);
+            return plan_get_rows(package, op, call) || plan_get_rows_quant(package, op, call);
+        case GGML_OP_SOFT_MAX:
+            return plan_soft_max(package, op, call);
         default:
             return false;
     }
