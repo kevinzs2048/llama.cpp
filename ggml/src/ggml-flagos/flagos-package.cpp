@@ -4,6 +4,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -74,6 +76,40 @@ static bool flagos_get_int(const json & item, const char * key, T & out, std::st
     return true;
 }
 
+// Optional variant fields: "contract", "priority" and
+// "when": { "<fact>": { "min": i, "max": i, "multiple_of": i }, ... }.
+static bool flagos_get_variant(const json & item, flagos_kernel_info & info, std::string & error) {
+    if (item.contains("contract")) {
+        if (!item.at("contract").is_string() || item.at("contract").get<std::string>().empty()) {
+            error = "field 'contract' is not a kernel name";
+            return false;
+        }
+        info.contract = item.at("contract").get<std::string>();
+    }
+    if (!flagos_get_int(item, "priority", info.priority, error)) {
+        return false;
+    }
+    if (!item.contains("when")) {
+        return true;
+    }
+    const json & when = item.at("when");
+    if (!when.is_object() || info.contract.empty()) {
+        error = "field 'when' needs an object and a 'contract'";
+        return false;
+    }
+    for (const auto & [fact, rule] : when.items()) {
+        flagos_kernel_constraint c;
+        c.fact = fact;
+        if (!rule.is_object() || !flagos_get_int(rule, "min", c.min, error) || !flagos_get_int(rule, "max", c.max, error) ||
+            !flagos_get_int(rule, "multiple_of", c.multiple_of, error) || c.multiple_of < 1 || c.min > c.max) {
+            error = "invalid constraint on '" + fact + "'" + (error.empty() ? "" : ": " + error);
+            return false;
+        }
+        info.when.push_back(std::move(c));
+    }
+    return true;
+}
+
 bool flagos_kernel_package::open(const std::string & dir, std::string & error) {
     // nlohmann::json throws on type mismatches; never let that escape into
     // GGML registry initialization.
@@ -132,6 +168,10 @@ bool flagos_kernel_package::open_impl(const std::string & dir, std::string & err
             error = "kernel '" + info.name + "': " + error;
             return false;
         }
+        if (!flagos_get_variant(item, info, error)) {
+            error = "kernel '" + info.name + "': " + error;
+            return false;
+        }
         if (info.block_size < 0 || info.num_warps < 0 || info.warp_size < 0 || info.shared_memory < 0 ||
             info.tile_m < 0 || info.tile_n < 0 || info.tile_k < 0) {
             error = "kernel '" + info.name + "' has negative launch metadata";
@@ -143,8 +183,84 @@ bool flagos_kernel_package::open_impl(const std::string & dir, std::string & err
         }
         kernels_.push_back(std::move(info));
     }
+    // A variant must name an existing, non-variant kernel and take the same
+    // number of arguments; anything else is a packaging error.
+    for (size_t i = 0; i < kernels_.size(); ++i) {
+        const flagos_kernel_info & v = kernels_[i];
+        if (v.contract.empty()) {
+            continue;
+        }
+        const flagos_kernel_info * base = find(v.contract);
+        if (base == nullptr || !base->contract.empty() || base == &v ||
+            (base->argument_count >= 0 && v.argument_count >= 0 && base->argument_count != v.argument_count)) {
+            error = "kernel '" + v.name + "' is not a valid variant of '" + v.contract + "'";
+            return false;
+        }
+        variants_[v.contract].push_back(i);
+    }
+    for (auto & [contract, list] : variants_) {
+        std::stable_sort(list.begin(), list.end(),
+                         [this](size_t a, size_t b) { return kernels_[a].priority > kernels_[b].priority; });
+    }
     dir_ = dir;
     return true;
+}
+
+static bool flagos_variants_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_FLAGOS_KERNEL_VARIANTS");
+        return value == nullptr || value[0] == '\0' || value[0] != '0';
+    }();
+    return enabled;
+}
+
+static bool flagos_constraints_hold(const flagos_kernel_info & kernel, std::initializer_list<flagos_kernel_fact> facts) {
+    for (const flagos_kernel_constraint & c : kernel.when) {
+        const flagos_kernel_fact * fact = nullptr;
+        for (const flagos_kernel_fact & f : facts) {
+            if (c.fact == f.name) {
+                fact = &f;
+                break;
+            }
+        }
+        if (fact == nullptr || fact->value < c.min || fact->value > c.max ||
+            (c.multiple_of > 1 && fact->value % c.multiple_of != 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const flagos_kernel_info * flagos_kernel_package::select(std::string_view contract,
+                                                         std::initializer_list<flagos_kernel_fact> facts) const {
+    const flagos_kernel_info * base = find(contract);
+    if (base == nullptr || !flagos_variants_enabled()) {
+        return base;
+    }
+    const auto it = variants_.find(std::string(contract));
+    if (it != variants_.end()) {
+        for (size_t i : it->second) {
+            const flagos_kernel_info & v = kernels_[i];
+            if (v.priority >= base->priority && flagos_constraints_hold(v, facts)) {
+                return &v;
+            }
+        }
+    }
+    return base;
+}
+
+void flagos_kernel_package::retain_variants(const std::function<bool(const flagos_kernel_info &)> & keep) {
+    for (auto & [contract, list] : variants_) {
+        list.erase(std::remove_if(list.begin(), list.end(), [&](size_t i) { return !keep(kernels_[i]); }), list.end());
+    }
+}
+
+size_t flagos_kernel_package::variant_count() const {
+    size_t n = 0;
+    for (const auto & [contract, list] : variants_) {
+        n += list.size();
+    }
+    return n;
 }
 
 const flagos_kernel_info * flagos_kernel_package::find(std::string_view name) const {

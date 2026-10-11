@@ -26,6 +26,12 @@ struct flagos_kernel_call {
     uint32_t grid[3] = { 1, 1, 1 };
     uint32_t n_args = 0;
     flagos_rt_arg args[FLAGOS_MAX_KERNEL_ARGS] = {};
+    // Kernels without an outer batch dimension cover one by repetition: the
+    // executor launches `repeat` times, and launch r adds r * advance[i]
+    // bytes to pointer argument i (0 for arguments that stay fixed). Graph
+    // capture records every launch.
+    uint32_t repeat = 1;
+    int64_t advance[FLAGOS_MAX_KERNEL_ARGS] = {};
 };
 
 // Ops that need no kernel (views and reshapes). graph_compute skips them.

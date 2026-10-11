@@ -282,7 +282,9 @@ void backend_free(ggml_backend_t backend) {
         uint64_t total = 0;
         std::string text;
         for (const auto & [op, count] : ctx->executed) {
-            total += count;
+            // "variant:<kernel>" lines break launches down further; do not
+            // count them twice.
+            total += op.rfind("variant:", 0) == 0 ? 0 : count;
             text += " " + op + "=" + std::to_string(count);
         }
         std::fprintf(stderr, "FlagOS %s: %llu graphs, %llu kernel launches:%s\n", ctx->device->name.c_str(),
@@ -566,17 +568,20 @@ void dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
 // refuse at launch: the manifest must declare the argument count and the
 // launch geometry, and the kernel may not need compiler scratch (no runtime
 // allocates it yet).
-bool kernel_launchable(const rt_device * device, const flagos_kernel_call & call) {
-    const flagos_kernel_info * k = call.kernel;
-    if (k == nullptr || k->argument_count < 0 || uint32_t(k->argument_count) != call.n_args ||
-        call.n_args > FLAGOS_MAX_EXPLICIT_KERNEL_ARGS || k->num_warps <= 0 || k->warp_size <= 0 ||
-        k->global_scratch_size != 0 || k->profile_scratch_size != 0) {
+bool kernel_fits_device(const rt_device * device, const flagos_kernel_info & k) {
+    if (k.argument_count < 0 || uint32_t(k.argument_count) > FLAGOS_MAX_EXPLICIT_KERNEL_ARGS || k.num_warps <= 0 ||
+        k.warp_size <= 0 || k.global_scratch_size != 0 || k.profile_scratch_size != 0) {
         return false;
     }
-    const uint32_t threads = uint32_t(k->num_warps * k->warp_size);
+    const uint32_t threads = uint32_t(k.num_warps * k.warp_size);
     const flagos_rt_device_props & p = device->props;
     return (p.max_threads_per_block == 0 || threads <= p.max_threads_per_block) &&
-        (p.shared_memory_per_block == 0 || uint32_t(k->shared_memory) <= p.shared_memory_per_block);
+        (p.shared_memory_per_block == 0 || uint32_t(k.shared_memory) <= p.shared_memory_per_block);
+}
+
+bool kernel_launchable(const rt_device * device, const flagos_kernel_call & call) {
+    return call.kernel != nullptr && uint32_t(call.kernel->argument_count) == call.n_args &&
+        kernel_fits_device(device, *call.kernel);
 }
 
 flagos_lowering_choice fusion_query(void * user_data, const ggml_cgraph * graph, const flagos_pattern_candidate & candidate) {
@@ -610,12 +615,32 @@ bool launch_call(rt_backend * ctx, const flagos_kernel_call & call) {
     if (kernel == nullptr) {
         return false;
     }
+    if (ctx->stats && !call.kernel->contract.empty()) {
+        ++ctx->executed["variant:" + call.kernel->name];
+    }
     flagos_rt_launch launch {};
     launch.struct_size = sizeof(launch);
     std::memcpy(launch.grid, call.grid, sizeof(launch.grid));
     launch.n_args = call.n_args;
     launch.args = call.args;
-    return rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str());
+    if (call.repeat <= 1) {
+        return rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str());
+    }
+    flagos_rt_arg args[FLAGOS_MAX_KERNEL_ARGS];
+    std::memcpy(args, call.args, sizeof(args));
+    launch.args = args;
+    for (uint32_t r = 0; r < call.repeat; ++r) {
+        for (uint32_t i = 0; i < call.n_args; ++i) {
+            if (call.advance[i] != 0) {
+                GGML_ASSERT(call.args[i].kind == FLAGOS_RT_ARG_PTR);
+                args[i].value.ptr = static_cast<char *>(call.args[i].value.ptr) + int64_t(r) * call.advance[i];
+            }
+        }
+        if (!rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str())) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool fusion_execute(void * user_data, ggml_cgraph * graph, const flagos_plan_step & step) {
@@ -969,8 +994,13 @@ const flagos_provider_v1 * flagos_runtime_adapter(const std::vector<flagos_runti
                     GGML_LOG_WARN("FlagOS %s: kernel package %s rejected: %s\n", device->name.c_str(),
                                   package_dir.c_str(), error.c_str());
                 } else {
-                    GGML_LOG_DEBUG("FlagOS %s: kernel package %s (%zu kernels)\n", device->name.c_str(),
-                                   package_dir.c_str(), device->package.size());
+                    // A variant is chosen at launch, after supports_op
+                    // accepted the base kernel, so keep only variants this
+                    // device can launch.
+                    const rt_device * d = device.get();
+                    device->package.retain_variants([d](const flagos_kernel_info & k) { return kernel_fits_device(d, k); });
+                    GGML_LOG_DEBUG("FlagOS %s: kernel package %s (%zu kernels, %zu variants)\n", device->name.c_str(),
+                                   package_dir.c_str(), device->package.size(), device->package.variant_count());
                 }
                 device->buft = { buft_interface, &device->dev, device.get() };
                 device->dev = { device_interface(device.get()), nullptr, device.get() };

@@ -4,8 +4,10 @@
 
 #include "../ggml-impl.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 
 bool flagos_op_is_noop(const ggml_tensor * op) {
@@ -41,6 +43,31 @@ const flagos_kernel_info * find_kernel(const flagos_kernel_package & package, co
         return nullptr;
     }
     return kernel;
+}
+
+// Largest power of two (up to 256) dividing every operand address; 0 while
+// the data is not bound (supports_op), so constraints on it fail there and
+// hold only at launch, when the base kernel is the fallback anyway.
+int64_t common_alignment(std::initializer_list<const ggml_tensor *> tensors) {
+    int64_t align = 256;
+    for (const ggml_tensor * t : tensors) {
+        const auto address = reinterpret_cast<uintptr_t>(t->data);
+        if (address == 0) {
+            return 0;
+        }
+        while (align > 1 && address % uintptr_t(align) != 0) {
+            align /= 2;
+        }
+    }
+    return align;
+}
+
+int64_t largest_nbytes(std::initializer_list<const ggml_tensor *> tensors) {
+    size_t bytes = 0;
+    for (const ggml_tensor * t : tensors) {
+        bytes = std::max(bytes, ggml_nbytes(t));
+    }
+    return int64_t(bytes);
 }
 
 int64_t programs_for(const flagos_kernel_info * kernel, int64_t elements) {
@@ -81,6 +108,7 @@ void set_call(flagos_kernel_call * call, const flagos_kernel_info * kernel, int6
     if (call == nullptr) {
         return;
     }
+    *call = flagos_kernel_call {};
     call->kernel = kernel;
     call->grid[0] = static_cast<uint32_t>(programs);
     call->grid[1] = 1;
@@ -241,10 +269,15 @@ bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op,
     const std::string base = std::string("flagos_mul_mat_") + quant_name(sig.weight_kind) + "_f32";
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
+    // Facts a package may constrain GEMV variants on (manifest "when").
+    const std::initializer_list<flagos_kernel_fact> facts = {
+        { "k", sig.k }, { "rows", sig.rows }, { "columns", sig.columns },
+        { "align", common_alignment({ w, x, op }) }, { "bytes", largest_nbytes({ w, x, op }) },
+    };
     if (sig.columns == 1) {
         // Decode GEMV: one program per output row.
-        const flagos_kernel_info * kernel = find_kernel(package, base.c_str(), 6, sig.rows);
-        if (kernel == nullptr) {
+        const flagos_kernel_info * kernel = package.select(base, facts);
+        if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 6)) {
             return false;
         }
         set_call(call, kernel, sig.rows, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
@@ -252,15 +285,20 @@ bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op,
     }
     // Batched (prefill): grid (rows, ceil(columns / BLOCK)).
     const std::string batched = base + "_batched";
-    const flagos_kernel_info * kernel = package.find(batched);
-    if (kernel == nullptr || kernel->block_size <= 0 ||
-        (kernel->argument_count >= 0 && kernel->argument_count != 7)) {
-        return false;
+    // A variant may use another BLOCK; if its grid does not fit, the base
+    // kernel (the one supports_op checked) is used instead.
+    auto usable = [&](const flagos_kernel_info * kern) {
+        return kern != nullptr && kern->block_size > 0 && (kern->argument_count < 0 || kern->argument_count == 7) &&
+            (sig.columns + kern->block_size - 1) / kern->block_size <= 65535;
+    };
+    const flagos_kernel_info * kernel = package.select(batched, facts);
+    if (!usable(kernel)) {
+        kernel = package.find(batched);
+        if (!usable(kernel)) {
+            return false;
+        }
     }
     const int64_t col_programs = (sig.columns + kernel->block_size - 1) / kernel->block_size;
-    if (col_programs > 65535) {
-        return false;
-    }
     set_call(call, kernel, sig.rows, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows), i32(sig.columns) });
     if (call != nullptr) {
         call->grid[1] = static_cast<uint32_t>(col_programs);
@@ -811,6 +849,9 @@ bool plan_rope(const flagos_kernel_package & package, const ggml_tensor * op, fl
 //   mask of exactly [n_kv, 1, 1, 1].
 // - prefill: flagos_flash_attn_prefill_f32_f16_generic_h{D}, 19 arguments,
 //   grid (Hq, ceil(n_q / BLOCK)); one mask plane shared by all heads.
+// Neither kernel has a sequence dimension. Several KV streams (ne[3] > 1:
+// parallel sequences with a non-unified cache) are covered by repeating the
+// launch per stream; K/V and the mask may also be shared (ne[3] == 1).
 bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
     const ggml_tensor * q = op->src[0];
     const ggml_tensor * k = op->src[1];
@@ -826,10 +867,11 @@ bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * 
         q->nb[0] != sizeof(float) || k->nb[0] != 2 || v->nb[0] != 2) {
         return false;
     }
-    const int64_t D = q->ne[0], n_q = q->ne[1], Hq = q->ne[2], n_kv = k->ne[1], Hkv = k->ne[2];
-    if ((D != 128 && D != 256) || k->ne[0] != D || v->ne[0] != D || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+    const int64_t D = q->ne[0], n_q = q->ne[1], Hq = q->ne[2], n_kv = k->ne[1], Hkv = k->ne[2], n_seq = q->ne[3];
+    if ((D != 128 && D != 256) || k->ne[0] != D || v->ne[0] != D || n_seq < 1 || n_seq > 4096 ||
+        (k->ne[3] != 1 && k->ne[3] != n_seq) || (mask->ne[3] != 1 && mask->ne[3] != n_seq) ||
         !ggml_are_same_shape(k, v) || Hkv <= 0 || Hq % Hkv != 0 || n_kv <= 0 || n_q <= 0 ||
-        op->ne[0] != D || op->ne[1] != Hq || op->ne[2] != n_q || op->ne[3] != 1 || v->nb[1] != k->nb[1] || v->nb[2] != k->nb[2] ||
+        op->ne[0] != D || op->ne[1] != Hq || op->ne[2] != n_q || op->ne[3] != n_seq || v->nb[1] != k->nb[1] || v->nb[2] != k->nb[2] ||
         !element_offsets_fit_i32(q, sizeof(float)) || !element_offsets_fit_i32(k, 2) || !element_offsets_fit_i32(v, 2) ||
         !fits_i32(ggml_nelements(op)) || Hq > INT32_MAX) {
         return false;
@@ -841,26 +883,34 @@ bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * 
     }
     const bool decode = n_q == 1;
     if (decode) {
-        if (mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+        if (mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[2] != 1 ||
             k->nb[2] != size_t(D) * 2 || k->nb[1] < size_t(D) * 2) {
             return false;
         }
-    } else if (mask->ne[0] < n_kv || mask->ne[1] < n_q || mask->ne[2] != 1 || mask->ne[3] != 1) {
+    } else if (mask->ne[0] < n_kv || mask->ne[1] < n_q || mask->ne[2] != 1) {
         return false;
     }
     const std::string name = std::string("flagos_flash_attn_") + (decode ? "decode" : "prefill") +
         "_f32_f16_generic_h" + std::to_string(D);
-    const flagos_kernel_info * kernel = package.find(name);
     const int expected_args = decode ? 16 : 19;
-    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != expected_args) ||
-        kernel->tile_k != D || kernel->tile_m != 16 || kernel->tile_n < 16 || kernel->tile_n > 64 ||
-        (kernel->tile_n & (kernel->tile_n - 1)) != 0 || kernel->block_size != (decode ? kernel->tile_n : kernel->tile_m)) {
-        return false;
+    // As for GEMV: an unusable variant falls back to the base kernel.
+    auto usable = [&](const flagos_kernel_info * kern) {
+        return kern != nullptr && (kern->argument_count < 0 || kern->argument_count == expected_args) &&
+            kern->tile_k == D && kern->tile_m == 16 && kern->tile_n >= 16 && kern->tile_n <= 64 &&
+            (kern->tile_n & (kern->tile_n - 1)) == 0 && kern->block_size == (decode ? kern->tile_n : kern->tile_m) &&
+            (decode || (n_q + kern->block_size - 1) / kern->block_size <= 65535);
+    };
+    const flagos_kernel_info * kernel = package.select(name, {
+        { "n_q", n_q }, { "n_kv", n_kv }, { "gqa", Hq / Hkv }, { "heads", Hq },
+        { "align", common_alignment({ q, k, v, mask, op }) },
+    });
+    if (!usable(kernel)) {
+        kernel = package.find(name);
+        if (!usable(kernel)) {
+            return false;
+        }
     }
     const int64_t q_programs = decode ? 1 : (n_q + kernel->block_size - 1) / kernel->block_size;
-    if (q_programs > 65535) {
-        return false;
-    }
     if (call != nullptr) {
         const int64_t gqa = Hq / Hkv;
         const int32_t sqt = q->nb[1] / 4, sqh = q->nb[2] / 4, skt = k->nb[1] / 2, skh = k->nb[2] / 2;
@@ -873,6 +923,14 @@ bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * 
                      i32(sqt), i32(sqh), i32(skt), i32(skh), i32(svt), i32(svh), i32(mask->nb[0] / 2),
                      i32(mask->nb[1] / 2), i32(sot), i32(soh), f32(scale) });
             call->grid[1] = static_cast<uint32_t>(q_programs);
+        }
+        if (n_seq > 1) {
+            call->repeat = static_cast<uint32_t>(n_seq);
+            call->advance[0] = int64_t(q->nb[3]);
+            call->advance[1] = k->ne[3] > 1 ? int64_t(k->nb[3]) : 0;
+            call->advance[2] = v->ne[3] > 1 ? int64_t(v->nb[3]) : 0;
+            call->advance[3] = mask->ne[3] > 1 ? int64_t(mask->nb[3]) : 0;
+            call->advance[4] = int64_t(op->nb[3]);
         }
     }
     return true;

@@ -1,6 +1,7 @@
 // Loader and registry behaviour with provider plugins. The plugins are mock
 // modules built next to this test; no device runtime is touched.
 #include "flagos-loader.h"
+#include "flagos-package.h"
 #include "flagos-provider.h"
 #include "flagos-registry.h"
 #include "ggml-flagos.h"
@@ -10,7 +11,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+
+#include <unistd.h>
 
 #define CHECK(cond)                                                              \
     do {                                                                         \
@@ -72,8 +77,54 @@ static void check_entry_validation() {
     CHECK(!flagos_loader_entry_is_valid(&entry, reason));
 }
 
+static bool open_manifest(const std::string & kernels, flagos_kernel_package & pkg, std::string & error) {
+    const auto dir = std::filesystem::temp_directory_path() / ("flagos-variants-" + std::to_string(getpid()));
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir / "k.bin") << "x";
+    std::ofstream(dir / "manifest.json") << "{\"kernels\": [" << kernels << "]}";
+    const bool ok = pkg.open(dir.string(), error);
+    std::filesystem::remove_all(dir);
+    return ok;
+}
+
+// Manifest variants: selection by constraints and priority, fallback to the
+// base kernel, pruning, and rejection of malformed variants.
+static void check_package_variants() {
+    const std::string base = R"({"name": "gemv", "file": "k.bin", "argument_count": 6})";
+    const std::string aligned = R"({"name": "gemv_a16", "file": "k.bin", "argument_count": 6, "contract": "gemv",
+        "priority": 5, "when": {"k": {"multiple_of": 16}, "align": {"min": 16}}})";
+    const std::string narrow = R"({"name": "gemv_narrow", "file": "k.bin", "contract": "gemv", "priority": 9,
+        "when": {"rows": {"max": 64}}})";
+    flagos_kernel_package pkg;
+    std::string error;
+    CHECK(open_manifest(base + "," + aligned + "," + narrow, pkg, error));
+    CHECK(pkg.variant_count() == 2);
+    CHECK(pkg.select("gemv", { { "k", 4096 }, { "align", 256 }, { "rows", 4096 } })->name == "gemv_a16");
+    CHECK(pkg.select("gemv", { { "k", 4096 }, { "align", 256 }, { "rows", 32 } })->name == "gemv_narrow");
+    CHECK(pkg.select("gemv", { { "k", 4100 }, { "align", 256 }, { "rows", 4096 } })->name == "gemv");
+    // A fact the caller does not know fails the constraint (unbound data).
+    CHECK(pkg.select("gemv", { { "k", 4096 }, { "rows", 4096 } })->name == "gemv");
+    CHECK(pkg.select("missing", {}) == nullptr);
+    pkg.retain_variants([](const flagos_kernel_info & k) { return k.name != "gemv_narrow"; });
+    CHECK(pkg.variant_count() == 1);
+    CHECK(pkg.select("gemv", { { "k", 4096 }, { "align", 256 }, { "rows", 32 } })->name == "gemv_a16");
+    CHECK(pkg.find("gemv_narrow") != nullptr);
+
+    const std::string bad_args = R"({"name": "v", "file": "k.bin", "argument_count": 7, "contract": "gemv"})";
+    const std::string no_base = R"({"name": "v", "file": "k.bin", "contract": "nothing"})";
+    const std::string chained = R"({"name": "v2", "file": "k.bin", "contract": "gemv_a16"})";
+    const std::string bad_rule = R"({"name": "v", "file": "k.bin", "contract": "gemv", "when": {"k": {"multiple_of": 0}}})";
+    const std::string when_alone = R"({"name": "v", "file": "k.bin", "when": {"k": {"min": 1}}})";
+    for (const std::string & extra : { bad_args, no_base, chained, bad_rule, when_alone }) {
+        flagos_kernel_package bad;
+        CHECK(!open_manifest(base + "," + aligned + "," + extra, bad, error));
+        CHECK(!bad.is_open());
+    }
+}
+
 int main() {
     check_entry_validation();
+    check_package_variants();
 
     CHECK(setenv("GGML_FLAGOS_PROVIDER_PATH", "/nonexistent/flagos:" FLAGOS_TEST_PLUGIN_DIR, 1) == 0);
     const auto paths = flagos_loader_search_paths();

@@ -311,6 +311,16 @@ foreach(_k IN LISTS _flagos_hostsim_kernels)
     endif()
     string(APPEND _flagos_hostsim_entries "  {\"name\": \"${_name}\", \"file\": \"hostsim-elementwise.bin\", \"sha256\": \"${_flagos_hostsim_sha}\", \"size_bytes\": ${_flagos_hostsim_size}, \"block_size\": ${_block}, \"num_warps\": 1, \"warp_size\": 1, \"argument_count\": ${_argc}, \"tile_n\": ${_tile}, \"tile_m\": ${_tile_m}, \"tile_k\": ${_tile_k}}")
 endforeach()
+# Variants (manifest "contract"/"when"): same symbol and arguments as the
+# base kernel, other tiles, in their own artifact as a tuned HSACO would be.
+# They exercise variant selection; GGML_FLAGOS_KERNEL_VARIANTS=0 turns it off.
+file(WRITE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/hostsim-variants.bin"
+    "hostsim-module v1\nflagos_mul_mat_q4_k_f32 1 16 16\nflagos_flash_attn_prefill_f32_f16_generic_h256 16 32 16\n")
+file(SHA256 "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/hostsim-variants.bin" _flagos_hostsim_vsha)
+file(SIZE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/hostsim-variants.bin" _flagos_hostsim_vsize)
+set(_flagos_hostsim_vcommon "\"file\": \"hostsim-variants.bin\", \"sha256\": \"${_flagos_hostsim_vsha}\", \"size_bytes\": ${_flagos_hostsim_vsize}, \"num_warps\": 1, \"warp_size\": 1")
+string(APPEND _flagos_hostsim_entries ",\n  {\"name\": \"flagos_mul_mat_q4_k_f32_aligned16\", \"symbol\": \"flagos_mul_mat_q4_k_f32\", ${_flagos_hostsim_vcommon}, \"block_size\": 1, \"argument_count\": 6, \"tile_n\": 16, \"tile_m\": 16, \"tile_k\": 16, \"contract\": \"flagos_mul_mat_q4_k_f32\", \"priority\": 10, \"when\": {\"k\": {\"multiple_of\": 16}, \"rows\": {\"multiple_of\": 16}, \"align\": {\"multiple_of\": 16}, \"bytes\": {\"max\": 2147483647}}}")
+string(APPEND _flagos_hostsim_entries ",\n  {\"name\": \"flagos_flash_attn_prefill_f32_f16_generic_h256_n32\", \"symbol\": \"flagos_flash_attn_prefill_f32_f16_generic_h256\", ${_flagos_hostsim_vcommon}, \"block_size\": 16, \"argument_count\": 19, \"tile_n\": 32, \"tile_m\": 16, \"tile_k\": 256, \"contract\": \"flagos_flash_attn_prefill_f32_f16_generic_h256\", \"priority\": 10, \"when\": {\"n_kv\": {\"min\": 64, \"multiple_of\": 32}}}")
 file(WRITE "${FLAGOS_HOSTSIM_DIR}/hostsim-kernels/manifest.json"
     "{\"format\": \"flagos-kernel-package-v1\", \"arch\": \"hostsim-v1\", \"kernels\": [\n${_flagos_hostsim_entries}\n]}\n")
 

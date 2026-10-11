@@ -156,8 +156,10 @@ hipError_t hipModuleUnload(hipModule_t module) { delete reinterpret_cast<emu_mod
 hipError_t hipModuleGetFunction(hipFunction_t * function, hipModule_t module, const char *) {
     // The module was matched to a manifest kernel name; the symbol inside
     // the artifact may differ from that name.
+    // A variant runs the host reference of the kernel it is a variant of.
     const std::string & name = reinterpret_cast<emu_module *>(module)->name;
-    *function = reinterpret_cast<hipFunction_t>(new emu_function { name, package().find(name) });
+    const flagos_kernel_info * info = package().find(name);
+    *function = reinterpret_cast<hipFunction_t>(new emu_function { info->contract.empty() ? name : info->contract, info });
     return hipSuccess;
 }
 
