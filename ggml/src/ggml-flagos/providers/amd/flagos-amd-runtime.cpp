@@ -17,8 +17,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -75,7 +78,68 @@ struct amd_kernel {
     uint32_t threads;
     uint32_t shared_memory;
     uint32_t n_args;
+    std::string name;
 };
+
+// FLAGOS_AMD_PROFILE=1: time every launch on the GPU with a pair of HIP
+// events and print the total per kernel at exit. Launches recorded into a
+// graph are not timed, so profile with graph capture off. Debug aid only.
+struct amd_profile {
+    struct pending { const std::string * name; hipEvent_t begin, end; };
+    struct total { double ms = 0; uint64_t count = 0; };
+    bool enabled = false;
+    std::mutex mutex;
+    std::vector<pending> open;
+    std::vector<hipEvent_t> pool;
+    std::unordered_map<std::string, total> totals;
+
+    hipEvent_t take() {
+        if (!pool.empty()) { hipEvent_t e = pool.back(); pool.pop_back(); return e; }
+        hipEvent_t e = nullptr;
+        (void) hipEventCreate(&e);
+        return e;
+    }
+    // Called after the stream has been synchronized.
+    void settle() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const pending & p : open) {
+            float ms = 0;
+            if (hipEventElapsedTime(&ms, p.begin, p.end) == hipSuccess) {
+                total & t = totals[*p.name];
+                t.ms += ms;
+                ++t.count;
+            }
+            pool.push_back(p.begin);
+            pool.push_back(p.end);
+        }
+        open.clear();
+    }
+    ~amd_profile() {
+        if (!enabled || totals.empty()) return;
+        std::vector<std::pair<std::string, total>> rows(totals.begin(), totals.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+        double sum = 0;
+        uint64_t launches = 0;
+        for (const auto & r : rows) { sum += r.second.ms; launches += r.second.count; }
+        std::fprintf(stderr, "FLAGOS_AMD_PROFILE total_gpu_ms=%.3f launches=%llu\n", sum, (unsigned long long) launches);
+        for (const auto & r : rows) {
+            std::fprintf(stderr, "FLAGOS_AMD_PROFILE %-60s ms=%10.3f share=%5.1f%% count=%8llu avg_us=%9.2f\n",
+                         r.first.c_str(), r.second.ms, 100.0 * r.second.ms / sum,
+                         (unsigned long long) r.second.count, 1000.0 * r.second.ms / r.second.count);
+        }
+    }
+};
+
+amd_profile & profile() {
+    static amd_profile p;
+    static bool init = [] {
+        const char * v = std::getenv("FLAGOS_AMD_PROFILE");
+        p.enabled = v != nullptr && v[0] == '1';
+        return true;
+    }();
+    (void) init;
+    return p;
+}
 
 std::string base_arch(const char * name) {
     std::string arch(name);
@@ -202,7 +266,12 @@ void stream_destroy(flagos_rt_stream_t handle) {
 }
 
 flagos_rt_status stream_synchronize(flagos_rt_stream_t handle) {
-    return check(hipStreamSynchronize(reinterpret_cast<amd_stream *>(handle)->stream), "hipStreamSynchronize");
+    const flagos_rt_status status = check(hipStreamSynchronize(reinterpret_cast<amd_stream *>(handle)->stream), "hipStreamSynchronize");
+    if (profile().enabled) {
+        (void) hipDeviceSynchronize();
+        profile().settle();
+    }
+    return status;
 }
 
 hipMemcpyKind copy_kind(flagos_rt_copy_kind kind) {
@@ -280,7 +349,8 @@ flagos_rt_status kernel_get(flagos_rt_module_t handle, const flagos_rt_kernel_de
         return FLAGOS_RT_NOT_FOUND;
     }
     *out = reinterpret_cast<flagos_rt_kernel_t>(
-        new amd_kernel { module->device, function, desc->threads, desc->shared_memory, desc->n_args });
+        new amd_kernel { module->device, function, desc->threads, desc->shared_memory, desc->n_args,
+                         desc->symbol != nullptr ? desc->symbol : "" });
     return FLAGOS_RT_OK;
 }
 
@@ -308,10 +378,27 @@ flagos_rt_status launch(flagos_rt_stream_t handle, flagos_rt_kernel_t kernel_han
     }
     values[launch->n_args] = &global_scratch;
     values[launch->n_args + 1] = &profile_scratch;
-    return check(hipModuleLaunchKernel(kernel->function, launch->grid[0], launch->grid[1], launch->grid[2],
+    amd_profile & prof = profile();
+    hipStreamCaptureStatus capturing = hipStreamCaptureStatusNone;
+    const bool timed = prof.enabled && hipStreamIsCapturing(stream->stream, &capturing) == hipSuccess &&
+        capturing == hipStreamCaptureStatusNone;
+    hipEvent_t begin = nullptr, end = nullptr;
+    if (timed) {
+        std::lock_guard<std::mutex> lock(prof.mutex);
+        begin = prof.take();
+        end = prof.take();
+        (void) hipEventRecord(begin, stream->stream);
+    }
+    const flagos_rt_status status = check(hipModuleLaunchKernel(kernel->function, launch->grid[0], launch->grid[1], launch->grid[2],
                                        kernel->threads, 1, 1, kernel->shared_memory, stream->stream,
                                        values.data(), nullptr),
                  "hipModuleLaunchKernel");
+    if (timed) {
+        (void) hipEventRecord(end, stream->stream);
+        std::lock_guard<std::mutex> lock(prof.mutex);
+        prof.open.push_back({ &kernel->name, begin, end });
+    }
+    return status;
 }
 
 flagos_rt_status event_create(flagos_rt_device_t handle, flagos_rt_event_t * out) {
