@@ -631,6 +631,37 @@ inline bool run(const std::string & name, const program & p) {
         for (int64_t c = c0; c < c1; ++c) out[int64_t(p.pid_x) * cols + c] = table[int64_t(idx[p.pid_x]) * cols + c];
         return true;
     }
+    // Dequantize to F16: (w_u8, w_f16, out_f16); one program per quant block.
+    if (name.rfind("flagos_dequant_", 0) == 0) {
+        quant_format f;
+        if (!quant_format_of(name, f)) return false;
+        const auto * w = arg<const uint8_t *>(p, 0);
+        auto * out = arg<uint16_t *>(p, 2);
+        float tmp[256];
+        f.dequant(w + int64_t(p.pid_x) * f.block_bytes, tmp);
+        for (int i = 0; i < f.block_elems; ++i) out[int64_t(p.pid_x) * f.block_elems + i] = f32_to_f16(tmp[i]);
+        return true;
+    }
+    // F16 GEMM: (w_f16, x, y, k, rows, columns); grid (ceil(rows / tile_m),
+    // ceil(columns / tile_n)); activations are rounded to F16, F32 accumulate.
+    if (name.rfind("flagos_mul_mat_f16_f32_batched", 0) == 0) {
+        const auto * w = arg<const uint16_t *>(p, 0);
+        const float * x = F(1);
+        float * y = F(2);
+        const int32_t k = I(3), rows = I(4), columns = I(5);
+        const int64_t r0 = int64_t(p.pid_x) * p.tile_m, r1 = std::min<int64_t>(r0 + p.tile_m, rows);
+        const int64_t c0 = int64_t(p.pid_y) * p.tile_n, c1 = std::min<int64_t>(c0 + p.tile_n, columns);
+        for (int64_t c = c0; c < c1; ++c) {
+            for (int64_t r = r0; r < r1; ++r) {
+                double sum = 0.0;
+                for (int32_t i = 0; i < k; ++i) {
+                    sum += double(f16_to_f32(w[r * k + i])) * f16_to_f32(f32_to_f16(x[c * k + i]));
+                }
+                y[c * rows + r] = float(sum);
+            }
+        }
+        return true;
+    }
     // Quantized GEMV: (w_u8, w_f16, x, y, k, rows); one program per row.
     // Batched: (w_u8, w_f16, x, y, k, rows, columns); grid (rows, ceil(columns / BLOCK)).
     if (name.rfind("flagos_mul_mat_q", 0) == 0) {

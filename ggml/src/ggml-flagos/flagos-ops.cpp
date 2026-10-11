@@ -251,6 +251,86 @@ const char * quant_name(flagos_quantized_matmul_kind kind) {
     }
 }
 
+// Byte offset into the call's workspace (flagos_kernel_call::in_workspace).
+flagos_rt_arg workspace_offset(uint64_t offset) {
+    flagos_rt_arg arg {};
+    arg.kind = FLAGOS_RT_ARG_PTR;
+    arg.value.ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(offset));
+    return arg;
+}
+
+// Smallest batch for which dequantizing the whole weight on every call is
+// worth it; GGML_FLAGOS_F16_PREFILL_MIN_COLUMNS overrides it, 0 disables
+// the path.
+int64_t f16_prefill_min_columns() {
+    static const int64_t value = [] {
+        const char * v = std::getenv("GGML_FLAGOS_F16_PREFILL_MIN_COLUMNS");
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(32);
+    }();
+    return value;
+}
+
+// Prefill through F16: dequantize the weight into the workspace
+// (flagos_dequant_<type>_f16, one program per quant block), then
+// flagos_mul_mat_f16_f32_batched, which rounds activations to F16 and uses
+// matrix instructions; grid (ceil(rows / tile_m), ceil(columns / tile_n)).
+// Per-call dequantization keeps memory at one weight, so it scales to
+// models whose F16 weights would not fit.
+bool plan_mul_mat_f16(const flagos_kernel_package & package, const ggml_tensor * op,
+                      const flagos_quantized_matmul_signature & sig, int32_t precision, flagos_kernel_call * call) {
+    const int64_t min_columns = f16_prefill_min_columns();
+    if (precision != GGML_PREC_DEFAULT || min_columns <= 0 || sig.columns < min_columns) {
+        return false;
+    }
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    const flagos_kernel_info * dequant =
+        package.find(std::string("flagos_dequant_") + quant_name(sig.weight_kind) + "_f16");
+    const int64_t elements = sig.k * sig.rows;
+    const int64_t block = ggml_blck_size(w->type);
+    if (dequant == nullptr || dequant->block_size != block ||
+        (dequant->argument_count >= 0 && dequant->argument_count != 3) ||
+        elements > INT32_MAX || int64_t(ggml_nbytes(w)) > INT32_MAX) {
+        return false;
+    }
+    // The workspace is 256-byte aligned and the weight starts at offset 0.
+    const std::initializer_list<flagos_kernel_fact> facts = {
+        { "k", sig.k }, { "rows", sig.rows }, { "columns", sig.columns },
+        { "align", common_alignment({ x, op }) },
+        { "bytes", std::max<int64_t>(largest_nbytes({ x, op }), elements * 2) },
+    };
+    auto usable = [&](const flagos_kernel_info * kern) {
+        return kern != nullptr && kern->tile_m > 0 && kern->tile_n > 0 &&
+            (kern->argument_count < 0 || kern->argument_count == 6) &&
+            (sig.columns + kern->tile_n - 1) / kern->tile_n <= 65535;
+    };
+    const char * gemm_name = "flagos_mul_mat_f16_f32_batched";
+    const flagos_kernel_info * gemm = package.select(gemm_name, facts);
+    if (!usable(gemm)) {
+        gemm = package.find(gemm_name);
+        if (!usable(gemm)) {
+            return false;
+        }
+    }
+    if (call == nullptr) {
+        return true;
+    }
+    set_call(call, gemm, (sig.rows + gemm->tile_m - 1) / gemm->tile_m,
+             { workspace_offset(0), ptr(x), ptr(op), i32(sig.k), i32(sig.rows), i32(sig.columns) });
+    call->grid[1] = static_cast<uint32_t>((sig.columns + gemm->tile_n - 1) / gemm->tile_n);
+    call->in_workspace[0] = true;
+    call->workspace_bytes = static_cast<uint64_t>(elements) * sizeof(uint16_t);
+    flagos_kernel_call::step & dq = call->before[call->n_before++];
+    dq.kernel = dequant;
+    dq.grid[0] = static_cast<uint32_t>(elements / block);
+    dq.n_args = 3;
+    dq.args[0] = ptr(w);
+    dq.args[1] = ptr(w);
+    dq.args[2] = workspace_offset(0);
+    dq.in_workspace[2] = true;
+    return true;
+}
+
 bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
     int32_t precision = 0;
     std::memcpy(&precision, op->op_params, sizeof(precision));
@@ -281,6 +361,9 @@ bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op,
             return false;
         }
         set_call(call, kernel, sig.rows, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
+        return true;
+    }
+    if (plan_mul_mat_f16(package, op, sig, precision, call)) {
         return true;
     }
     // Batched (prefill): grid (rows, ceil(columns / BLOCK)).

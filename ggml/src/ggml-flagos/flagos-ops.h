@@ -32,6 +32,24 @@ struct flagos_kernel_call {
     // capture records every launch.
     uint32_t repeat = 1;
     int64_t advance[FLAGOS_MAX_KERNEL_ARGS] = {};
+    // Device scratch the call needs, in bytes (0 for none). The executor
+    // provides a buffer of at least this size, owned by the core; a pointer
+    // argument with in_workspace[i] set holds a byte offset into it.
+    uint64_t workspace_bytes = 0;
+    bool in_workspace[FLAGOS_MAX_KERNEL_ARGS] = {};
+    // Launches issued before the main one, in order, under the same
+    // workspace rule and never repeated (e.g. dequantizing a weight into the
+    // workspace for an F16 GEMM).
+    struct step {
+        const flagos_kernel_info * kernel = nullptr;
+        uint32_t grid[3] = { 1, 1, 1 };
+        uint32_t n_args = 0;
+        flagos_rt_arg args[FLAGOS_MAX_KERNEL_ARGS] = {};
+        bool in_workspace[FLAGOS_MAX_KERNEL_ARGS] = {};
+    };
+    static constexpr uint32_t MAX_BEFORE = 2;
+    uint32_t n_before = 0;
+    step before[MAX_BEFORE];
 };
 
 // Ops that need no kernel (views and reshapes). graph_compute skips them.

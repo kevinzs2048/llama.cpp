@@ -266,6 +266,12 @@ struct rt_backend {
     uint64_t replays = 0;
     uint64_t recordings = 0;
     uint64_t updates = 0;
+    bool recording = false;
+    // Workspace for calls that need device scratch (flagos_kernel_call::
+    // workspace_bytes); grows on demand and is never shrunk.
+    flagos_rt_buffer_t workspace = nullptr;
+    char * workspace_base = nullptr;
+    uint64_t workspace_size = 0;
 };
 
 rt_backend * backend_of(ggml_backend_t backend) {
@@ -293,6 +299,9 @@ void backend_free(ggml_backend_t backend) {
     ctx->device->rt->stream_synchronize(ctx->stream);
     for (const auto & entry : ctx->captures) {
         ctx->device->rt->graph_destroy(entry.graph);
+    }
+    if (ctx->workspace != nullptr) {
+        ctx->device->rt->buffer_free(ctx->workspace);
     }
     if (ctx->stats && ctx->capture) {
         std::fprintf(stderr, "FlagOS %s: graph capture: %llu recorded, %llu updated in place, %llu launched\n",
@@ -322,6 +331,44 @@ void backend_synchronize(ggml_backend_t backend) {
 }
 
 bool launch_call(rt_backend * ctx, const flagos_kernel_call & call);
+
+// Make the workspace at least `bytes` large. Growing it frees the old
+// buffer, so the stream is drained first and recorded graphs, which hold
+// the old address, are dropped; it never happens while recording.
+char * ensure_workspace(rt_backend * ctx, uint64_t bytes) {
+    if (bytes <= ctx->workspace_size) {
+        return ctx->workspace_base;
+    }
+    rt_device * device = ctx->device;
+    const flagos_runtime_v1 * rt = device->rt;
+    if (ctx->recording) {
+        GGML_LOG_ERROR("FlagOS %s: workspace must grow while recording a graph\n", device->name.c_str());
+        return nullptr;
+    }
+    if (!rt_check(rt->stream_synchronize(ctx->stream), device, "stream_synchronize")) {
+        return nullptr;
+    }
+    for (const auto & entry : ctx->captures) {
+        rt->graph_destroy(entry.graph);
+    }
+    ctx->captures.clear();
+    if (ctx->workspace != nullptr) {
+        rt->buffer_free(ctx->workspace);
+        ctx->workspace = nullptr;
+        ctx->workspace_base = nullptr;
+        ctx->workspace_size = 0;
+    }
+    constexpr uint64_t granule = uint64_t(64) << 20;
+    const uint64_t size = (bytes + granule - 1) / granule * granule;
+    flagos_rt_buffer_t buffer = nullptr;
+    if (!rt_check(rt->buffer_alloc(device->handle, size, &buffer), device, "workspace buffer_alloc")) {
+        return nullptr;
+    }
+    ctx->workspace = buffer;
+    ctx->workspace_base = static_cast<char *>(rt->buffer_base(buffer));
+    ctx->workspace_size = size;
+    return ctx->workspace_base;
+}
 
 // Execute one node through the shared op adapter.
 bool compute_node(rt_backend * ctx, ggml_tensor * node) {
@@ -359,6 +406,22 @@ bool run_plan(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & 
         }
     }
     return true;
+}
+
+// Largest workspace any direct node of the plan needs.
+bool reserve_plan_workspace(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & plan) {
+    uint64_t bytes = 0;
+    for (const flagos_plan_step & step : plan.steps) {
+        if (step.kind == flagos_execution_kind::pattern) {
+            continue;
+        }
+        ggml_tensor * node = cgraph->nodes[step.candidate.node_indices[0]];
+        flagos_kernel_call call;
+        if (!ggml_is_empty(node) && !flagos_op_is_noop(node) && flagos_op_plan(ctx->device->package, node, &call)) {
+            bytes = std::max(bytes, call.workspace_bytes);
+        }
+    }
+    return bytes == 0 || ensure_workspace(ctx, bytes) != nullptr;
 }
 
 // Graph capture policy. Recordings are kept per (structure, bindings):
@@ -417,10 +480,17 @@ bool run_captured(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_pla
             return false;
         }
     }
+    // Recorded launches keep the workspace address, so size it before
+    // recording; growing it later drops every recording.
+    if (!reserve_plan_workspace(ctx, cgraph, plan)) {
+        return false;
+    }
     if (rt->graph_capture_begin(ctx->stream) != FLAGOS_RT_OK) {
         return false;
     }
+    ctx->recording = true;
     const bool recorded = run_plan(ctx, cgraph, plan);
+    ctx->recording = false;
     flagos_rt_graph_t graph = nullptr;
     const bool ended = update
         ? rt->graph_capture_end_update(ctx->stream, lru_same->graph, &graph) == FLAGOS_RT_OK && graph != nullptr
@@ -580,6 +650,13 @@ bool kernel_fits_device(const rt_device * device, const flagos_kernel_info & k) 
 }
 
 bool kernel_launchable(const rt_device * device, const flagos_kernel_call & call) {
+    for (uint32_t s = 0; s < call.n_before; ++s) {
+        const flagos_kernel_call::step & step = call.before[s];
+        if (step.kernel == nullptr || uint32_t(step.kernel->argument_count) != step.n_args ||
+            !kernel_fits_device(device, *step.kernel)) {
+            return false;
+        }
+    }
     return call.kernel != nullptr && uint32_t(call.kernel->argument_count) == call.n_args &&
         kernel_fits_device(device, *call.kernel);
 }
@@ -609,8 +686,82 @@ flagos_lowering_choice fusion_query(void * user_data, const ggml_cgraph * graph,
     return choice;
 }
 
+bool env_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// Debug aids for bringing up a runtime (both off by default):
+//  GGML_FLAGOS_TRACE_LAUNCH=1 prints every launch (kernel, grid, scalar
+//    arguments) to stderr before it is issued, flushed, so after a device
+//    hang the last line names the kernel that never finished.
+//  GGML_FLAGOS_SYNC_LAUNCH=1 synchronizes after every launch and reports
+//    the kernel whose execution failed.
+bool launch_once(rt_backend * ctx, flagos_rt_kernel_t kernel, const flagos_rt_launch & launch, const flagos_kernel_call & call) {
+    static const bool trace = env_flag("GGML_FLAGOS_TRACE_LAUNCH");
+    static const bool sync = env_flag("GGML_FLAGOS_SYNC_LAUNCH");
+    rt_device * device = ctx->device;
+    if (trace) {
+        std::string text;
+        char buffer[64];
+        for (uint32_t i = 0; i < launch.n_args; ++i) {
+            const flagos_rt_arg & a = launch.args[i];
+            switch (a.kind) {
+                case FLAGOS_RT_ARG_PTR: std::snprintf(buffer, sizeof(buffer), " %p", a.value.ptr); break;
+                case FLAGOS_RT_ARG_I32: std::snprintf(buffer, sizeof(buffer), " %d", a.value.i32); break;
+                case FLAGOS_RT_ARG_U32: std::snprintf(buffer, sizeof(buffer), " %u", a.value.u32); break;
+                case FLAGOS_RT_ARG_I64: std::snprintf(buffer, sizeof(buffer), " %lld", (long long) a.value.i64); break;
+                case FLAGOS_RT_ARG_F32: std::snprintf(buffer, sizeof(buffer), " %g", a.value.f32); break;
+                default:                std::snprintf(buffer, sizeof(buffer), " %g", a.value.f64); break;
+            }
+            text += buffer;
+        }
+        std::fprintf(stderr, "FlagOS launch %s grid=%u,%u,%u args:%s\n", call.kernel->name.c_str(),
+                     launch.grid[0], launch.grid[1], launch.grid[2], text.c_str());
+        std::fflush(stderr);
+    }
+    if (!rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str())) {
+        return false;
+    }
+    if (sync && !rt_check(device->rt->stream_synchronize(ctx->stream), device,
+                          ("execution of " + call.kernel->name).c_str())) {
+        return false;
+    }
+    return true;
+}
+
 bool launch_call(rt_backend * ctx, const flagos_kernel_call & call) {
     rt_device * device = ctx->device;
+    char * workspace = nullptr;
+    if (call.workspace_bytes > 0 && (workspace = ensure_workspace(ctx, call.workspace_bytes)) == nullptr) {
+        return false;
+    }
+    auto resolve = [workspace](flagos_rt_arg * args, const bool * in_workspace, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (in_workspace[i]) {
+                GGML_ASSERT(workspace != nullptr && args[i].kind == FLAGOS_RT_ARG_PTR);
+                args[i].value.ptr = workspace + reinterpret_cast<uintptr_t>(args[i].value.ptr);
+            }
+        }
+    };
+    for (uint32_t s = 0; s < call.n_before; ++s) {
+        const flagos_kernel_call::step & step = call.before[s];
+        flagos_kernel_call one;
+        one.kernel = step.kernel;
+        std::memcpy(one.grid, step.grid, sizeof(one.grid));
+        one.n_args = step.n_args;
+        std::memcpy(one.args, step.args, sizeof(one.args));
+        resolve(one.args, step.in_workspace, one.n_args);
+        flagos_rt_kernel_t kernel = resolve_kernel(device, one);
+        flagos_rt_launch launch {};
+        launch.struct_size = sizeof(launch);
+        std::memcpy(launch.grid, one.grid, sizeof(launch.grid));
+        launch.n_args = one.n_args;
+        launch.args = one.args;
+        if (kernel == nullptr || !launch_once(ctx, kernel, launch, one)) {
+            return false;
+        }
+    }
     flagos_rt_kernel_t kernel = resolve_kernel(device, call);
     if (kernel == nullptr) {
         return false;
@@ -618,25 +769,31 @@ bool launch_call(rt_backend * ctx, const flagos_kernel_call & call) {
     if (ctx->stats && !call.kernel->contract.empty()) {
         ++ctx->executed["variant:" + call.kernel->name];
     }
+    if (ctx->stats && call.n_before > 0) {
+        ++ctx->executed["variant:" + call.before[0].kernel->name + "+" + call.kernel->name];
+    }
+    flagos_rt_arg base[FLAGOS_MAX_KERNEL_ARGS];
+    std::memcpy(base, call.args, sizeof(base));
+    resolve(base, call.in_workspace, call.n_args);
     flagos_rt_launch launch {};
     launch.struct_size = sizeof(launch);
     std::memcpy(launch.grid, call.grid, sizeof(launch.grid));
     launch.n_args = call.n_args;
-    launch.args = call.args;
+    launch.args = base;
     if (call.repeat <= 1) {
-        return rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str());
+        return launch_once(ctx, kernel, launch, call);
     }
     flagos_rt_arg args[FLAGOS_MAX_KERNEL_ARGS];
-    std::memcpy(args, call.args, sizeof(args));
+    std::memcpy(args, base, sizeof(args));
     launch.args = args;
     for (uint32_t r = 0; r < call.repeat; ++r) {
         for (uint32_t i = 0; i < call.n_args; ++i) {
             if (call.advance[i] != 0) {
-                GGML_ASSERT(call.args[i].kind == FLAGOS_RT_ARG_PTR);
-                args[i].value.ptr = static_cast<char *>(call.args[i].value.ptr) + int64_t(r) * call.advance[i];
+                GGML_ASSERT(base[i].kind == FLAGOS_RT_ARG_PTR);
+                args[i].value.ptr = static_cast<char *>(base[i].value.ptr) + int64_t(r) * call.advance[i];
             }
         }
-        if (!rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str())) {
+        if (!launch_once(ctx, kernel, launch, call)) {
             return false;
         }
     }
