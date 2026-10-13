@@ -680,14 +680,41 @@ bool plan_moe_weighted_sum(const flagos_kernel_package & package, const ggml_cgr
     if (!distinct(out, weights)) {
         // GGML reused the dead routing weights for the output. One token:
         // flagos_moe_weighted_sum_token_f32 reads every weight before it
-        // writes (grid (n_tokens)); with more tokens a program could
-        // overwrite another token's weights, so the pattern is declined.
+        // writes; with more tokens a program could overwrite another
+        // token's weights, so the weights are copied first.
         const flagos_kernel_info * kernel = package.find("flagos_moe_weighted_sum_token_f32");
-        if (n_tokens != 1 || kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 5) ||
-            kernel->block_size <= 0 || kernel->tile_k < n_used) {
+        if (n_tokens == 1 && kernel != nullptr && (kernel->argument_count < 0 || kernel->argument_count == 5) &&
+            kernel->block_size > 0 && kernel->tile_k >= n_used) {
+            set_call(call, kernel, n_tokens, { ptr(experts), ptr(weights), ptr(out), i32(n_embd), i32(n_used) });
+            return true;
+        }
+        // More tokens: copy the weights into the workspace first
+        // (flagos_scale_f32 with scale 1, bias 0), then sum from the copy.
+        const int64_t n_weights = n_used * n_tokens;
+        const flagos_kernel_info * copy = find_elementwise(package, "flagos_scale_f32", 5, n_weights);
+        kernel = package.find("flagos_moe_weighted_sum_f32");
+        if (copy == nullptr || kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 5) ||
+            kernel->block_size <= 0) {
             return false;
         }
-        set_call(call, kernel, n_tokens, { ptr(experts), ptr(weights), ptr(out), i32(n_embd), i32(n_used) });
+        if (call == nullptr) {
+            return true;
+        }
+        set_call(call, kernel, (n_embd + kernel->block_size - 1) / kernel->block_size,
+                 { ptr(experts), workspace_offset(0), ptr(out), i32(n_embd), i32(n_used) });
+        call->grid[1] = static_cast<uint32_t>(n_tokens);
+        call->in_workspace[1] = true;
+        call->workspace_bytes = uint64_t(n_weights) * sizeof(float);
+        flagos_kernel_call::step & cp = call->before[call->n_before++];
+        cp.kernel = copy;
+        cp.grid[0] = static_cast<uint32_t>(programs_for(copy, n_weights));
+        cp.n_args = 5;
+        cp.args[0] = ptr(weights);
+        cp.args[1] = workspace_offset(0);
+        cp.args[2] = f32(1.0f);
+        cp.args[3] = f32(0.0f);
+        cp.args[4] = i32(n_weights);
+        cp.in_workspace[1] = true;
         return true;
     }
     const flagos_kernel_info * kernel = package.find("flagos_moe_weighted_sum_f32");
