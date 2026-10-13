@@ -314,6 +314,146 @@ inline bool run(const std::string & name, const program & p) {
         }
         return true;
     }
+    if (name.rfind("flagos_flash_decode_splitkv_partial_f32_f16_h", 0) == 0 ||
+        name.rfind("flagos_flash_decode_splitkv_grouped_", 0) == 0) {
+        // (q, k, v, mask, m, l, a, n_kv, gqa, splits, keys_per_split, sqt, sqh, skt, skh, svt, svh, scale)
+        // Per head and split: online softmax over the split's keys with q and the
+        // probabilities rounded to F16; m = running max, l = sum, a = weighted values.
+        // Per-head kernels: grid (heads, splits). Grouped: grid (kv heads, splits[, value chunks]),
+        // all query heads of the group per program (value chunk 0 writes the whole row).
+        const bool grouped = name.rfind("flagos_flash_decode_splitkv_grouped_", 0) == 0;
+        const int D = name.find("_h256") != std::string::npos ? 256 : 128;
+        if (grouped && p.pid_z != 0) return true;
+        auto f16r = [](float x) { return f16_to_f32(f32_to_f16(x)); };
+        const float * q = F(0);
+        const auto * k = arg<const uint16_t *>(p, 1);
+        const auto * v = arg<const uint16_t *>(p, 2);
+        const auto * mask = arg<const uint16_t *>(p, 3);
+        float * pm = F(4); float * pl = F(5); float * pa = F(6);
+        const int32_t n_kv = I(7), gqa = I(8), splits = I(9), kps = I(10);
+        const int32_t sqh = I(12), skt = I(13), skh = I(14), svt = I(15), svh = I(16);
+        const float scale = arg<float>(p, 17);
+        const int64_t part = p.pid_y;
+        const int64_t h0 = grouped ? int64_t(p.pid_x) * gqa : p.pid_x;
+        const int64_t h1 = grouped ? h0 + gqa : h0 + 1;
+        const int64_t begin = part * kps, end = std::min<int64_t>(begin + kps, n_kv);
+        for (int64_t h = h0; h < h1; ++h) {
+            const int64_t kvh = h / gqa;
+            std::vector<float> Q(D), A(D, 0.0f);
+            for (int d = 0; d < D; ++d) Q[d] = f16r(q[h * sqh + d]);
+            float high = -INFINITY, den = 0.0f;
+            for (int64_t key = begin; key < end; ++key) {
+                float dot = 0.0f;
+                for (int d = 0; d < D; ++d) dot += Q[d] * f16_to_f32(k[d + kvh * skh + key * skt]);
+                const float logit = dot * scale + f16_to_f32(mask[key]);
+                if (logit == -INFINITY) continue;
+                const float nh = std::max(high, logit);
+                const float carry = high == -INFINITY ? 0.0f : std::exp(high - nh);
+                const float pr = std::exp(logit - nh);
+                for (int d = 0; d < D; ++d) A[d] = carry * A[d] + f16r(pr) * f16_to_f32(v[d + kvh * svh + key * svt]);
+                den = carry * den + pr;
+                high = nh;
+            }
+            const int64_t slot = h * splits + part;
+            pm[slot] = high; pl[slot] = den;
+            for (int d = 0; d < D; ++d) pa[slot * D + d] = A[d];
+        }
+        return true;
+    }
+    if (name.rfind("flagos_flash_decode_splitkv_merge_f32_h", 0) == 0) {
+        // (m, l, a, out, splits, stride_out_token, stride_out_head); one program per head
+        const int D = name.find("_h256") != std::string::npos ? 256 : 128;
+        const float * pm = F(0); const float * pl = F(1); const float * pa = F(2); float * out = F(3);
+        const int32_t splits = I(4), soh = I(6);
+        const int64_t h = p.pid_x;
+        float high = -INFINITY;
+        for (int32_t s = 0; s < splits; ++s) high = std::max(high, pm[h * splits + s]);
+        const float safe = high == -INFINITY ? 0.0f : high;
+        std::vector<float> num(D, 0.0f);
+        float den = 0.0f;
+        for (int32_t s = 0; s < splits; ++s) {
+            const int64_t slot = h * splits + s;
+            const float w = pl[slot] > 0.0f ? std::exp(pm[slot] - safe) : 0.0f;
+            den += w * pl[slot];
+            for (int d = 0; d < D; ++d) num[d] += w * pa[slot * D + d];
+        }
+        for (int d = 0; d < D; ++d) out[h * soh + d] = num[d] / (den > 0.0f ? den : 1.0f);
+        return true;
+    }
+    if (name == "flagos_ffn_swiglu_q4_0_f32_decode" || name == "flagos_ffn_swiglu_q4_k_f32_decode") {
+        // (gate_u8, gate_f16, up_u8, up_f16, x, out, k, rows); block rows per program,
+        // out[row] = silu(gate[row] . x) * (up[row] . x)
+        quant_format f;
+        if (!quant_format_of(name, f)) return false;
+        const auto * gw = arg<const uint8_t *>(p, 0);
+        const auto * uw = arg<const uint8_t *>(p, 2);
+        const float * x = F(4);
+        float * out = F(5);
+        const int32_t k = I(6), rows = I(7);
+        int64_t r0, r1;
+        range(p, rows, r0, r1);
+        for (int64_t row = r0; row < r1; ++row) {
+            float g = 0.0f, u = 0.0f;
+            quant_dot_rows(f, gw, x, &g - row, k, rows, row, 0);
+            quant_dot_rows(f, uw, x, &u - row, k, rows, row, 0);
+            out[row] = g / (1.0f + std::exp(-g)) * u;
+        }
+        return true;
+    }
+    if (name == "flagos_gated_delta_net_scalar_f32_cache" || name == "flagos_gated_delta_net_scalar_f32_cache_only" ||
+        name == "flagos_gated_delta_net_scalar_f32_cache_only_decode" ||
+        name == "flagos_gated_delta_net_scalar_f32_cache_gather") {
+        // _cache*: (q, k, v, g, beta, state, out, cache, Sd, H, T, B, sq1..3, sv1..3, sb1..3, q_heads, q_seq_ratio,
+        //           K, scale, cache_slot_stride); snapshot slots go to the cache (and to out for _cache)
+        // _cache_gather: (q, k, v, g, beta, cache_src, ids, out, cache_dst, Sd, H, T, B, sq1..3, sv1..3, sb1..3,
+        //           q_heads, q_seq_ratio, scale, src_row_stride); state from cache_src row ids[seq], final state to cache_dst
+        const bool gather = name == "flagos_gated_delta_net_scalar_f32_cache_gather";
+        const bool to_out = name == "flagos_gated_delta_net_scalar_f32_cache";
+        const int o = gather ? 9 : 8;
+        const int32_t Sd = I(o), H = I(o + 1), T = I(o + 2), B = I(o + 3);
+        const int32_t sq1 = I(o + 4), sq2 = I(o + 5), sq3 = I(o + 6), sv1 = I(o + 7), sv2 = I(o + 8), sv3 = I(o + 9);
+        const int32_t sb1 = I(o + 10), sb2 = I(o + 11), sb3 = I(o + 12), q_heads = I(o + 13), ratio = I(o + 14);
+        const int32_t K = gather ? 1 : I(o + 15);
+        const float scale = arg<float>(p, gather ? o + 15 : o + 16);
+        const int64_t slot_stride = gather ? 0 : I(o + 17);
+        const int64_t head = p.pid_x, seq = p.pid_y;
+        const int64_t cols = p.tile_n;
+        const int64_t j0 = int64_t(p.pid_z) * cols, j1 = std::min<int64_t>(j0 + cols, Sd);
+        const int64_t qh = head % q_heads, qs = seq / ratio;
+        const int64_t sb = (seq * H + head) * int64_t(Sd) * Sd;
+        const int64_t attn_elems = int64_t(Sd) * H * T * B, snap_stride = int64_t(Sd) * Sd * H * B;
+        const float * q = F(0); const float * k = F(1); const float * v = F(2);
+        const float * g = F(3); const float * beta = F(4);
+        const float * state = gather
+            ? F(5) + int64_t(arg<const int32_t *>(p, 6)[seq]) * I(o + 16) + head * int64_t(Sd) * Sd
+            : F(5) + sb;
+        float * out = gather ? F(7) : F(6);
+        float * cache = gather ? F(8) : F(7);
+        std::vector<float> M(size_t(j1 - j0) * Sd);
+        for (int64_t j = j0; j < j1; ++j) for (int32_t i = 0; i < Sd; ++i) M[(j - j0) * Sd + i] = state[j * Sd + i];
+        for (int32_t t = 0; t < T; ++t) {
+            const int64_t qb = qs * sq3 + int64_t(t) * sq2 + qh * sq1;
+            const int64_t gb = seq * sb3 + int64_t(t) * sb2 + head * sb1;
+            const float decay = std::exp(g[gb]), bt = beta[gb];
+            for (int64_t j = j0; j < j1; ++j) {
+                float * m = &M[(j - j0) * Sd];
+                float pk = 0.0f;
+                for (int32_t i = 0; i < Sd; ++i) { m[i] *= decay; pk += m[i] * k[qb + i]; }
+                const float d = (v[seq * sv3 + int64_t(t) * sv2 + head * sv1 + j] - pk) * bt;
+                float a = 0.0f;
+                for (int32_t i = 0; i < Sd; ++i) { m[i] += d * k[qb + i]; a += m[i] * q[qb + i]; }
+                out[((seq * T + t) * H + head) * Sd + j] = a * scale;
+                const int32_t slot = T - 1 - t;
+                if (slot < K) {
+                    for (int32_t i = 0; i < Sd; ++i) {
+                        cache[slot * slot_stride + sb + j * Sd + i] = m[i];
+                        if (to_out) out[attn_elems + slot * snap_stride + sb + j * Sd + i] = m[i];
+                    }
+                }
+            }
+        }
+        return true;
+    }
     if (name == "flagos_gated_delta_net_scalar_f32") {
         // (q, k, v, g, beta, state, out, Sd, H, T, B, sq1..3, sv1..3, sb1..3, q_heads, q_seq_ratio, K, scale)
         const int32_t Sd = I(7), H = I(8), T = I(9), B = I(10);
