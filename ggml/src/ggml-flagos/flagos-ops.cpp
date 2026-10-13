@@ -314,6 +314,14 @@ bool plan_mul_mat_f16(const flagos_kernel_package & package, const ggml_tensor *
             return false;
         }
     }
+    // flagos_dequant_<type>_f16_blocks(w_u8, w_f16, out, n_blocks) covers
+    // block_size / (quant block) blocks per program, bounded by n_blocks.
+    const flagos_kernel_info * dq_blocks =
+        package.select(std::string("flagos_dequant_") + quant_name(sig.weight_kind) + "_f16_blocks", facts);
+    if (dq_blocks != nullptr && ((dq_blocks->argument_count >= 0 && dq_blocks->argument_count != 4) ||
+        dq_blocks->block_size <= 0 || dq_blocks->block_size % block != 0)) {
+        dq_blocks = nullptr;
+    }
     if (call == nullptr) {
         return true;
     }
@@ -323,13 +331,20 @@ bool plan_mul_mat_f16(const flagos_kernel_package & package, const ggml_tensor *
     call->in_workspace[0] = true;
     call->workspace_bytes = static_cast<uint64_t>(elements) * sizeof(uint16_t);
     flagos_kernel_call::step & dq = call->before[call->n_before++];
-    dq.kernel = dequant;
-    dq.grid[0] = static_cast<uint32_t>(elements / block);
-    dq.n_args = 3;
     dq.args[0] = ptr(w);
     dq.args[1] = ptr(w);
     dq.args[2] = workspace_offset(0);
     dq.in_workspace[2] = true;
+    if (dq_blocks != nullptr) {
+        dq.kernel = dq_blocks;
+        dq.grid[0] = static_cast<uint32_t>((elements + dq_blocks->block_size - 1) / dq_blocks->block_size);
+        dq.n_args = 4;
+        dq.args[3] = i32(elements / block);
+    } else {
+        dq.kernel = dequant;
+        dq.grid[0] = static_cast<uint32_t>(elements / block);
+        dq.n_args = 3;
+    }
     return true;
 }
 
