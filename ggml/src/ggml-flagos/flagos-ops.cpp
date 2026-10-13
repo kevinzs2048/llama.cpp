@@ -1267,6 +1267,16 @@ bool plan_mul_mat_f32(const flagos_kernel_package & package, const ggml_tensor *
         kernel->tile_m <= 0 || kernel->tile_n <= 0) {
         return false;
     }
+    // A variant may take another tiling (e.g. one program per output for a
+    // single column, manifest "when": columns max).
+    const flagos_kernel_info * chosen = package.select("flagos_mul_mat_f32_f32_strided_batched_ieee", {
+        { "k", w->ne[0] }, { "rows", op->ne[0] }, { "columns", op->ne[1] },
+        { "align", common_alignment({ w, x, op }) }, { "bytes", largest_nbytes({ w, x, op }) },
+    });
+    if (chosen != nullptr && (chosen->argument_count < 0 || chosen->argument_count == 15) &&
+        chosen->tile_m > 0 && chosen->tile_n > 0 && (op->ne[1] + chosen->tile_n - 1) / chosen->tile_n <= 65535) {
+        kernel = chosen;
+    }
     const int64_t gx = (op->ne[0] + kernel->tile_m - 1) / kernel->tile_m;
     const int64_t gy = (op->ne[1] + kernel->tile_n - 1) / kernel->tile_n;
     if (gx > INT32_MAX || gy > 65535) {
@@ -1279,6 +1289,86 @@ bool plan_mul_mat_f32(const flagos_kernel_package & package, const ggml_tensor *
         call->grid[1] = static_cast<uint32_t>(gy);
         call->grid[2] = static_cast<uint32_t>(op->ne[2] * op->ne[3]);
     }
+    return true;
+}
+
+// Smallest token count for the grouped MUL_MAT_ID path;
+// GGML_FLAGOS_MOE_GROUPED_MIN_TOKENS overrides it, 0 disables the path.
+int64_t moe_grouped_min_tokens() {
+    static const int64_t value = [] {
+        const char * v = std::getenv("GGML_FLAGOS_MOE_GROUPED_MIN_TOKENS");
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(32);
+    }();
+    return value;
+}
+
+// Grouped MUL_MAT_ID for many tokens, after plan_mul_mat_id validated the
+// op: flagos_moe_route_i32 lists each expert's (pick, token) pairs in the
+// workspace (counts at 0, lists at list_offset, cap = picks * tokens per
+// expert), then flagos_mul_mat_id_<type>_f32_grouped multiplies each
+// expert's weight tile by its pairs, grid (ceil(rows / tile_m), experts).
+bool plan_mul_mat_id_grouped(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    const ggml_tensor * ids = op->src[2];
+    const int64_t picks = ids->ne[0], tokens = ids->ne[1], experts = w->ne[2];
+    const int64_t min_tokens = moe_grouped_min_tokens();
+    if (min_tokens <= 0 || tokens < min_tokens) {
+        return false;
+    }
+    const char * type = nullptr;
+    switch (w->type) {
+        case GGML_TYPE_Q4_0: type = "q4_0"; break;
+        case GGML_TYPE_Q4_1: type = "q4_1"; break;
+        case GGML_TYPE_Q8_0: type = "q8_0"; break;
+        default: return false;
+    }
+    const int64_t cap = picks * tokens;
+    const uint64_t list_offset = (uint64_t(experts) * sizeof(int32_t) + 255) & ~uint64_t(255);
+    const uint64_t bytes = list_offset + uint64_t(experts) * uint64_t(cap) * sizeof(int32_t);
+    if (experts > 65535 || cap > INT32_MAX / experts || bytes > uint64_t(INT32_MAX)) {
+        return false;
+    }
+    const flagos_kernel_info * route = package.find("flagos_moe_route_i32");
+    const std::initializer_list<flagos_kernel_fact> facts = {
+        { "k", w->ne[0] }, { "rows", w->ne[1] }, { "columns", tokens },
+        { "align", common_alignment({ w, x, op }) }, { "bytes", largest_nbytes({ w, x, op }) },
+    };
+    const std::string name = std::string("flagos_mul_mat_id_") + type + "_f32_grouped";
+    const flagos_kernel_info * gemm = package.select(name, facts);
+    if (gemm == nullptr) {
+        gemm = package.find(name);
+    }
+    if (route == nullptr || (route->argument_count >= 0 && route->argument_count != 8) ||
+        gemm == nullptr || (gemm->argument_count >= 0 && gemm->argument_count != 15) || gemm->tile_m <= 0 ||
+        (w->ne[1] + gemm->tile_m - 1) / gemm->tile_m > INT32_MAX) {
+        return false;
+    }
+    if (call == nullptr) {
+        return true;
+    }
+    set_call(call, gemm, (w->ne[1] + gemm->tile_m - 1) / gemm->tile_m,
+             { ptr(w), ptr(w), ptr(x), workspace_offset(list_offset), workspace_offset(0), ptr(op), i32(w->ne[0]),
+               i32(w->ne[1]), i32(picks), i32(x->ne[1]), i32(w->nb[1]), i32(w->nb[2]), i32(x->nb[1] / 4),
+               i32(x->nb[2] / 4), i32(cap) });
+    call->grid[1] = static_cast<uint32_t>(experts);
+    call->in_workspace[3] = true;
+    call->in_workspace[4] = true;
+    call->workspace_bytes = bytes;
+    flagos_kernel_call::step & rt = call->before[call->n_before++];
+    rt.kernel = route;
+    rt.grid[0] = static_cast<uint32_t>(experts);
+    rt.n_args = 8;
+    rt.args[0] = ptr(ids);
+    rt.args[1] = workspace_offset(list_offset);
+    rt.args[2] = workspace_offset(0);
+    rt.args[3] = i32(picks);
+    rt.args[4] = i32(tokens);
+    rt.args[5] = i32(ids->nb[0] / 4);
+    rt.args[6] = i32(ids->nb[1] / 4);
+    rt.args[7] = i32(cap);
+    rt.in_workspace[1] = true;
+    rt.in_workspace[2] = true;
     return true;
 }
 
@@ -1340,8 +1430,22 @@ bool plan_mul_mat_id(const flagos_kernel_package & package, const ggml_tensor * 
             (kernel->argument_count >= 0 && kernel->argument_count != 17) || kernel->block_size != qk) {
             return false;
         }
+        if (plan_mul_mat_id_grouped(package, op, call)) {
+            return true;
+        }
+        // Decode: a package may offer variants of the routed kernel (manifest "when").
+        const std::initializer_list<flagos_kernel_fact> facts = {
+            { "k", w->ne[0] }, { "rows", w->ne[1] }, { "columns", tokens },
+            { "align", common_alignment({ w, x, op }) }, { "bytes", largest_nbytes({ w, x, op }) },
+        };
+        const flagos_kernel_info * chosen = package.select(name, facts);
+        if (chosen != nullptr && (chosen->argument_count < 0 || chosen->argument_count == 17) && chosen->block_size == qk) {
+            kernel = chosen;
+        }
+        // tile_m rows per program (1 for the base kernels).
+        const int64_t tile_m = std::max<int64_t>(kernel->tile_m, 1);
         if (call != nullptr) {
-            set_call(call, kernel, w->ne[1], { ptr(w), ptr(w), ptr(x), ptr(ids), ptr(op), i32(w->ne[0]), i32(w->ne[1]),
+            set_call(call, kernel, (w->ne[1] + tile_m - 1) / tile_m, { ptr(w), ptr(w), ptr(x), ptr(ids), ptr(op), i32(w->ne[0]), i32(w->ne[1]),
                      i32(picks), i32(tokens), i32(x->ne[1]), i32(w->ne[2]), i32(w->nb[1]), i32(w->nb[2]),
                      i32(x->nb[1] / 4), i32(x->nb[2] / 4), i32(ids->nb[0] / 4), i32(ids->nb[1] / 4) });
             call->grid[1] = static_cast<uint32_t>(picks * tokens);
