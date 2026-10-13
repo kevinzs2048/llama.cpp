@@ -1222,6 +1222,99 @@ bool plan_rope(const flagos_kernel_package & package, const ggml_tensor * op, fl
 // Neither kernel has a sequence dimension. Several KV streams (ne[3] > 1:
 // parallel sequences with a non-unified cache) are covered by repeating the
 // launch per stream; K/V and the mask may also be shared (ne[3] == 1).
+// Smallest KV length for split-KV decode; GGML_FLAGOS_FA_SPLITKV_MIN_KV
+// overrides it, 0 disables the path.
+int64_t fa_splitkv_min_kv() {
+    static const int64_t value = [] {
+        const char * v = std::getenv("GGML_FLAGOS_FA_SPLITKV_MIN_KV");
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(512);
+    }();
+    return value;
+}
+
+// Split-KV FA decode, after plan_flash_attn validated the op: a partial
+// kernel scores each of `splits` KV ranges per head into the workspace
+// (running max, sum, weighted values), then
+// flagos_flash_decode_splitkv_merge_f32_h<D>(m, l, a, out, splits, sot, soh)
+// combines them, grid (heads). Partial kernels (18 arguments: q, k, v,
+// mask, m, l, a, n_kv, gqa, splits, keys_per_split, strides, scale):
+// flagos_flash_decode_splitkv_grouped_f32_f16_h<D>_g<gqa>, grid (kv heads,
+// splits), reads each KV head once for its whole query group; otherwise
+// flagos_flash_decode_splitkv_partial_f32_f16_h<D>, grid (heads, splits).
+bool plan_flash_attn_splitkv(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    const int64_t D = q->ne[0], Hq = q->ne[2], n_kv = k->ne[1], Hkv = k->ne[2];
+    const int64_t gqa = Hq / Hkv;
+    const int64_t min_kv = fa_splitkv_min_kv();
+    if (min_kv <= 0 || n_kv < min_kv || mask->nb[0] != 2) {
+        return false;
+    }
+    const std::string dim = std::to_string(D);
+    // Variants may merge more splits (block_size) or tile the partial differently.
+    // kv_align: q/k/v/mask pointer alignment (bytes); kv_stride: gcd of the
+    // K/V token/head and Q head strides (elements), for vector-load variants.
+    const int64_t kv_stride = std::gcd(std::gcd(int64_t(k->nb[1] / 2), int64_t(k->nb[2] / 2)),
+                                       std::gcd(std::gcd(int64_t(v->nb[1] / 2), int64_t(v->nb[2] / 2)),
+                                                int64_t(q->nb[2] / 4)));
+    const std::initializer_list<flagos_kernel_fact> facts = {
+        { "n_kv", n_kv }, { "heads", Hq }, { "gqa", gqa },
+        { "kv_align", common_alignment({ q, k, v, mask }) }, { "kv_stride", kv_stride },
+    };
+    const flagos_kernel_info * merge = package.select("flagos_flash_decode_splitkv_merge_f32_h" + dim, facts);
+    // ..._grouped_dv_..._h<D>_g<gqa> additionally splits the value columns:
+    // grid (kv heads, splits, D / tile_n), tile_n value columns per program.
+    const flagos_kernel_info * partial =
+        package.select("flagos_flash_decode_splitkv_grouped_dv_f32_f16_h" + dim + "_g" + std::to_string(gqa), facts);
+    const bool value_chunks = partial != nullptr && partial->tile_k == D && partial->tile_m >= gqa &&
+        partial->tile_n > 0 && D % partial->tile_n == 0 && (partial->argument_count < 0 || partial->argument_count == 18);
+    if (!value_chunks) {
+        partial = package.select("flagos_flash_decode_splitkv_grouped_f32_f16_h" + dim + "_g" + std::to_string(gqa), facts);
+    }
+    const bool grouped = value_chunks || (partial != nullptr && partial->tile_k == D && partial->tile_m >= gqa &&
+        (partial->argument_count < 0 || partial->argument_count == 18));
+    if (!grouped) {
+        partial = package.select("flagos_flash_decode_splitkv_partial_f32_f16_h" + dim, facts);
+    }
+    if (merge == nullptr || partial == nullptr || (merge->argument_count >= 0 && merge->argument_count != 7) ||
+        (partial->argument_count >= 0 && partial->argument_count != 18) || merge->tile_k != D ||
+        partial->tile_k != D || merge->block_size < 2) {
+        return false;
+    }
+    const int64_t splits = std::min<int64_t>(merge->block_size, std::max<int64_t>(2, n_kv / 256));
+    const int64_t keys_per_split = (n_kv + splits - 1) / splits;
+    const uint64_t slots = uint64_t(Hq) * uint64_t(splits);
+    const uint64_t l_offset = (slots * sizeof(float) + 255) & ~uint64_t(255);
+    const uint64_t a_offset = l_offset + l_offset;
+    if (call == nullptr) {
+        return true;
+    }
+    float scale = 0.0f;
+    std::memcpy(&scale, op->op_params, sizeof(scale));
+    set_call(call, merge, Hq, { workspace_offset(0), workspace_offset(l_offset), workspace_offset(a_offset), ptr(op),
+             i32(splits), i32(op->nb[2] / 4), i32(op->nb[1] / 4) });
+    call->in_workspace[0] = call->in_workspace[1] = call->in_workspace[2] = true;
+    call->workspace_bytes = a_offset + slots * uint64_t(D) * sizeof(float);
+    flagos_kernel_call::step & st = call->before[call->n_before++];
+    st.kernel = partial;
+    st.grid[0] = static_cast<uint32_t>(grouped ? Hkv : Hq);
+    st.grid[1] = static_cast<uint32_t>(splits);
+    st.grid[2] = static_cast<uint32_t>(value_chunks ? D / partial->tile_n : 1);
+    st.n_args = 18;
+    const flagos_rt_arg args[18] = {
+        ptr(q), ptr(k), ptr(v), ptr(mask), workspace_offset(0), workspace_offset(l_offset), workspace_offset(a_offset),
+        i32(n_kv), i32(gqa), i32(splits), i32(keys_per_split), i32(q->nb[1] / 4), i32(q->nb[2] / 4),
+        i32(k->nb[1] / 2), i32(k->nb[2] / 2), i32(v->nb[1] / 2), i32(v->nb[2] / 2), f32(scale),
+    };
+    for (int i = 0; i < 18; ++i) {
+        st.args[i] = args[i];
+    }
+    st.in_workspace[4] = st.in_workspace[5] = st.in_workspace[6] = true;
+    return true;
+}
+
 bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
     const ggml_tensor * q = op->src[0];
     const ggml_tensor * k = op->src[1];
@@ -1253,7 +1346,8 @@ bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * 
     }
     const bool decode = n_q == 1;
     if (decode) {
-        if (mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[2] != 1 ||
+        // Decode reads mask row 0; rows past it are GGML_KQ_MASK_PAD padding.
+        if (mask->ne[0] != n_kv || mask->ne[1] < 1 || mask->ne[2] != 1 ||
             k->nb[2] != size_t(D) * 2 || k->nb[1] < size_t(D) * 2) {
             return false;
         }
@@ -1280,6 +1374,9 @@ bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * 
         if (!usable(kernel)) {
             return false;
         }
+    }
+    if (decode && n_seq == 1 && plan_flash_attn_splitkv(package, op, call)) {
+        return true;
     }
     const int64_t q_programs = decode ? 1 : (n_q + kernel->block_size - 1) / kernel->block_size;
     if (call != nullptr) {
