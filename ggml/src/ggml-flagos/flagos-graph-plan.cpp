@@ -1721,6 +1721,10 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
         if (left.choice.score != right.choice.score) {
             return left.choice.score > right.choice.score;
         }
+        // Equal scores: the variant that also absorbs producers does strictly less work.
+        if (left.candidate.absorbed_node_indices.size() != right.candidate.absorbed_node_indices.size()) {
+            return left.candidate.absorbed_node_indices.size() > right.candidate.absorbed_node_indices.size();
+        }
         if (left.candidate.node_indices.size() != right.candidate.node_indices.size()) {
             return left.candidate.node_indices.size() > right.candidate.node_indices.size();
         }
