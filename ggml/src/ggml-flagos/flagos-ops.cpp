@@ -1019,6 +1019,22 @@ bool plan_concat(const flagos_kernel_package & package, const ggml_tensor * op, 
             return false;
         }
     }
+    // 2-D, dim 0, dense a rows and b stored transposed (unit stride along
+    // dim 1): flagos_concat_dim0_bt_f32(a, b, out, a_ne0, ne0, ne1, sa1, sb0),
+    // grid (ceil(ne0 / tile_n), ceil(ne1 / tile_m)).
+    if (dim == 0 && op->ne[2] == 1 && op->ne[3] == 1 && a->nb[0] == sizeof(float) && b->nb[1] == sizeof(float) &&
+        b->nb[0] > sizeof(float)) {
+        const flagos_kernel_info * bt = package.find("flagos_concat_dim0_bt_f32");
+        if (bt != nullptr && (bt->argument_count < 0 || bt->argument_count == 8) && bt->tile_m > 0 && bt->tile_n > 0 &&
+            (op->ne[1] + bt->tile_m - 1) / bt->tile_m <= 65535) {
+            set_call(call, bt, (op->ne[0] + bt->tile_n - 1) / bt->tile_n, { ptr(a), ptr(b), ptr(op), i32(a->ne[0]),
+                     i32(op->ne[0]), i32(op->ne[1]), i32(a->nb[1] / sizeof(float)), i32(b->nb[0] / sizeof(float)) });
+            if (call != nullptr) {
+                call->grid[1] = static_cast<uint32_t>((op->ne[1] + bt->tile_m - 1) / bt->tile_m);
+            }
+            return true;
+        }
+    }
     const int64_t n = ggml_nelements(op);
     const flagos_kernel_info * kernel = find_elementwise(package, "flagos_concat_f32", 21, n);
     if (kernel == nullptr) {

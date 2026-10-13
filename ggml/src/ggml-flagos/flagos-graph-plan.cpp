@@ -845,6 +845,28 @@ static bool flagos_candidate_early_reads_are_safe(
 
 static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const ggml_cgraph * cgraph) {
     std::vector<flagos_pattern_candidate> candidates;
+    static bool dumped = false;
+    if (!dumped && getenv("FLAGOS_DUMP_GDN")) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
+                dumped = true;
+                const ggml_tensor * st = cgraph->nodes[i]->src[5];
+                for (const ggml_tensor * t = st; t != nullptr; t = t->src[0]) {
+                    fprintf(stderr, "DUMPSRC %s %s ne=[%lld,%lld,%lld,%lld] nb1=%zu src1=%s vsrc=%s offs=%zu\n", ggml_op_name(t->op), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[1],
+                        t->src[1] ? t->src[1]->name : "-", t->view_src ? t->view_src->name : "-", t->view_offs);
+                    if (t->op == GGML_OP_NONE) break;
+                }
+                for (int j = std::max(0, i - 12); j < std::min(cgraph->n_nodes, i + 4); ++j) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    fprintf(stderr, "DUMP %d %s %s ne=[%lld,%lld,%lld,%lld] src0=%s src1=%s vsrc=%s\n", j, ggml_op_name(n->op), n->name,
+                        (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                        n->src[0] ? n->src[0]->name : "-", n->src[1] ? n->src[1]->name : "-", n->view_src ? n->view_src->name : "-");
+                }
+                break;
+            }
+        }
+    }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
 
