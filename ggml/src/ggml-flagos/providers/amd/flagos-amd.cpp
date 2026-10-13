@@ -3838,7 +3838,10 @@ static flagos_lowering_choice amd_query_fusion(
         void * user_data, const ggml_cgraph * cgraph, const flagos_pattern_candidate & candidate) {
     auto * context = static_cast<amd_backend_context *>(user_data);
     flagos_lowering_choice choice;
-    if (context == nullptr || cgraph == nullptr || candidate.node_indices.empty()) {
+    // This provider executes every pattern node itself; it cannot skip
+    // absorbed producers.
+    if (context == nullptr || cgraph == nullptr || candidate.node_indices.empty() ||
+        !candidate.absorbed_node_indices.empty()) {
         return choice;
     }
     if (candidate.id == flagos_pattern_id::rms_norm_mul_rope && candidate.node_indices.size() == 3) {

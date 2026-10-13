@@ -891,6 +891,46 @@ bool plan_gated_delta_net_cache(const flagos_kernel_package & package, const ggm
             (!exact || (kernel->block_size == S && S % kernel->tile_n == 0));
     };
     const bool cache_only_ok = gdn_cache_only_outputs_are_safe(graph, c, gdn, copy);
+    if (!c.absorbed_node_indices.empty()) {
+        // The initial state's GET_ROWS is absorbed: read it from the cache rows.
+        // flagos_gated_delta_net_scalar_f32_cache_gather(q, k, v, gate, beta,
+        //   cache_src, ids, out, cache_dst, S, H, T, B, strides, Hq, B / Bq,
+        //   scale, src_row_stride), grid (H, B, ceil(S / tile_n)), one snapshot.
+        const ggml_tensor * gather = nullptr;
+        for (const int index : c.absorbed_node_indices) {
+            if (graph->nodes[index]->op == GGML_OP_GET_ROWS) {
+                gather = graph->nodes[index];
+            }
+        }
+        const ggml_tensor * rows = gather != nullptr ? gather->src[0] : nullptr;
+        const ggml_tensor * ids = gather != nullptr ? gather->src[1] : nullptr;
+        const flagos_kernel_info * kernel = package.select("flagos_gated_delta_net_scalar_f32_cache_gather", {
+            { "tokens", T }, { "state", S }, { "heads", H }, { "seqs", B } });
+        // Decode only: for prefill the cache-only kernels below are faster.
+        if (!cache_only_ok || K != 1 || T != 1 || gather == nullptr || rows == nullptr || ids == nullptr || kernel == nullptr ||
+            (kernel->argument_count >= 0 && kernel->argument_count != 26) || kernel->block_size < S ||
+            kernel->tile_n <= 0 || rows->type != GGML_TYPE_F32 || rows->nb[0] != sizeof(float) ||
+            rows->ne[0] != state_elements || rows->nb[1] % sizeof(float) != 0 ||
+            rows->nb[1] / sizeof(float) > INT32_MAX || ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) ||
+            ggml_nelements(ids) != B || gather->ne[0] != state_elements || gather->ne[1] != B ||
+            gdn->src[5]->data != gather->data || partially_overlaps(destination, ids) ||
+            destination->data == ids->data) {
+            return false;
+        }
+        if (call == nullptr) {
+            return true;
+        }
+        const float scale = 1.0f / std::sqrt(static_cast<float>(S));
+        set_call(call, kernel, H, { ptr(q), ptr(gdn->src[1]), ptr(v), ptr(gdn->src[3]), ptr(beta), ptr(rows), ptr(ids),
+                 ptr(gdn), ptr(destination), i32(S), i32(H), i32(T), i32(B),
+                 i32(q->nb[1] / sizeof(float)), i32(q->nb[2] / sizeof(float)), i32(q->nb[3] / sizeof(float)),
+                 i32(v->nb[1] / sizeof(float)), i32(v->nb[2] / sizeof(float)), i32(v->nb[3] / sizeof(float)),
+                 i32(beta->nb[1] / sizeof(float)), i32(beta->nb[2] / sizeof(float)), i32(beta->nb[3] / sizeof(float)),
+                 i32(Hq), i32(B / Bq), f32(scale), i32(rows->nb[1] / sizeof(float)) });
+        call->grid[1] = static_cast<uint32_t>(B);
+        call->grid[2] = static_cast<uint32_t>((S + kernel->tile_n - 1) / kernel->tile_n);
+        return true;
+    }
     const flagos_kernel_info * kernel = nullptr;
     // A package may offer variants of either cache-only kernel.
     const std::initializer_list<flagos_kernel_fact> facts = {

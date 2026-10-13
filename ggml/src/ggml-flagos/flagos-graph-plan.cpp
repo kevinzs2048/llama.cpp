@@ -782,6 +782,65 @@ static bool flagos_candidate_early_writes_are_safe(
 // GGML may give an intervening output and that later input distinct tensor
 // identities backed by the same storage. The original schedule writes before
 // reading; the fused schedule would otherwise observe stale data.
+// Absorbed producers (see flagos_pattern_candidate) are skipped: each must
+// precede the entry, be read only by covered or absorbed nodes, and keep its
+// inputs unchanged until the entry.
+static bool flagos_absorbed_nodes_are_safe(
+        const ggml_cgraph * cgraph, const flagos_pattern_candidate & candidate,
+        flagos_resolve_tensor_data_fn resolve = nullptr,
+        void * user_data = nullptr) {
+    if (candidate.absorbed_node_indices.empty()) {
+        return true;
+    }
+    const int entry = candidate.node_indices.front();
+    std::vector<bool> covered(static_cast<size_t>(cgraph->n_nodes), false);
+    for (const int index : candidate.node_indices) {
+        covered[static_cast<size_t>(index)] = true;
+    }
+    for (const int index : candidate.absorbed_node_indices) {
+        if (index < 0 || index >= entry || covered[static_cast<size_t>(index)]) {
+            return false;
+        }
+        covered[static_cast<size_t>(index)] = true;
+    }
+    for (const int index : candidate.absorbed_node_indices) {
+        const ggml_tensor * absorbed = cgraph->nodes[index];
+        if ((absorbed->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || flagos_global_use_count(cgraph, absorbed) < 0) {
+            return false;
+        }
+        for (int consumer = 0; consumer < cgraph->n_nodes; ++consumer) {
+            if (covered[static_cast<size_t>(consumer)]) {
+                continue;
+            }
+            const ggml_tensor * node = cgraph->nodes[consumer];
+            if (node->view_src == absorbed) {
+                return false;
+            }
+            for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                if (node->src[source] == absorbed) {
+                    return false;
+                }
+            }
+        }
+        if (flagos_is_view_or_noop(absorbed)) {
+            continue;
+        }
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            const ggml_tensor * input = absorbed->src[source];
+            if (input == nullptr) {
+                continue;
+            }
+            for (int between = index + 1; between < entry; ++between) {
+                if (!covered[static_cast<size_t>(between)] &&
+                    flagos_tensor_storage_overlaps(input, cgraph->nodes[between], resolve, user_data)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool flagos_candidate_early_reads_are_safe(
         const ggml_cgraph * cgraph, const flagos_pattern_candidate & candidate,
         flagos_resolve_tensor_data_fn resolve = nullptr,
@@ -929,6 +988,31 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                     candidate.eliminated_read_bytes = flagos_tensor_bytes(copy->src[0]);
                     candidate.eliminated_launches = 1;
                     candidates.push_back(candidate);
+
+                    // The initial state usually comes from GET_ROWS on the same
+                    // recurrent cache (through reshapes). Offer a variant that
+                    // absorbs that gather, for kernels that read the cache row.
+                    std::vector<int> absorbed;
+                    const ggml_tensor * state = node->src[5];
+                    while (state != nullptr && (state->op == GGML_OP_RESHAPE || state->op == GGML_OP_VIEW) &&
+                           state->view_src != nullptr) {
+                        const int view_index = flagos_find_node_index(cgraph, state, 0, i);
+                        if (view_index >= 0) {
+                            absorbed.push_back(view_index);
+                        }
+                        state = state->view_src;
+                    }
+                    const int gather_index = state != nullptr && state->op == GGML_OP_GET_ROWS
+                        ? flagos_find_node_index(cgraph, state, 0, i) : -1;
+                    if (gather_index >= 0) {
+                        absorbed.push_back(gather_index);
+                        std::sort(absorbed.begin(), absorbed.end());
+                        flagos_pattern_candidate gathered = candidate;
+                        gathered.absorbed_node_indices = std::move(absorbed);
+                        gathered.eliminated_read_bytes += 2 * flagos_tensor_bytes(state);
+                        gathered.eliminated_launches += 1;
+                        candidates.push_back(std::move(gathered));
+                    }
                 }
             }
         }
@@ -1615,6 +1699,8 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
                 !flagos_candidate_early_writes_are_safe(
                     cgraph, candidate, resolve_tensor_data, user_data) ||
                 !flagos_candidate_early_reads_are_safe(
+                    cgraph, candidate, resolve_tensor_data, user_data) ||
+                !flagos_absorbed_nodes_are_safe(
                     cgraph, candidate, resolve_tensor_data, user_data)) {
                 continue;
             }
@@ -1648,10 +1734,12 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
     std::vector<selected_candidate> selected;
     for (const auto & item : supported) {
         bool overlaps = false;
-        for (const int node_index : item.candidate.node_indices) {
-            if (selected_by[node_index] != -1) {
-                overlaps = true;
-                break;
+        for (const auto * list : { &item.candidate.node_indices, &item.candidate.absorbed_node_indices }) {
+            for (const int node_index : *list) {
+                if (selected_by[node_index] != -1) {
+                    overlaps = true;
+                    break;
+                }
             }
         }
         if (overlaps) {
@@ -1659,8 +1747,10 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
         }
         const int selected_index = static_cast<int>(selected.size());
         selected.push_back(item);
-        for (const int node_index : item.candidate.node_indices) {
-            selected_by[node_index] = selected_index;
+        for (const auto * list : { &item.candidate.node_indices, &item.candidate.absorbed_node_indices }) {
+            for (const int node_index : *list) {
+                selected_by[node_index] = selected_index;
+            }
         }
     }
 

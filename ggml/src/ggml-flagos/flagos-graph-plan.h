@@ -91,6 +91,12 @@ struct flagos_pattern_candidate {
     // The provider must write every listed output. Missing whole-graph use
     // metadata makes every covered node output observable.
     std::vector<int> required_output_node_indices;
+    // Producers the pattern absorbs instead of executing them: nodes before
+    // the entry whose outputs only covered or absorbed nodes read (e.g. the
+    // GET_ROWS that gathers a recurrent state a fused kernel reads from the
+    // cache itself). They are skipped, so no node between one of them and
+    // the entry may write what it reads.
+    std::vector<int> absorbed_node_indices;
     uint64_t eliminated_read_bytes = 0;
     uint64_t eliminated_write_bytes = 0;
     uint32_t eliminated_launches = 0;
