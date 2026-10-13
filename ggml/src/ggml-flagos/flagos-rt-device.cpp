@@ -52,6 +52,25 @@ struct rt_device {
 
 std::vector<std::unique_ptr<rt_device>> g_devices;
 
+// GGML_FLAGOS_GUARD=1 (debug, for validating kernel packages): every
+// device tensor is allocated with a redzone after its data. Before a node
+// runs, the redzone of its output (or of the tensor it views) and the
+// workspace tail are filled with a pattern; after the node they are read
+// back, so a kernel that writes past its output is reported by name.
+// Launches are synchronous and graph capture is off in this mode. Fused
+// patterns are not guarded: their intermediates may share memory with
+// tensors the fused kernel still reads.
+constexpr size_t kGuardBytes = 256;
+constexpr uint8_t kGuardByte = 0xA5;
+
+bool guard_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_FLAGOS_GUARD");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 rt_device * device_of(ggml_backend_dev_t dev) {
     return static_cast<rt_device *>(dev->context);
 }
@@ -225,12 +244,16 @@ ggml_backend_buffer_t buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t 
     return ggml_backend_buffer_init(buft, buffer_interface, ctx, size);
 }
 
+size_t buft_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
+    return ggml_nbytes(tensor) + (guard_enabled() ? kGuardBytes : 0);
+}
+
 const ggml_backend_buffer_type_i buft_interface = {
     /* .get_name       = */ buft_get_name,
     /* .alloc_buffer   = */ buft_alloc_buffer,
     /* .get_alignment  = */ buft_get_alignment,
     /* .get_max_size   = */ nullptr,
-    /* .get_alloc_size = */ nullptr,
+    /* .get_alloc_size = */ buft_get_alloc_size,
     /* .is_host        = */ nullptr,
 };
 
@@ -288,9 +311,9 @@ void backend_free(ggml_backend_t backend) {
         uint64_t total = 0;
         std::string text;
         for (const auto & [op, count] : ctx->executed) {
-            // "variant:<kernel>" lines break launches down further; do not
-            // count them twice.
-            total += op.rfind("variant:", 0) == 0 ? 0 : count;
+            // "variant:<kernel>" and "kernel:<name>" lines break launches
+            // down further; do not count them twice.
+            total += op.rfind("variant:", 0) == 0 || op.rfind("kernel:", 0) == 0 ? 0 : count;
             text += " " + op + "=" + std::to_string(count);
         }
         std::fprintf(stderr, "FlagOS %s: %llu graphs, %llu kernel launches:%s\n", ctx->device->name.c_str(),
@@ -370,6 +393,77 @@ char * ensure_workspace(rt_backend * ctx, uint64_t bytes) {
     return ctx->workspace_base;
 }
 
+// Redzones checked around one node (GGML_FLAGOS_GUARD). Only memory this
+// device allocated with a redzone is guarded: the output's own tensor, or
+// the tensor it views, and the tail of the workspace the call uses.
+struct guard_zone {
+    char * begin;
+    std::string what;
+};
+
+std::vector<guard_zone> guard_zones(rt_backend * ctx, const ggml_tensor * node, const flagos_kernel_call & call) {
+    std::vector<guard_zone> zones;
+    const ggml_tensor * base = node->view_src != nullptr ? node->view_src : node;
+    if (base->buffer != nullptr && base->buffer->buft == &ctx->device->buft && base->data != nullptr) {
+        zones.push_back({ static_cast<char *>(base->data) + ggml_nbytes(base),
+                          std::string("tensor '") + base->name + "'" });
+    }
+    if (call.workspace_bytes > 0 && ctx->workspace_base != nullptr &&
+        call.workspace_bytes + kGuardBytes <= ctx->workspace_size) {
+        zones.push_back({ ctx->workspace_base + call.workspace_bytes, "workspace" });
+    }
+    return zones;
+}
+
+bool guard_arm(rt_backend * ctx, const std::vector<guard_zone> & zones) {
+    rt_device * device = ctx->device;
+    // The fill runs outside the stream; earlier work must not race with it.
+    if (!rt_check(device->rt->stream_synchronize(ctx->stream), device, "stream_synchronize")) {
+        return false;
+    }
+    for (const guard_zone & zone : zones) {
+        if (!rt_check(device->rt->memset(nullptr, zone.begin, kGuardByte, kGuardBytes), device, "guard memset")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool guard_check(rt_backend * ctx, const std::vector<guard_zone> & zones, const ggml_tensor * node,
+                 const flagos_kernel_call & call) {
+    rt_device * device = ctx->device;
+    if (!rt_check(device->rt->stream_synchronize(ctx->stream), device, "stream_synchronize")) {
+        return false;
+    }
+    bool ok = true;
+    for (const guard_zone & zone : zones) {
+        uint8_t bytes[kGuardBytes];
+        if (!rt_check(device->rt->memcpy(nullptr, bytes, zone.begin, kGuardBytes, FLAGOS_RT_COPY_DEVICE_TO_HOST), device,
+                      "guard memcpy")) {
+            return false;
+        }
+        size_t first = kGuardBytes, last = 0;
+        for (size_t i = 0; i < kGuardBytes; ++i) {
+            if (bytes[i] != kGuardByte) {
+                first = std::min(first, i);
+                last = i;
+            }
+        }
+        if (first < kGuardBytes) {
+            std::string kernels;
+            for (uint32_t s = 0; s < call.n_before; ++s) {
+                kernels += call.before[s].kernel->name + " -> ";
+            }
+            kernels += call.kernel->name;
+            GGML_LOG_ERROR("FlagOS %s: GUARD %s (%s %s) wrote past the end of the %s: bytes %zu..%zu of the redzone changed\n",
+                           device->name.c_str(), kernels.c_str(), ggml_op_desc(node), node->name, zone.what.c_str(),
+                           first, last);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 // Execute one node through the shared op adapter.
 bool compute_node(rt_backend * ctx, ggml_tensor * node) {
     if (ggml_is_empty(node) || flagos_op_is_noop(node)) {
@@ -382,7 +476,16 @@ bool compute_node(rt_backend * ctx, ggml_tensor * node) {
         GGML_LOG_ERROR("FlagOS %s: no kernel for %s (%s)\n", ctx->device->name.c_str(), ggml_op_desc(node), node->name);
         return false;
     }
-    if (!launch_call(ctx, call)) {
+    if (guard_enabled()) {
+        // Allocate the workspace first so its tail can be armed.
+        if (call.workspace_bytes > 0 && ensure_workspace(ctx, call.workspace_bytes + kGuardBytes) == nullptr) {
+            return false;
+        }
+        const std::vector<guard_zone> zones = guard_zones(ctx, node, call);
+        if (!guard_arm(ctx, zones) || !launch_call(ctx, call) || !guard_check(ctx, zones, node, call)) {
+            return false;
+        }
+    } else if (!launch_call(ctx, call)) {
         return false;
     }
     if (ctx->stats) {
@@ -723,6 +826,10 @@ bool launch_once(rt_backend * ctx, flagos_rt_kernel_t kernel, const flagos_rt_la
     if (!rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str())) {
         return false;
     }
+    if (ctx->stats) {
+        // Every launched kernel, so a package's coverage can be measured.
+        ++ctx->executed["kernel:" + call.kernel->name];
+    }
     if (sync && !rt_check(device->rt->stream_synchronize(ctx->stream), device,
                           ("execution of " + call.kernel->name).c_str())) {
         return false;
@@ -825,7 +932,7 @@ rt_backend * make_backend_context(rt_device * device, flagos_rt_stream_t stream)
     const flagos_runtime_v1 * rt = device->rt;
     const char * capture = std::getenv("GGML_FLAGOS_GRAPH_CAPTURE");
     (void) rt;
-    ctx->capture = capture != nullptr && capture[0] == '1' && device->has_capture;
+    ctx->capture = capture != nullptr && capture[0] == '1' && device->has_capture && !guard_enabled();
     return ctx;
 }
 

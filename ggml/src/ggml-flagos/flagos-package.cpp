@@ -206,12 +206,42 @@ bool flagos_kernel_package::open_impl(const std::string & dir, std::string & err
     return true;
 }
 
-static bool flagos_variants_enabled() {
-    static const bool enabled = [] {
+// GGML_FLAGOS_KERNEL_VARIANTS: unset or "1" selects variants by priority,
+// "0" uses only base kernels, and a comma-separated list of kernel names
+// allows only those variants (used to validate one variant at a time).
+struct flagos_variant_policy {
+    bool enabled = true;
+    std::vector<std::string> only;
+};
+
+static const flagos_variant_policy & flagos_variants() {
+    static const flagos_variant_policy policy = [] {
+        flagos_variant_policy p;
         const char * value = std::getenv("GGML_FLAGOS_KERNEL_VARIANTS");
-        return value == nullptr || value[0] == '\0' || value[0] != '0';
+        if (value == nullptr || value[0] == '\0' || std::string(value) == "1") {
+            return p;
+        }
+        if (std::string(value) == "0") {
+            p.enabled = false;
+            return p;
+        }
+        const std::string list(value);
+        size_t start = 0;
+        while (start <= list.size()) {
+            const size_t end = std::min(list.find(',', start), list.size());
+            if (end > start) {
+                p.only.push_back(list.substr(start, end - start));
+            }
+            start = end + 1;
+        }
+        return p;
     }();
-    return enabled;
+    return policy;
+}
+
+static bool flagos_variant_allowed(const flagos_kernel_info & kernel) {
+    const flagos_variant_policy & p = flagos_variants();
+    return p.only.empty() || std::find(p.only.begin(), p.only.end(), kernel.name) != p.only.end();
 }
 
 static bool flagos_constraints_hold(const flagos_kernel_info & kernel, std::initializer_list<flagos_kernel_fact> facts) {
@@ -234,14 +264,14 @@ static bool flagos_constraints_hold(const flagos_kernel_info & kernel, std::init
 const flagos_kernel_info * flagos_kernel_package::select(std::string_view contract,
                                                          std::initializer_list<flagos_kernel_fact> facts) const {
     const flagos_kernel_info * base = find(contract);
-    if (base == nullptr || !flagos_variants_enabled()) {
+    if (base == nullptr || !flagos_variants().enabled) {
         return base;
     }
     const auto it = variants_.find(std::string(contract));
     if (it != variants_.end()) {
         for (size_t i : it->second) {
             const flagos_kernel_info & v = kernels_[i];
-            if (v.priority >= base->priority && flagos_constraints_hold(v, facts)) {
+            if (v.priority >= base->priority && flagos_variant_allowed(v) && flagos_constraints_hold(v, facts)) {
                 return &v;
             }
         }

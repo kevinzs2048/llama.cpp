@@ -182,6 +182,30 @@ flagos_rt_status kernel_get(flagos_rt_module_t module, const flagos_rt_kernel_de
 
 flagos_rt_status run_kernel(hs_kernel * k, const uint32_t grid[3], const flagos_rt_arg * args, uint32_t n_args);
 
+// Test hook for the core's GGML_FLAGOS_GUARD: FLAGOS_HOSTSIM_OVERRUN=
+// <kernel>:<arg>:<offset> makes every launch of <kernel> also write four
+// bytes at pointer argument <arg> + <offset>, like a kernel that writes
+// past its output.
+void inject_overrun(const std::string & kernel, const flagos_rt_arg * args, uint32_t n_args) {
+    struct overrun { std::string kernel; uint32_t arg = 0; size_t offset = 0; bool set = false; };
+    static const overrun o = [] {
+        overrun r;
+        const char * value = std::getenv("FLAGOS_HOSTSIM_OVERRUN");
+        if (value == nullptr) return r;
+        std::string text(value);
+        const size_t a = text.find(':'), b = a == std::string::npos ? a : text.find(':', a + 1);
+        if (b == std::string::npos) return r;
+        r.kernel = text.substr(0, a);
+        r.arg = static_cast<uint32_t>(std::strtoul(text.c_str() + a + 1, nullptr, 10));
+        r.offset = std::strtoull(text.c_str() + b + 1, nullptr, 10);
+        r.set = true;
+        return r;
+    }();
+    if (!o.set || kernel != o.kernel || o.arg >= n_args || args[o.arg].kind != FLAGOS_RT_ARG_PTR) return;
+    const uint32_t junk = 0x0BADF00Du;
+    std::memcpy(static_cast<char *>(args[o.arg].value.ptr) + o.offset, &junk, sizeof(junk));
+}
+
 flagos_rt_status launch(flagos_rt_stream_t stream, flagos_rt_kernel_t kernel, const flagos_rt_launch * launch) {
     auto * k = reinterpret_cast<hs_kernel *>(kernel);
     if (launch->n_args != k->n_args || launch->n_args > 32) return FLAGOS_RT_INVALID_ARGUMENT;
@@ -209,6 +233,7 @@ flagos_rt_status run_kernel(hs_kernel * k, const uint32_t grid[3], const flagos_
             }
         }
     }
+    inject_overrun(k->name, args, n_args);
     return FLAGOS_RT_OK;
 }
 
