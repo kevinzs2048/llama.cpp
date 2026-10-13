@@ -937,6 +937,15 @@ bool plan_gated_delta_net(const flagos_kernel_package & package, const ggml_tens
     if (kernel == nullptr || kernel->block_size < S || kernel->tile_n <= 0) {
         return false;
     }
+    // A variant may take another algorithm (e.g. chunked for prefill with
+    // only the final state, manifest "when": tokens min, snapshots max 1).
+    const flagos_kernel_info * chosen = package.select("flagos_gated_delta_net_scalar_f32", {
+        { "tokens", T }, { "snapshots", K }, { "state", S }, { "heads", H }, { "seqs", B },
+    });
+    if (chosen != nullptr && (chosen->argument_count < 0 || chosen->argument_count == 24) &&
+        chosen->block_size >= S && chosen->tile_n > 0) {
+        kernel = chosen;
+    }
     if (call != nullptr) {
         const float scale = 1.0f / std::sqrt(static_cast<float>(S));
         set_call(call, kernel, H, { ptr(q), ptr(k), ptr(v), ptr(g), ptr(beta), ptr(state), ptr(op),
