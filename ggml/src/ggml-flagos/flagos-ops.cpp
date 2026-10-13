@@ -730,6 +730,187 @@ bool plan_moe_weighted_sum(const flagos_kernel_package & package, const ggml_cgr
     return true;
 }
 
+// GATED_DELTA_NET whose newest state snapshot is copied into the recurrent
+// cache (patterns gated_delta_net_decode / _prefill: GDN, snapshot VIEW,
+// CPY into a cache VIEW). The fused kernels write the cache directly:
+//   flagos_gated_delta_net_scalar_f32_cache             attention + snapshots + cache
+//   flagos_gated_delta_net_scalar_f32_cache_only        attention + cache
+//   flagos_gated_delta_net_scalar_f32_cache_only_decode one token, one snapshot
+// with the GDN arguments plus the cache pointer (after output) and the cache
+// slot stride (last), grid (heads, seqs, ceil(state / tile_n)). Ported from
+// the AMD provider's legacy fusion.
+
+bool aligned16(const ggml_tensor * t);
+bool plan_gated_delta_net(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call);
+
+// The snapshot suffix of the GDN output may be skipped only if nothing but
+// the covered CPY reads it; every other consumer must stay in the attention
+// prefix. Zero-work views may appear only as sources, so they are audited too.
+bool gdn_cache_only_outputs_are_safe(const ggml_cgraph * graph, const flagos_pattern_candidate & c,
+                                     const ggml_tensor * gdn, const ggml_tensor * copy) {
+    if (gdn->data == nullptr || static_cast<const int32_t *>(gdn->op_params)[0] != 1) {
+        return false;
+    }
+    for (const int index : c.node_indices) {
+        const ggml_tensor * node = graph->nodes[index];
+        if ((node == gdn || node->view_src == gdn) && !flagos_graph_exposes_all_consumers(graph, node)) {
+            return false;
+        }
+    }
+    const ggml_tensor * value = gdn->src[2];
+    const size_t attention_bytes = size_t(value->ne[0]) * value->ne[1] * value->ne[2] * value->ne[3] * sizeof(float);
+    const uintptr_t attention_begin = reinterpret_cast<uintptr_t>(gdn->data);
+    const uintptr_t attention_end = attention_begin + attention_bytes;
+    const ggml_tensor * destination = copy->src[1];
+    std::vector<bool> covered(size_t(graph->n_nodes), false);
+    for (const int index : c.node_indices) {
+        covered[size_t(index)] = true;
+    }
+    const auto in_attention = [&](const ggml_tensor * t) {
+        if (t == nullptr || t->data == nullptr || t->view_src != gdn) {
+            return false;
+        }
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(t->data);
+        const size_t bytes = ggml_nbytes(t);
+        return bytes > 0 && begin >= attention_begin && begin <= UINTPTR_MAX - bytes && begin + bytes <= attention_end;
+    };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (covered[size_t(i)]) {
+            continue;
+        }
+        const ggml_tensor * consumer = graph->nodes[i];
+        if (consumer->view_src == gdn && !in_attention(consumer)) {
+            return false;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * input = consumer->src[s];
+            const bool attention_view = input == gdn && consumer->view_src == gdn && in_attention(consumer);
+            if ((input == gdn && !attention_view) || (input != nullptr && input->view_src == gdn && !in_attention(input))) {
+                return false;
+            }
+        }
+    }
+    const int copy_index = c.node_indices.back();
+    bool copy_required = false;
+    for (const int index : c.required_output_node_indices) {
+        if (index == copy_index) {
+            if (copy_required) {
+                return false;
+            }
+            copy_required = true;
+            continue;
+        }
+        if (std::find(c.node_indices.begin(), c.node_indices.end(), index) == c.node_indices.end()) {
+            return false;
+        }
+        const ggml_tensor * output = graph->nodes[index];
+        if (output == nullptr || output->data == nullptr) {
+            return false;
+        }
+        // The GDN node itself is required when an attention view outside
+        // the pattern reads it; the audit above proved every such reader
+        // stays in the attention prefix, which the kernel writes.
+        if (output == destination || output == gdn) {
+            continue;
+        }
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(output->data);
+        const size_t bytes = ggml_nbytes(output);
+        if (bytes == 0 || begin < attention_begin || begin > UINTPTR_MAX - bytes || begin + bytes > attention_end) {
+            return false;
+        }
+    }
+    return copy_required;
+}
+
+bool plan_gated_delta_net_cache(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                                const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    if (c.node_indices.size() < 3) {
+        return false;
+    }
+    const ggml_tensor * gdn = graph->nodes[c.node_indices.front()];
+    const ggml_tensor * copy = graph->nodes[c.node_indices.back()];
+    const ggml_tensor * snapshot_view = copy != nullptr ? copy->src[0] : nullptr;
+    if (gdn == nullptr || gdn->op != GGML_OP_GATED_DELTA_NET || !plan_gated_delta_net(package, gdn, nullptr) ||
+        snapshot_view == nullptr || snapshot_view->op != GGML_OP_VIEW || snapshot_view->type != GGML_TYPE_F32 ||
+        snapshot_view->src[0] != gdn || snapshot_view->view_src != gdn || copy->op != GGML_OP_CPY ||
+        copy->type != GGML_TYPE_F32 || copy->src[1] == nullptr || copy->src[1]->op != GGML_OP_VIEW ||
+        copy->src[1]->type != GGML_TYPE_F32 || copy->data == nullptr || copy->data != copy->src[1]->data ||
+        gdn->data == nullptr || snapshot_view->data == nullptr || !ggml_is_contiguous(snapshot_view)) {
+        return false;
+    }
+    const ggml_tensor * q = gdn->src[0];
+    const ggml_tensor * v = gdn->src[2];
+    const ggml_tensor * beta = gdn->src[4];
+    const ggml_tensor * destination = copy->src[1];
+    const int64_t S = v->ne[0], H = v->ne[1], T = v->ne[2], B = v->ne[3];
+    const int64_t Hq = q->ne[1], Bq = q->ne[3];
+    const int64_t K = ggml_get_op_params_i32(gdn, 0);
+    const int64_t state_elements = S * S * H;
+    const int64_t written = std::min(T, K);
+    const size_t attention_bytes = size_t(S) * H * T * B * sizeof(float);
+    const uintptr_t gdn_data = reinterpret_cast<uintptr_t>(gdn->data);
+    const int64_t expected[GGML_MAX_DIMS] = { state_elements, B, written, 1 };
+    if (gdn_data > UINTPTR_MAX - attention_bytes ||
+        reinterpret_cast<uintptr_t>(snapshot_view->data) != gdn_data + attention_bytes ||
+        snapshot_view->view_offs != attention_bytes || ggml_nelements(snapshot_view) != state_elements * B * written ||
+        !std::equal(expected, expected + GGML_MAX_DIMS, destination->ne) ||
+        !std::equal(expected, expected + GGML_MAX_DIMS, copy->ne) || destination->nb[0] != sizeof(float) ||
+        destination->nb[1] != size_t(state_elements) * sizeof(float) ||
+        (written > 1 && (destination->nb[2] % sizeof(float) != 0 || destination->nb[2] / sizeof(float) > INT32_MAX ||
+                         destination->nb[2] / sizeof(float) < size_t(state_elements * B) ||
+                         (destination->nb[2] / sizeof(float)) % 16 != 0)) ||
+        !aligned16(destination) || partially_overlaps(gdn, destination) || gdn->data == destination->data) {
+        return false;
+    }
+    // Other workgroups may still be loading the initial state while one writes the cache.
+    for (int s = 0; s < 6; ++s) {
+        const ggml_tensor * input = gdn->src[s];
+        if (partially_overlaps(destination, input) || destination->data == input->data) {
+            return false;
+        }
+    }
+    const auto usable = [&](const flagos_kernel_info * kernel, bool exact) {
+        return kernel != nullptr && (kernel->argument_count < 0 || kernel->argument_count == 26) &&
+            kernel->block_size >= S && kernel->tile_n > 0 &&
+            (!exact || (kernel->block_size == S && S % kernel->tile_n == 0));
+    };
+    const bool cache_only_ok = gdn_cache_only_outputs_are_safe(graph, c, gdn, copy);
+    const flagos_kernel_info * kernel = nullptr;
+    // A package may offer variants of either cache-only kernel.
+    const std::initializer_list<flagos_kernel_fact> facts = {
+        { "tokens", T }, { "snapshots", K }, { "state", S }, { "heads", H }, { "seqs", B },
+    };
+    if (cache_only_ok && T == 1 && K == 1 && (Hq & (Hq - 1)) == 0 && Bq == B) {
+        kernel = package.select("flagos_gated_delta_net_scalar_f32_cache_only_decode", facts);
+        kernel = usable(kernel, true) ? kernel : nullptr;
+    }
+    if (kernel == nullptr && cache_only_ok) {
+        kernel = package.select("flagos_gated_delta_net_scalar_f32_cache_only", facts);
+        kernel = usable(kernel, true) ? kernel : nullptr;
+    }
+    if (kernel == nullptr) {
+        kernel = package.find("flagos_gated_delta_net_scalar_f32_cache");
+        kernel = usable(kernel, false) ? kernel : nullptr;
+    }
+    if (kernel == nullptr) {
+        return false;
+    }
+    if (call == nullptr) {
+        return true;
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(S));
+    const int32_t slot_stride = written > 1 ? int32_t(destination->nb[2] / sizeof(float)) : 0;
+    set_call(call, kernel, H, { ptr(q), ptr(gdn->src[1]), ptr(v), ptr(gdn->src[3]), ptr(beta), ptr(gdn->src[5]),
+             ptr(gdn), ptr(destination), i32(S), i32(H), i32(T), i32(B),
+             i32(q->nb[1] / sizeof(float)), i32(q->nb[2] / sizeof(float)), i32(q->nb[3] / sizeof(float)),
+             i32(v->nb[1] / sizeof(float)), i32(v->nb[2] / sizeof(float)), i32(v->nb[3] / sizeof(float)),
+             i32(beta->nb[1] / sizeof(float)), i32(beta->nb[2] / sizeof(float)), i32(beta->nb[3] / sizeof(float)),
+             i32(Hq), i32(B / Bq), i32(K), f32(scale), i32(slot_stride) });
+    call->grid[1] = static_cast<uint32_t>(B);
+    call->grid[2] = static_cast<uint32_t>((S + kernel->tile_n - 1) / kernel->tile_n);
+    return true;
+}
+
 // GLU SWIGLU, split form (gate and up are separate tensors):
 // flagos_swiglu_split_f32(gate, up, out, n) computes g * sigmoid(g) * up.
 bool plan_glu(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -1643,6 +1824,9 @@ bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph
             return plan_add_rms_norm_mul(package, graph, candidate, call);
         case flagos_pattern_id::moe_weighted_sum:
             return plan_moe_weighted_sum(package, graph, candidate, call);
+        case flagos_pattern_id::gated_delta_net_decode:
+        case flagos_pattern_id::gated_delta_net_prefill:
+            return plan_gated_delta_net_cache(package, graph, candidate, call);
         default:
             return false;
     }
