@@ -248,6 +248,16 @@ int main() {
     CHECK(flagos_describe_quantized_matmul(&q80_output, &q80_signature));
     CHECK(q80_signature.weight_kind == flagos_quantized_matmul_kind::q8_0);
 
+    ggml_tensor q50_weight = q40_weight;
+    q50_weight.type = GGML_TYPE_Q5_0;
+    q50_weight.nb[0] = ggml_type_size(GGML_TYPE_Q5_0);
+    q50_weight.nb[1] = q50_weight.nb[0] * q50_weight.ne[0] / ggml_blck_size(GGML_TYPE_Q5_0);
+    ggml_tensor q50_output = q40_output;
+    q50_output.src[0] = &q50_weight;
+    flagos_quantized_matmul_signature q50_signature;
+    CHECK(flagos_describe_quantized_matmul(&q50_output, &q50_signature));
+    CHECK(q50_signature.weight_kind == flagos_quantized_matmul_kind::q5_0);
+
     ggml_tensor q5_weight {};
     q5_weight.type = GGML_TYPE_Q5_K;
     q5_weight.ne[0] = 256;

@@ -235,7 +235,7 @@ bool plan_unary(const flagos_kernel_package & package, const ggml_tensor * op, f
 }
 
 
-// Quantized MUL_MAT with GGUF weights (Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K)
+// Quantized MUL_MAT with GGUF weights (Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K)
 // and F32 activations. Arguments are (weights as bytes, weights as f16 for
 // the block scales, x, y, k, rows[, columns]); the kernels address with
 // 32-bit offsets, so every pairwise product must fit in int32.
@@ -243,6 +243,7 @@ const char * quant_name(flagos_quantized_matmul_kind kind) {
     switch (kind) {
         case flagos_quantized_matmul_kind::q4_0: return "q4_0";
         case flagos_quantized_matmul_kind::q4_1: return "q4_1";
+        case flagos_quantized_matmul_kind::q5_0: return "q5_0";
         case flagos_quantized_matmul_kind::q8_0: return "q8_0";
         case flagos_quantized_matmul_kind::q4_k: return "q4_k";
         case flagos_quantized_matmul_kind::q5_k: return "q5_k";
@@ -1069,6 +1070,7 @@ bool plan_get_rows_quant(const flagos_kernel_package & package, const ggml_tenso
     switch (table->type) {
         case GGML_TYPE_Q4_0: type = "q4_0"; qk = 32; break;
         case GGML_TYPE_Q4_1: type = "q4_1"; qk = 32; break;
+        case GGML_TYPE_Q5_0: type = "q5_0"; qk = 32; break;
         case GGML_TYPE_Q8_0: type = "q8_0"; qk = 32; break;
         case GGML_TYPE_Q4_K: type = "q4_k"; qk = 256; break;
         case GGML_TYPE_Q5_K: type = "q5_k"; qk = 256; break;
@@ -1316,6 +1318,7 @@ bool plan_mul_mat_id(const flagos_kernel_package & package, const ggml_tensor * 
     switch (w->type) {
         case GGML_TYPE_Q4_0: type = "q4_0_f32_decoded_compensation"; qk = 32; break;
         case GGML_TYPE_Q4_1: type = "q4_1_f32"; qk = 32; break;
+        case GGML_TYPE_Q5_0: type = "q5_0_f32"; qk = 32; break;   // proposed FlagGems kernel
         case GGML_TYPE_Q8_0: type = "q8_0_f32_finite_compensation"; qk = 32; break;
         case GGML_TYPE_Q4_K: type = "q4_k_f32"; qk = 256; break;
         case GGML_TYPE_Q5_K: type = "q5_k_f32"; qk = 256; break;   // proposed FlagGems kernel

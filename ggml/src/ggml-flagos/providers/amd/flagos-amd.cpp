@@ -384,6 +384,13 @@ static bool amd_graph_capture_prefill_enabled() {
     return value != nullptr && std::strcmp(value, "all") == 0;
 }
 
+// The common descriptor also accepts Q5_0, which this backend has no
+// kernels for; it only sees the formats it was written against.
+static bool amd_describe_quantized_matmul(const ggml_tensor * op, flagos_quantized_matmul_signature * signature) {
+    return flagos_describe_quantized_matmul(op, signature) &&
+        signature->weight_kind != flagos_quantized_matmul_kind::q5_0;
+}
+
 static bool amd_graph_is_decode(const ggml_cgraph * cgraph) {
     if (cgraph == nullptr) {
         return false;
@@ -391,7 +398,7 @@ static bool amd_graph_is_decode(const ggml_cgraph * cgraph) {
     bool found_projection = false;
     for (int index = 0; index < cgraph->n_nodes; ++index) {
         flagos_quantized_matmul_signature signature;
-        if (!flagos_describe_quantized_matmul(cgraph->nodes[index], &signature)) {
+        if (!amd_describe_quantized_matmul(cgraph->nodes[index], &signature)) {
             continue;
         }
         found_projection = true;
@@ -1119,6 +1126,7 @@ static int64_t amd_quantized_block_size(flagos_quantized_matmul_kind kind) {
         case flagos_quantized_matmul_kind::q5_k:
         case flagos_quantized_matmul_kind::q4_k:
         case flagos_quantized_matmul_kind::q6_k: return 256;
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return 0;
     }
     return 0;
@@ -1144,6 +1152,7 @@ static const char * amd_quantized_dequant_kernel(flagos_quantized_matmul_kind ki
         case flagos_quantized_matmul_kind::q4_k: return "flagos_dequant_q4_k_f16";
         case flagos_quantized_matmul_kind::q6_k: return "flagos_dequant_q6_k_f16";
         case flagos_quantized_matmul_kind::q8_0: return "flagos_dequant_q8_0_f16";
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return nullptr;
     }
     return nullptr;
@@ -1157,6 +1166,7 @@ static const char * amd_quantized_gemv_kernel(flagos_quantized_matmul_kind kind)
         case flagos_quantized_matmul_kind::q4_k: return "flagos_mul_mat_q4_k_f32";
         case flagos_quantized_matmul_kind::q6_k: return "flagos_mul_mat_q6_k_f32";
         case flagos_quantized_matmul_kind::q8_0: return "flagos_mul_mat_q8_0_f32";
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return nullptr;
     }
     return nullptr;
@@ -1193,6 +1203,7 @@ static const char * amd_quantized_get_rows_kernel(flagos_quantized_matmul_kind k
         case flagos_quantized_matmul_kind::q4_k: return "flagos_get_rows_q4_k_f32";
         case flagos_quantized_matmul_kind::q6_k: return "flagos_get_rows_q6_k_f32";
         case flagos_quantized_matmul_kind::q8_0: return "flagos_get_rows_q8_0_f32";
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return nullptr;
     }
     return nullptr;
@@ -1500,7 +1511,7 @@ static bool amd_f16_graph_cache_ready(
             continue;
         }
         flagos_quantized_matmul_signature signature;
-        if (!flagos_describe_quantized_matmul(node, &signature) ||
+        if (!amd_describe_quantized_matmul(node, &signature) ||
             !amd_dequant_cache_contains(context, node->src[0], signature)) {
             return false;
         }
@@ -1644,7 +1655,7 @@ static void amd_prepare_dequant_cache(
             continue;
         }
         flagos_quantized_matmul_signature signature;
-        if (!flagos_describe_quantized_matmul(node, &signature) ||
+        if (!amd_describe_quantized_matmul(node, &signature) ||
             amd_dequant_cache_contains(context, node->src[0], signature)) {
             continue;
         }
@@ -3111,7 +3122,7 @@ static bool amd_supports_quantized_mul_mat(const amd_device_context * device, co
         return false;
     }
     flagos_quantized_matmul_signature signature;
-    if (!flagos_describe_quantized_matmul(op, &signature) ||
+    if (!amd_describe_quantized_matmul(op, &signature) ||
         !amd_i32_matrix_offsets_fit(signature)) {
         return false;
     }
@@ -3271,8 +3282,8 @@ static bool amd_supports_gdn_gate_projections(
     }
     flagos_quantized_matmul_signature alpha_signature;
     flagos_quantized_matmul_signature beta_signature;
-    if (!flagos_describe_quantized_matmul(match.alpha_projection, &alpha_signature) ||
-        !flagos_describe_quantized_matmul(match.beta_projection, &beta_signature) ||
+    if (!amd_describe_quantized_matmul(match.alpha_projection, &alpha_signature) ||
+        !amd_describe_quantized_matmul(match.beta_projection, &beta_signature) ||
         !amd_i32_matrix_offsets_fit(alpha_signature) ||
         !amd_i32_matrix_offsets_fit(beta_signature) ||
         alpha_signature.weight_kind != flagos_quantized_matmul_kind::q8_0 ||
@@ -3343,8 +3354,8 @@ static bool amd_supports_ffn_swiglu_f16_layout(const amd_device_context * device
 
     flagos_quantized_matmul_signature gate_signature;
     flagos_quantized_matmul_signature up_signature;
-    if (!flagos_describe_quantized_matmul(gate, &gate_signature) ||
-        !flagos_describe_quantized_matmul(up, &up_signature) ||
+    if (!amd_describe_quantized_matmul(gate, &gate_signature) ||
+        !amd_describe_quantized_matmul(up, &up_signature) ||
         !amd_i32_matrix_offsets_fit(gate_signature) ||
         !amd_i32_matrix_offsets_fit(up_signature)) {
         return false;
@@ -3413,7 +3424,7 @@ static bool amd_supports_ffn_swiglu_f16(const amd_device_context * device,
     amd_f16_ffn_launch launch;
     // Cached weights are allocated at aligned arena boundaries; graph bindings
     // may be unknown here and are rechecked with their final addresses later.
-    return flagos_describe_quantized_matmul(gate, &signature) &&
+    return amd_describe_quantized_matmul(gate, &signature) &&
         amd_describe_f16_ffn(device, nullptr, nullptr, gate->src[1]->data, glu->data,
             static_cast<int>(signature.k), static_cast<int>(signature.rows),
             static_cast<int>(signature.columns), &launch);
@@ -3444,9 +3455,9 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
     flagos_quantized_matmul_signature gate_signature;
     flagos_quantized_matmul_signature up_signature;
     flagos_quantized_matmul_signature down_signature;
-    if (!flagos_describe_quantized_matmul(gate, &gate_signature) ||
-        !flagos_describe_quantized_matmul(up, &up_signature) ||
-        !flagos_describe_quantized_matmul(down, &down_signature) ||
+    if (!amd_describe_quantized_matmul(gate, &gate_signature) ||
+        !amd_describe_quantized_matmul(up, &up_signature) ||
+        !amd_describe_quantized_matmul(down, &down_signature) ||
         gate_signature.columns <= 1 || gate_signature.columns != up_signature.columns ||
         gate_signature.columns != down_signature.columns ||
         gate_signature.rows != up_signature.rows || gate_signature.rows != down_signature.k ||
@@ -3546,8 +3557,8 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
     }
     flagos_quantized_matmul_signature gate_signature;
     flagos_quantized_matmul_signature up_signature;
-    if (!flagos_describe_quantized_matmul(gate, &gate_signature) ||
-        !flagos_describe_quantized_matmul(up, &up_signature) ||
+    if (!amd_describe_quantized_matmul(gate, &gate_signature) ||
+        !amd_describe_quantized_matmul(up, &up_signature) ||
         gate_signature.weight_kind != up_signature.weight_kind ||
         (gate_signature.weight_kind != flagos_quantized_matmul_kind::q4_0 &&
          gate_signature.weight_kind != flagos_quantized_matmul_kind::q4_k) ||
@@ -4001,9 +4012,9 @@ static flagos_lowering_choice amd_query_fusion(
         flagos_quantized_matmul_signature second_signature;
         flagos_quantized_matmul_signature down_signature;
         const bool described =
-            flagos_describe_quantized_matmul(first_projection, &first_signature) &&
-            flagos_describe_quantized_matmul(second_projection, &second_signature) &&
-            flagos_describe_quantized_matmul(down_projection, &down_signature);
+            amd_describe_quantized_matmul(first_projection, &first_signature) &&
+            amd_describe_quantized_matmul(second_projection, &second_signature) &&
+            amd_describe_quantized_matmul(down_projection, &down_signature);
         if (amd_candidate_outputs_are(candidate, { 3 }) &&
             amd_supports_ffn_swiglu_down_f16(
                 context->device, first_projection, second_projection, glu, down_projection) &&
@@ -4028,8 +4039,8 @@ static flagos_lowering_choice amd_query_fusion(
         flagos_quantized_matmul_signature first_signature;
         flagos_quantized_matmul_signature second_signature;
         const bool described =
-            flagos_describe_quantized_matmul(first_projection, &first_signature) &&
-            flagos_describe_quantized_matmul(second_projection, &second_signature);
+            amd_describe_quantized_matmul(first_projection, &first_signature) &&
+            amd_describe_quantized_matmul(second_projection, &second_signature);
         if (amd_candidate_outputs_are(candidate, { 2 }) && amd_supports_ffn_swiglu_q4_decode(
                 context->device, first_projection, second_projection, glu)) {
             choice.supported = true;
@@ -4412,9 +4423,9 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
         flagos_quantized_matmul_signature gate_signature;
         flagos_quantized_matmul_signature up_signature;
         flagos_quantized_matmul_signature down_signature;
-        if (!flagos_describe_quantized_matmul(gate_projection, &gate_signature) ||
-            !flagos_describe_quantized_matmul(up_projection, &up_signature) ||
-            !flagos_describe_quantized_matmul(down_projection, &down_signature)) {
+        if (!amd_describe_quantized_matmul(gate_projection, &gate_signature) ||
+            !amd_describe_quantized_matmul(up_projection, &up_signature) ||
+            !amd_describe_quantized_matmul(down_projection, &down_signature)) {
             return false;
         }
         void * gate_weights = amd_get_dequantized_weight(
@@ -4498,8 +4509,8 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
                 context->device, gate_projection, up_projection, glu)) {
             flagos_quantized_matmul_signature gate_signature;
             flagos_quantized_matmul_signature up_signature;
-            if (!flagos_describe_quantized_matmul(gate_projection, &gate_signature) ||
-                !flagos_describe_quantized_matmul(up_projection, &up_signature) ||
+            if (!amd_describe_quantized_matmul(gate_projection, &gate_signature) ||
+                !amd_describe_quantized_matmul(up_projection, &up_signature) ||
                 gate_projection->src[0] == nullptr || up_projection->src[0] == nullptr ||
                 gate_projection->src[1] == nullptr || glu->data == nullptr) {
                 return false;
@@ -4555,8 +4566,8 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
         }
         flagos_quantized_matmul_signature first_signature;
         flagos_quantized_matmul_signature second_signature;
-        if (!flagos_describe_quantized_matmul(gate_projection, &first_signature) ||
-            !flagos_describe_quantized_matmul(up_projection, &second_signature)) {
+        if (!amd_describe_quantized_matmul(gate_projection, &first_signature) ||
+            !amd_describe_quantized_matmul(up_projection, &second_signature)) {
             return false;
         }
         void * first_weights = amd_get_dequantized_weight(
@@ -5386,6 +5397,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 case flagos_quantized_matmul_kind::q8_0:
                     backend_context->stats.q80_get_rows.fetch_add(1, std::memory_order_relaxed);
                     break;
+                case flagos_quantized_matmul_kind::q5_0:
                 case flagos_quantized_matmul_kind::none:
                     return GGML_STATUS_FAILED;
             }
@@ -5476,7 +5488,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             if (columns > 1 && rows >= 64 && k >= 1024 && amd_allows_f16_matmul(node) &&
                 amd_prefill_f16_gemm_enabled(backend_context->device)) {
                 flagos_quantized_matmul_signature signature;
-                const bool described = flagos_describe_quantized_matmul(node, &signature);
+                const bool described = amd_describe_quantized_matmul(node, &signature);
                 void * dequantized_weights = described
                     ? amd_get_dequantized_weight(backend_context, node->src[0], signature) : nullptr;
                 const auto * f16_metadata = backend_context->device->aot->find(

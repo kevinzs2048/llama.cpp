@@ -105,6 +105,18 @@ inline void dequant_q4_1(const uint8_t * b, float * out) {   // 20 bytes / 32
     }
 }
 
+inline void dequant_q5_0(const uint8_t * b, float * out) {   // 22 bytes / 32
+    const float d = f16_at(b);
+    uint32_t qh;
+    std::memcpy(&qh, b + 2, sizeof(qh));
+    for (int j = 0; j < 16; ++j) {
+        const int lo = (b[6 + j] & 0x0f) | (((qh >> j) << 4) & 0x10);
+        const int hi = (b[6 + j] >> 4) | ((qh >> (j + 12)) & 0x10);
+        out[j] = float(lo - 16) * d;
+        out[j + 16] = float(hi - 16) * d;
+    }
+}
+
 inline void dequant_q8_0(const uint8_t * b, float * out) {   // 34 bytes / 32
     const float d = f16_at(b);
     for (int j = 0; j < 32; ++j) {
@@ -197,6 +209,7 @@ struct quant_format {
 inline bool quant_format_of(const std::string & name, quant_format & f) {
     if (name.find("q4_0") != std::string::npos) { f = { 32, 18, dequant_q4_0 }; return true; }
     if (name.find("q4_1") != std::string::npos) { f = { 32, 20, dequant_q4_1 }; return true; }
+    if (name.find("q5_0") != std::string::npos) { f = { 32, 22, dequant_q5_0 }; return true; }
     if (name.find("q8_0") != std::string::npos) { f = { 32, 34, dequant_q8_0 }; return true; }
     if (name.find("q4_k") != std::string::npos) { f = { 256, 144, dequant_q4_k }; return true; }
     if (name.find("q5_k") != std::string::npos) { f = { 256, 176, dequant_q5_k }; return true; }

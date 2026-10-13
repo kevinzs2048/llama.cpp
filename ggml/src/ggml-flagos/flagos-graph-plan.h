@@ -44,6 +44,7 @@ enum class flagos_quantized_matmul_kind : uint32_t {
     q5_k = 4,
     q4_1 = 5,
     q8_0 = 6,
+    q5_0 = 7,
 };
 
 // Provider-neutral description of a GGML quantized matrix multiply. The

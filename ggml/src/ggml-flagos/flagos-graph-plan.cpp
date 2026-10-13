@@ -44,13 +44,14 @@ bool flagos_describe_quantized_matmul(
     if (op == nullptr || signature == nullptr || op->op != GGML_OP_MUL_MAT ||
         op->src[0] == nullptr || op->src[1] == nullptr ||
         (op->src[0]->type != GGML_TYPE_Q4_0 && op->src[0]->type != GGML_TYPE_Q4_1 &&
+         op->src[0]->type != GGML_TYPE_Q5_0 &&
          op->src[0]->type != GGML_TYPE_Q5_K &&
          op->src[0]->type != GGML_TYPE_Q4_K &&
          op->src[0]->type != GGML_TYPE_Q6_K && op->src[0]->type != GGML_TYPE_Q8_0) ||
         op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
         op->src[0]->ne[0] <= 0 ||
         ((op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q4_1 ||
-          op->src[0]->type == GGML_TYPE_Q8_0) ? op->src[0]->ne[0] % 32 != 0
+          op->src[0]->type == GGML_TYPE_Q5_0 || op->src[0]->type == GGML_TYPE_Q8_0) ? op->src[0]->ne[0] % 32 != 0
                                                : op->src[0]->ne[0] % 256 != 0) ||
         op->src[0]->ne[0] != op->src[1]->ne[0] || op->src[0]->ne[1] <= 0 ||
         op->src[1]->ne[1] <= 0 || op->src[0]->ne[2] != 1 || op->src[0]->ne[3] != 1 ||
@@ -64,6 +65,8 @@ bool flagos_describe_quantized_matmul(
         ? flagos_quantized_matmul_kind::q4_0
         : op->src[0]->type == GGML_TYPE_Q4_1
         ? flagos_quantized_matmul_kind::q4_1
+        : op->src[0]->type == GGML_TYPE_Q5_0
+        ? flagos_quantized_matmul_kind::q5_0
         : op->src[0]->type == GGML_TYPE_Q5_K
         ? flagos_quantized_matmul_kind::q5_k
         : op->src[0]->type == GGML_TYPE_Q4_K

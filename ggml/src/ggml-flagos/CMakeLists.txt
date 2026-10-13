@@ -249,10 +249,10 @@ list(APPEND _flagos_hostsim_kernels
     "flagos_flash_attn_decode_f32_f16_generic_h256 16 16 16 16 256"
     "flagos_flash_attn_prefill_f32_f16_generic_h128 16 19 16 16 128"
     "flagos_flash_attn_prefill_f32_f16_generic_h256 16 19 16 16 256")
-foreach(_q q4_0 q4_1 q8_0 q4_k q5_k q6_k)
+foreach(_q q4_0 q4_1 q5_0 q8_0 q4_k q5_k q6_k)
     list(APPEND _flagos_hostsim_kernels "flagos_mul_mat_${_q}_f32 1 6" "flagos_mul_mat_${_q}_f32_batched 4 7")
 endforeach()
-foreach(_q q4_0 q4_1 q8_0)
+foreach(_q q4_0 q4_1 q5_0 q8_0)
     list(APPEND _flagos_hostsim_kernels "flagos_get_rows_${_q}_f32 32 5" "flagos_dequant_${_q}_f16 32 3")
 endforeach()
 foreach(_q q4_k q5_k q6_k)
@@ -273,7 +273,7 @@ list(APPEND _flagos_hostsim_kernels
     "flagos_add_repeat_strided_f32 64 20" "flagos_mul_repeat_strided_f32 64 20" "flagos_div_repeat_strided_f32 64 20"
     "flagos_get_rows_batched_f32 64 16" "flagos_mul_mat_f32_f32_strided_batched_ieee 32 15 16 32 32"
     "flagos_mul_mat_id_f32_f32 64 16 4 4 64"
-    "flagos_mul_mat_id_q4_0_f32_decoded_compensation 32 17" "flagos_mul_mat_id_q4_1_f32 32 17"
+    "flagos_mul_mat_id_q4_0_f32_decoded_compensation 32 17" "flagos_mul_mat_id_q4_1_f32 32 17" "flagos_mul_mat_id_q5_0_f32 32 17"
     "flagos_mul_mat_id_q8_0_f32_finite_compensation 32 17" "flagos_mul_mat_id_q4_k_f32 256 17"
     "flagos_mul_mat_id_q5_k_f32 256 17" "flagos_mul_mat_id_q6_k_f32 256 17")
 set(_flagos_hostsim_module "hostsim-module v1\n")
