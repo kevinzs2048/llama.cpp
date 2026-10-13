@@ -31,6 +31,7 @@ const char * flagos_pattern_name(flagos_pattern_id id) {
         case flagos_pattern_id::flash_attn_prefill:      return "flash_attn_prefill";
         case flagos_pattern_id::attention_output_gate:   return "attention_output_gate";
         case flagos_pattern_id::gdn_gate_projections:    return "gdn_gate_projections";
+        case flagos_pattern_id::moe_weighted_sum:        return "moe_weighted_sum";
     }
     return "unknown";
 }
@@ -106,6 +107,7 @@ flagos_fusion_scope flagos_pattern_scope(flagos_pattern_id id) {
         case flagos_pattern_id::qkv_mrope_kv_store:
         case flagos_pattern_id::attention_output_gate:
         case flagos_pattern_id::gdn_gate_projections:
+        case flagos_pattern_id::moe_weighted_sum:
             return flagos_fusion_scope::graph;
     }
     return flagos_fusion_scope::graph;
@@ -943,6 +945,53 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                 candidate.eliminated_read_bytes = flagos_tensor_bytes(node) + flagos_tensor_bytes(view);
                 candidate.eliminated_launches = 2;
                 candidates.push_back(candidate);
+            }
+        }
+
+        // MoE expert aggregation (llama.cpp build_moe_ffn): experts
+        // [n_embd, n_used, n_tokens] times routing weights [1, n_used,
+        // n_tokens], a 2-D VIEW of each expert's slice, then
+        // ((v0 + v1) + v2) + ... .  Only the last ADD leaves the pattern.
+        // Zero-work views need not be graph nodes, so the chain is followed
+        // through the ADD operands; view nodes that do appear are covered.
+        if (node->op == GGML_OP_MUL && node->src[0] != nullptr && node->src[1] != nullptr &&
+            node->src[1]->ne[0] == 1 && node->ne[1] >= 2 && node->ne[1] <= 64 && node->ne[3] == 1 &&
+            ggml_are_same_shape(node, node->src[0]) && node->src[1]->ne[1] == node->ne[1] &&
+            node->src[1]->ne[2] == node->ne[2]) {
+            const int64_t n_used = node->ne[1];
+            const auto expert_view = [&](const ggml_tensor * view, int64_t k) {
+                return view != nullptr && view->op == GGML_OP_VIEW && view->view_src == node &&
+                    view->ne[0] == node->ne[0] && view->ne[1] == node->ne[2] && view->ne[2] == 1 &&
+                    view->ne[3] == 1 && view->nb[1] == node->nb[2] &&
+                    view->view_offs == static_cast<size_t>(k) * node->nb[1];
+            };
+            std::vector<int> covered = { i };
+            const ggml_tensor * sum = nullptr;
+            int64_t next = 1;
+            for (int j = i + 1; j < cgraph->n_nodes && next < n_used; ++j) {
+                const ggml_tensor * other = cgraph->nodes[j];
+                if (flagos_is_graph_barrier(other)) {
+                    break;
+                }
+                if (other->op == GGML_OP_VIEW && other->view_src == node) {
+                    covered.push_back(j);
+                    continue;
+                }
+                const bool lhs = sum != nullptr ? other->src[0] == sum : expert_view(other->src[0], 0);
+                if (other->op == GGML_OP_ADD && lhs && expert_view(other->src[1], next)) {
+                    covered.push_back(j);
+                    sum = other;
+                    ++next;
+                }
+            }
+            if (next == n_used) {
+                flagos_pattern_candidate candidate;
+                candidate.id = flagos_pattern_id::moe_weighted_sum;
+                candidate.scope = flagos_pattern_scope(candidate.id);
+                candidate.node_indices = std::move(covered);
+                candidate.eliminated_read_bytes = flagos_tensor_bytes(node) * 2;
+                candidate.eliminated_launches = static_cast<uint32_t>(n_used - 1);
+                candidates.push_back(std::move(candidate));
             }
         }
 

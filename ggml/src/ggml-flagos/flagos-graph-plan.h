@@ -31,6 +31,9 @@ enum class flagos_pattern_id : uint32_t {
     ffn_swiglu_down      = 15,
     // Parallel GDN alpha/beta projections and their decode gate epilogues.
     gdn_gate_projections = 16,
+    // MoE expert aggregation: MUL(experts, routing weights), one VIEW per
+    // used expert, and the chain of ADDs that sums them.
+    moe_weighted_sum     = 17,
 };
 
 const char * flagos_pattern_name(flagos_pattern_id id);

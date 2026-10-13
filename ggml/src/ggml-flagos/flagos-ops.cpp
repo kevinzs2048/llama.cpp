@@ -635,6 +635,58 @@ bool plan_add_rms_norm_mul(const flagos_kernel_package & package, const ggml_cgr
     return true;
 }
 
+// MoE expert aggregation (pattern moe_weighted_sum): MUL(experts, weights),
+// VIEWs of each used expert, ADD chain. One kernel sums
+// experts[:, i, t] * weights[i, t] over i in GGML's order:
+// flagos_moe_weighted_sum_f32(experts, weights, out, n_embd, n_used),
+// grid (ceil(n_embd / BLOCK), n_tokens). Only the last ADD is written.
+// The token kernel's tile_k is the largest n_used it supports.
+bool plan_moe_weighted_sum(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                           const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    if (c.node_indices.size() < 2 || !outputs_are(c, { c.node_indices.size() - 1 })) {
+        return false;
+    }
+    const ggml_tensor * mul = graph->nodes[c.node_indices[0]];
+    const ggml_tensor * out = graph->nodes[c.node_indices.back()];
+    if (mul->op != GGML_OP_MUL || out->op != GGML_OP_ADD) {
+        return false;
+    }
+    const ggml_tensor * experts = mul->src[0];
+    const ggml_tensor * weights = mul->src[1];
+    const int64_t n_embd = mul->ne[0], n_used = mul->ne[1], n_tokens = mul->ne[2];
+    if (experts == nullptr || weights == nullptr || !is_contiguous_f32(experts) || !is_contiguous_f32(weights) ||
+        !is_contiguous_f32(out) || out->ne[0] != n_embd || out->ne[1] != n_tokens || out->ne[2] != 1 ||
+        out->ne[3] != 1 || weights->ne[0] != 1 || weights->ne[1] != n_used || weights->ne[2] != n_tokens ||
+        int64_t(c.node_indices.size()) < n_used || !fits_i32(ggml_nelements(experts)) ||
+        n_tokens > 65535 || !distinct(out, experts)) {
+        return false;
+    }
+    if (!distinct(out, weights)) {
+        // GGML reused the dead routing weights for the output. One token:
+        // flagos_moe_weighted_sum_token_f32 reads every weight before it
+        // writes (grid (n_tokens)); with more tokens a program could
+        // overwrite another token's weights, so the pattern is declined.
+        const flagos_kernel_info * kernel = package.find("flagos_moe_weighted_sum_token_f32");
+        if (n_tokens != 1 || kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 5) ||
+            kernel->block_size <= 0 || kernel->tile_k < n_used) {
+            return false;
+        }
+        set_call(call, kernel, n_tokens, { ptr(experts), ptr(weights), ptr(out), i32(n_embd), i32(n_used) });
+        return true;
+    }
+    const flagos_kernel_info * kernel = package.find("flagos_moe_weighted_sum_f32");
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 5) || kernel->block_size <= 0) {
+        return false;
+    }
+    if (call == nullptr) {
+        return true;
+    }
+    set_call(call, kernel, (n_embd + kernel->block_size - 1) / kernel->block_size,
+             { ptr(experts), ptr(weights), ptr(out), i32(n_embd), i32(n_used) });
+    call->grid[1] = static_cast<uint32_t>(n_tokens);
+    return true;
+}
+
 // GLU SWIGLU, split form (gate and up are separate tensors):
 // flagos_swiglu_split_f32(gate, up, out, n) computes g * sigmoid(g) * up.
 bool plan_glu(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -1532,6 +1584,8 @@ bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph
             return plan_rms_norm_mul(package, graph, candidate, call);
         case flagos_pattern_id::add_rms_norm_mul:
             return plan_add_rms_norm_mul(package, graph, candidate, call);
+        case flagos_pattern_id::moe_weighted_sum:
+            return plan_moe_weighted_sum(package, graph, candidate, call);
         default:
             return false;
     }
