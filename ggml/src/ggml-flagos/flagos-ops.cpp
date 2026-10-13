@@ -995,6 +995,52 @@ bool plan_moe_topk_softmax(const flagos_kernel_package & package, const ggml_cgr
     return true;
 }
 
+// Dense FFN decode (pattern ffn_swiglu: two quantized GEMVs and their SWIGLU):
+// flagos_ffn_swiglu_<q4_0|q4_k>_f32_decode(gate_u8, gate_f16, up_u8, up_f16, x,
+// out, k, rows), block_size rows per program; only the GLU output leaves.
+// The GLU's first input is the SiLU (gate) side whatever the node order.
+bool plan_ffn_swiglu(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                     const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    if (c.node_indices.size() != 3 || !outputs_are(c, { 2 })) {
+        return false;
+    }
+    const ggml_tensor * first = graph->nodes[c.node_indices[0]];
+    const ggml_tensor * second = graph->nodes[c.node_indices[1]];
+    const ggml_tensor * glu = graph->nodes[c.node_indices[2]];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[0] == nullptr ||
+        glu->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * gate = glu->src[0] == first ? first : second;
+    const ggml_tensor * up = glu->src[0] == first ? second : first;
+    if (glu->src[1] != up) {
+        return false;
+    }
+    flagos_quantized_matmul_signature gs, us;
+    if (!flagos_describe_quantized_matmul(gate, &gs) || !flagos_describe_quantized_matmul(up, &us) ||
+        gs.weight_kind != us.weight_kind || gs.columns != 1 || us.columns != 1 || gs.k != us.k ||
+        gs.rows != us.rows) {
+        return false;
+    }
+    const char * name = gs.weight_kind == flagos_quantized_matmul_kind::q4_0 ? "flagos_ffn_swiglu_q4_0_f32_decode"
+                      : gs.weight_kind == flagos_quantized_matmul_kind::q4_k ? "flagos_ffn_swiglu_q4_k_f32_decode"
+                      : nullptr;
+    const flagos_kernel_info * kernel = name == nullptr ? nullptr
+        : package.select(name, { { "k", gs.k }, { "rows", gs.rows } });
+    const ggml_tensor * x = gate->src[1];
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 8) || kernel->block_size <= 0 ||
+        x == nullptr || x != up->src[1] || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+        !ggml_is_contiguous(gate->src[0]) || !ggml_is_contiguous(up->src[0]) || !is_contiguous_f32(glu) ||
+        gs.rows % kernel->block_size != 0 || gs.rows > INT32_MAX || gs.k > INT32_MAX ||
+        glu->ne[0] != gs.rows || ggml_nelements(glu) != gs.rows || x->ne[0] != gs.k || ggml_nelements(x) != gs.k ||
+        !distinct(glu, x) || !distinct(glu, gate->src[0]) || !distinct(glu, up->src[0])) {
+        return false;
+    }
+    set_call(call, kernel, gs.rows / kernel->block_size, { ptr(gate->src[0]), ptr(gate->src[0]), ptr(up->src[0]),
+             ptr(up->src[0]), ptr(x), ptr(glu), i32(gs.k), i32(gs.rows) });
+    return true;
+}
+
 // GLU SWIGLU, split form (gate and up are separate tensors):
 // flagos_swiglu_split_f32(gate, up, out, n) computes g * sigmoid(g) * up.
 bool plan_glu(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -2024,6 +2070,8 @@ bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph
             return plan_moe_weighted_sum(package, graph, candidate, call);
         case flagos_pattern_id::moe_topk_softmax:
             return plan_moe_topk_softmax(package, graph, candidate, call);
+        case flagos_pattern_id::ffn_swiglu:
+            return plan_ffn_swiglu(package, graph, candidate, call);
         case flagos_pattern_id::gated_delta_net_decode:
         case flagos_pattern_id::gated_delta_net_prefill:
             return plan_gated_delta_net_cache(package, graph, candidate, call);
