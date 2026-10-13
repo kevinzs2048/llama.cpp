@@ -34,6 +34,9 @@ enum class flagos_pattern_id : uint32_t {
     // MoE expert aggregation: MUL(experts, routing weights), one VIEW per
     // used expert, and the chain of ADDs that sums them.
     moe_weighted_sum     = 17,
+    // MoE router: SOFT_MAX, ARGSORT and its top-k VIEW, GET_ROWS of the
+    // selected probabilities, SUM_ROWS, CLAMP, DIV (llama.cpp norm_w).
+    moe_topk_softmax     = 18,
 };
 
 const char * flagos_pattern_name(flagos_pattern_id id);

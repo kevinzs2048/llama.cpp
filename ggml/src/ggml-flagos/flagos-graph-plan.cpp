@@ -32,6 +32,7 @@ const char * flagos_pattern_name(flagos_pattern_id id) {
         case flagos_pattern_id::attention_output_gate:   return "attention_output_gate";
         case flagos_pattern_id::gdn_gate_projections:    return "gdn_gate_projections";
         case flagos_pattern_id::moe_weighted_sum:        return "moe_weighted_sum";
+        case flagos_pattern_id::moe_topk_softmax:        return "moe_topk_softmax";
     }
     return "unknown";
 }
@@ -108,6 +109,7 @@ flagos_fusion_scope flagos_pattern_scope(flagos_pattern_id id) {
         case flagos_pattern_id::attention_output_gate:
         case flagos_pattern_id::gdn_gate_projections:
         case flagos_pattern_id::moe_weighted_sum:
+        case flagos_pattern_id::moe_topk_softmax:
             return flagos_fusion_scope::graph;
     }
     return flagos_fusion_scope::graph;
@@ -991,6 +993,64 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                 candidate.node_indices = std::move(covered);
                 candidate.eliminated_read_bytes = flagos_tensor_bytes(node) * 2;
                 candidate.eliminated_launches = static_cast<uint32_t>(n_used - 1);
+                candidates.push_back(std::move(candidate));
+            }
+        }
+
+        // MoE router (llama.cpp build_moe_ffn with softmax gating and
+        // norm_w): probs = SOFT_MAX(logits); ids = VIEW(ARGSORT(probs), k);
+        // w = GET_ROWS(reshape(probs), ids); w / CLAMP(SUM_ROWS(w)).
+        // Reshapes/views are matched through operands and covered when
+        // they are graph nodes.
+        if (node->op == GGML_OP_SOFT_MAX && node->src[0] != nullptr && node->src[1] == nullptr) {
+            const ggml_tensor * argsort = nullptr, * topk = nullptr, * rows = nullptr, * sum = nullptr,
+                              * clamp = nullptr, * div = nullptr;
+            std::vector<int> covered = { i };
+            for (int j = i + 1; j < cgraph->n_nodes && div == nullptr; ++j) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                if (flagos_is_graph_barrier(n)) {
+                    break;
+                }
+                bool take = false;
+                if (n->op == GGML_OP_ARGSORT && n->src[0] == node && argsort == nullptr) {
+                    argsort = n; take = true;
+                } else if (argsort != nullptr && n->op == GGML_OP_GET_ROWS && rows == nullptr &&
+                           n->src[0] != nullptr && n->src[0]->view_src == node && n->src[1] != nullptr &&
+                           n->src[1]->op == GGML_OP_VIEW && n->src[1]->view_src == argsort && n->src[1]->view_offs == 0) {
+                    rows = n; topk = n->src[1]; take = true;
+                } else if (rows != nullptr && n->op == GGML_OP_SUM_ROWS && sum == nullptr &&
+                           n->src[0] != nullptr && (n->src[0] == rows || n->src[0]->view_src == rows)) {
+                    sum = n; take = true;
+                } else if (sum != nullptr && n->op == GGML_OP_CLAMP && clamp == nullptr && n->src[0] == sum) {
+                    clamp = n; take = true;
+                } else if (clamp != nullptr && n->op == GGML_OP_DIV && n->src[0] == sum->src[0] && n->src[1] == clamp) {
+                    div = n; take = true;
+                } else if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) {
+                    const ggml_tensor * of = n->view_src;
+                    take = of != nullptr && (of == node || (argsort != nullptr && of == argsort) ||
+                                             (rows != nullptr && of == rows));
+                }
+                if (take) {
+                    covered.push_back(j);
+                }
+            }
+            if (div != nullptr) {
+                for (int j = covered.back() + 1; j < cgraph->n_nodes; ++j) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    if (n->op == GGML_OP_RESHAPE && n->view_src == div) {
+                        covered.push_back(j);
+                        break;
+                    }
+                    if (n->op != GGML_OP_RESHAPE && n->op != GGML_OP_VIEW) {
+                        break;
+                    }
+                }
+                flagos_pattern_candidate candidate;
+                candidate.id = flagos_pattern_id::moe_topk_softmax;
+                candidate.scope = flagos_pattern_scope(candidate.id);
+                candidate.node_indices = std::move(covered);
+                candidate.eliminated_read_bytes = flagos_tensor_bytes(node) * 3;
+                candidate.eliminated_launches = 5;
                 candidates.push_back(std::move(candidate));
             }
         }

@@ -525,6 +525,7 @@ int fusion_supported(flagos_rt_device_t, uint32_t pattern_id) {
         case 4:  // gated_delta_net_decode (cache write)
         case 5:  // gated_delta_net_prefill (cache write)
         case 17: // moe_weighted_sum
+        case 18: // moe_topk_softmax
             return 1;
         default:
             return 0;

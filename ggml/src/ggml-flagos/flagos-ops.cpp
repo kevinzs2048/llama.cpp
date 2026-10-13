@@ -911,6 +911,74 @@ bool plan_gated_delta_net_cache(const flagos_kernel_package & package, const ggm
     return true;
 }
 
+// MoE router (pattern moe_topk_softmax): one program per token computes the
+// softmax of its logits, picks the n_used largest probabilities (ties to the
+// lower index, as the argsort), and writes their indices into the first
+// n_used slots of the ARGSORT row (what the top-k VIEW exposes) and the
+// probabilities divided by their clamped sum into the DIV output:
+// flagos_moe_topk_softmax_f32(logits, ids, weights, n_expert, n_used,
+//   ids_stride, logits_stride, clamp_min, clamp_max), grid (n_tokens).
+bool plan_moe_topk_softmax(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                           const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    const ggml_tensor * softmax = nullptr, * argsort = nullptr, * topk = nullptr, * rows = nullptr,
+                      * clamp = nullptr, * div = nullptr;
+    for (const int index : c.node_indices) {
+        const ggml_tensor * n = graph->nodes[index];
+        switch (n->op) {
+            case GGML_OP_SOFT_MAX: softmax = n; break;
+            case GGML_OP_ARGSORT:  argsort = n; break;
+            case GGML_OP_GET_ROWS: rows = n; topk = n->src[1]; break;
+            case GGML_OP_CLAMP:    clamp = n; break;
+            case GGML_OP_DIV:      div = n; break;
+            default: break;
+        }
+    }
+    if (softmax == nullptr || argsort == nullptr || topk == nullptr || rows == nullptr || clamp == nullptr ||
+        div == nullptr) {
+        return false;
+    }
+    // Required outputs: only the top-k view (or the argsort it views) and the
+    // normalized weights (DIV or a reshape of it).
+    for (const int index : c.required_output_node_indices) {
+        const ggml_tensor * n = graph->nodes[index];
+        if (n != topk && n != argsort && n != div && n->view_src != div) {
+            return false;
+        }
+    }
+    const ggml_tensor * logits = softmax->src[0];
+    float sm[2];
+    std::memcpy(sm, softmax->op_params, sizeof(sm));
+    int32_t order = 0;
+    std::memcpy(&order, argsort->op_params, sizeof(order));
+    float bounds[2];
+    std::memcpy(bounds, clamp->op_params, sizeof(bounds));
+    const int64_t n_expert = logits->ne[0], n_tokens = logits->ne[1], n_used = topk->ne[0];
+    if (logits->type != GGML_TYPE_F32 || logits->nb[0] != sizeof(float) || logits->ne[2] != 1 || logits->ne[3] != 1 ||
+        sm[0] != 1.0f || sm[1] != 0.0f || order != GGML_SORT_ORDER_DESC || argsort->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(argsort) || argsort->ne[0] != n_expert || argsort->ne[1] != n_tokens ||
+        topk->ne[1] != n_tokens || topk->nb[1] != argsort->nb[1] || n_used < 1 || n_used > n_expert ||
+        !is_contiguous_f32(div) || div->ne[0] != n_used || div->ne[1] != n_tokens ||
+        n_tokens > 65535 || !fits_i32(ggml_nelements(argsort)) || partially_overlaps(div, argsort) ||
+        div->data == argsort->data) {
+        return false;
+    }
+    // GGML may place the outputs in the dead logits. One token: the program
+    // reads its whole row before a barrier and writes after it. More tokens:
+    // a program could overwrite another token's logits, so require disjoint.
+    if (n_tokens > 1 && (partially_overlaps(argsort, logits) || partially_overlaps(div, logits) ||
+                         div->data == logits->data || argsort->data == logits->data)) {
+        return false;
+    }
+    const flagos_kernel_info * kernel = package.find("flagos_moe_topk_softmax_f32");
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 9) ||
+        kernel->block_size < n_expert || kernel->tile_k < n_used) {
+        return false;
+    }
+    set_call(call, kernel, n_tokens, { ptr(logits), ptr(argsort), ptr(div), i32(n_expert), i32(n_used),
+             i32(argsort->nb[1] / 4), i32(logits->nb[1] / 4), f32(bounds[0]), f32(bounds[1]) });
+    return true;
+}
+
 // GLU SWIGLU, split form (gate and up are separate tensors):
 // flagos_swiglu_split_f32(gate, up, out, n) computes g * sigmoid(g) * up.
 bool plan_glu(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -1921,6 +1989,8 @@ bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph
             return plan_add_rms_norm_mul(package, graph, candidate, call);
         case flagos_pattern_id::moe_weighted_sum:
             return plan_moe_weighted_sum(package, graph, candidate, call);
+        case flagos_pattern_id::moe_topk_softmax:
+            return plan_moe_topk_softmax(package, graph, candidate, call);
         case flagos_pattern_id::gated_delta_net_decode:
         case flagos_pattern_id::gated_delta_net_prefill:
             return plan_gated_delta_net_cache(package, graph, candidate, call);
