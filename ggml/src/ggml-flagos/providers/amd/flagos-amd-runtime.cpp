@@ -482,8 +482,25 @@ flagos_rt_status graph_capture_end_update(flagos_rt_stream_t handle, flagos_rt_g
 }
 
 flagos_rt_status graph_launch(flagos_rt_stream_t handle, flagos_rt_graph_t graph) {
-    return check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), reinterpret_cast<amd_stream *>(handle)->stream),
-                 "hipGraphLaunch");
+    // Under FLAGOS_AMD_PROFILE a replayed graph is timed as one unit, which
+    // gives the GPU time of a whole token without per-kernel event overhead.
+    static const std::string replay_name = "[graph replay]";
+    amd_profile & prof = profile();
+    hipStream_t stream = reinterpret_cast<amd_stream *>(handle)->stream;
+    hipEvent_t begin = nullptr, end = nullptr;
+    if (prof.enabled) {
+        std::lock_guard<std::mutex> lock(prof.mutex);
+        begin = prof.take();
+        end = prof.take();
+        (void) hipEventRecord(begin, stream);
+    }
+    const flagos_rt_status status = check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), stream), "hipGraphLaunch");
+    if (prof.enabled) {
+        (void) hipEventRecord(end, stream);
+        std::lock_guard<std::mutex> lock(prof.mutex);
+        prof.open.push_back({ &replay_name, begin, end });
+    }
+    return status;
 }
 
 void graph_destroy(flagos_rt_graph_t graph) {
