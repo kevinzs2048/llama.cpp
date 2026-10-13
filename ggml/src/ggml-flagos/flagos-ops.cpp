@@ -1409,12 +1409,13 @@ bool plan_rope(const flagos_kernel_package & package, const ggml_tensor * op, fl
 // Neither kernel has a sequence dimension. Several KV streams (ne[3] > 1:
 // parallel sequences with a non-unified cache) are covered by repeating the
 // launch per stream; K/V and the mask may also be shared (ne[3] == 1).
-// Smallest KV length for split-KV decode; GGML_FLAGOS_FA_SPLITKV_MIN_KV
-// overrides it, 0 disables the path.
+// Smallest KV length for split-KV decode (default 1: the split path beats the
+// single-pass decode kernel even for short contexts on the 890M);
+// GGML_FLAGOS_FA_SPLITKV_MIN_KV overrides it, 0 disables the path.
 int64_t fa_splitkv_min_kv() {
     static const int64_t value = [] {
         const char * v = std::getenv("GGML_FLAGOS_FA_SPLITKV_MIN_KV");
-        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(512);
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(1);
     }();
     return value;
 }
