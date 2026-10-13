@@ -70,7 +70,12 @@ def validate_profile(profile, export):
     warps = profile.get("num_warps", 4)
     if type(warps) is not int or warps not in (1, 2, 4, 8, 16):
         raise RuntimeError("invalid number of warps")
-    return name, signature, constants, resolved, warps
+    # Optional AMD compiler options (software pipelining, occupancy, WMMA packing).
+    options = profile.get("options", {})
+    if not isinstance(options, dict) or set(options) - {"num_stages", "waves_per_eu", "kpack", "matrix_instr_nonkdim"} or \
+            any(type(value) is not int or not 0 <= value <= 64 for value in options.values()):
+        raise RuntimeError("invalid compile options")
+    return name, signature, constants, resolved, warps, dict(options)
 
 
 def source_proof(root, exports):
@@ -152,11 +157,11 @@ def main():
         pass
     with tempfile.TemporaryDirectory(prefix=".flaggems-aot-", dir=output.parent) as temporary:
         stage = Path(temporary); kernels = []; assets = []
-        for export, (name, signature, constants, geometry, warps) in prepared:
+        for export, (name, signature, constants, geometry, warps, options) in prepared:
             fn = export.function
             full_signature = dict(signature, **{key: "constexpr" for key in constants})
             kernel = triton.compile(ASTSource(fn, full_signature, constants, attrs=export.aot_attributes),
-                target=GPUTarget("hip", arch, wave), options={"num_warps": warps, "enable_fp_fusion": False})
+                target=GPUTarget("hip", arch, wave), options={"num_warps": warps, "enable_fp_fusion": False, **options})
             metadata = kernel.metadata
             if getattr(metadata, "global_scratch_size", 0) or getattr(metadata, "profile_scratch_size", 0):
                 raise RuntimeError("export requires unsupported Triton scratch")
@@ -166,6 +171,8 @@ def main():
                 global_scratch_size=0, profile_scratch_size=0, size_bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest(),
                 library_export={"abi": export.abi, "name": export.name, "semantic": export.semantic,
                     "runtime_arguments": export.runtime_arguments, "signature": signature, "constants": constants})
+            if options:
+                item["compile_options"] = dict(options, num_warps=warps)
             validate_hsaco(stage / file, arch, item); kernels.append(item)
         declared_assets = specification.get("assets", [])
         if not isinstance(declared_assets, list) or len(declared_assets) > 16:
