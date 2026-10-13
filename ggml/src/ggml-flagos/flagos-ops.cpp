@@ -381,6 +381,22 @@ bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op,
         set_call(call, kernel, (sig.rows + per - 1) / per, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
         return true;
     }
+    // Prefill with dequantization fused into the GEMM: flagos_mul_mat_<type>_f32_gemm
+    // (same arguments as _batched), grid (ceil(rows / tile_m), ceil(columns / tile_n)).
+    // The fused kernels are compiled for 16-byte aligned weights, x and output.
+    if (precision == GGML_PREC_DEFAULT && f16_prefill_min_columns() > 0 && sig.columns >= f16_prefill_min_columns() &&
+        common_alignment({ w, x, op }) >= 16 && sig.k % 16 == 0) {
+        const flagos_kernel_info * gemm = package.select(base + "_gemm", facts);
+        if (gemm != nullptr && (gemm->argument_count < 0 || gemm->argument_count == 7) && gemm->tile_m > 0 &&
+            gemm->tile_n > 0 && (sig.columns + gemm->tile_n - 1) / gemm->tile_n <= 65535) {
+            set_call(call, gemm, (sig.rows + gemm->tile_m - 1) / gemm->tile_m,
+                     { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows), i32(sig.columns) });
+            if (call != nullptr) {
+                call->grid[1] = static_cast<uint32_t>((sig.columns + gemm->tile_n - 1) / gemm->tile_n);
+            }
+            return true;
+        }
+    }
     if (plan_mul_mat_f16(package, op, sig, precision, call)) {
         return true;
     }
