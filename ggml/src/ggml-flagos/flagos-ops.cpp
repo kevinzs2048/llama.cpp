@@ -1034,7 +1034,8 @@ bool plan_flash_attn(const flagos_kernel_package & package, const ggml_tensor * 
     // As for GEMV: an unusable variant falls back to the base kernel.
     auto usable = [&](const flagos_kernel_info * kern) {
         return kern != nullptr && (kern->argument_count < 0 || kern->argument_count == expected_args) &&
-            kern->tile_k == D && kern->tile_m == 16 && kern->tile_n >= 16 && kern->tile_n <= 64 &&
+            kern->tile_k == D && (decode ? kern->tile_m == 16 : (kern->tile_m >= 16 && kern->tile_m <= 128 &&
+            (kern->tile_m & (kern->tile_m - 1)) == 0)) && kern->tile_n >= 16 && kern->tile_n <= 64 &&
             (kern->tile_n & (kern->tile_n - 1)) == 0 && kern->block_size == (decode ? kern->tile_n : kern->tile_m) &&
             (decode || (n_q + kern->block_size - 1) / kern->block_size <= 65535);
     };
