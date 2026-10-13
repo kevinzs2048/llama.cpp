@@ -44,6 +44,9 @@ struct flagos_kernel_info {
     int tile_m = 0;            // optional multi-dimensional tile, 0 when unused
     int tile_n = 0;
     int tile_k = 0;
+    // Output rows each program of a GEMV / routed GEMV computes; the core
+    // launches ceil(rows / rows_per_program) programs. 1 when absent.
+    int rows_per_program = 1;
     size_t global_scratch_size = 0;
     size_t global_scratch_align = 1;
     size_t profile_scratch_size = 0;

@@ -356,12 +356,13 @@ bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op,
         { "align", common_alignment({ w, x, op }) }, { "bytes", largest_nbytes({ w, x, op }) },
     };
     if (sig.columns == 1) {
-        // Decode GEMV: one program per output row.
+        // Decode GEMV: one program per rows_per_program output rows.
         const flagos_kernel_info * kernel = package.select(base, facts);
         if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 6)) {
             return false;
         }
-        set_call(call, kernel, sig.rows, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
+        const int64_t per = kernel->rows_per_program;
+        set_call(call, kernel, (sig.rows + per - 1) / per, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
         return true;
     }
     if (plan_mul_mat_f16(package, op, sig, precision, call)) {
@@ -1442,10 +1443,9 @@ bool plan_mul_mat_id(const flagos_kernel_package & package, const ggml_tensor * 
         if (chosen != nullptr && (chosen->argument_count < 0 || chosen->argument_count == 17) && chosen->block_size == qk) {
             kernel = chosen;
         }
-        // tile_m rows per program (1 for the base kernels).
-        const int64_t tile_m = std::max<int64_t>(kernel->tile_m, 1);
+        const int64_t per = kernel->rows_per_program;
         if (call != nullptr) {
-            set_call(call, kernel, (w->ne[1] + tile_m - 1) / tile_m, { ptr(w), ptr(w), ptr(x), ptr(ids), ptr(op), i32(w->ne[0]), i32(w->ne[1]),
+            set_call(call, kernel, (w->ne[1] + per - 1) / per, { ptr(w), ptr(w), ptr(x), ptr(ids), ptr(op), i32(w->ne[0]), i32(w->ne[1]),
                      i32(picks), i32(tokens), i32(x->ne[1]), i32(w->ne[2]), i32(w->nb[1]), i32(w->nb[2]),
                      i32(x->nb[1] / 4), i32(x->nb[2] / 4), i32(ids->nb[0] / 4), i32(ids->nb[1] / 4) });
             call->grid[1] = static_cast<uint32_t>(picks * tokens);

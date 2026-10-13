@@ -161,6 +161,7 @@ bool flagos_kernel_package::open_impl(const std::string & dir, std::string & err
             !flagos_get_int(item, "tile_m", info.tile_m, error) ||
             !flagos_get_int(item, "tile_n", info.tile_n, error) ||
             !flagos_get_int(item, "tile_k", info.tile_k, error) ||
+            !flagos_get_int(item, "rows_per_program", info.rows_per_program, error) ||
             !flagos_get_int(item, "global_scratch_size", info.global_scratch_size, error) ||
             !flagos_get_int(item, "global_scratch_align", info.global_scratch_align, error) ||
             !flagos_get_int(item, "profile_scratch_size", info.profile_scratch_size, error) ||
@@ -173,7 +174,7 @@ bool flagos_kernel_package::open_impl(const std::string & dir, std::string & err
             return false;
         }
         if (info.block_size < 0 || info.num_warps < 0 || info.warp_size < 0 || info.shared_memory < 0 ||
-            info.tile_m < 0 || info.tile_n < 0 || info.tile_k < 0) {
+            info.tile_m < 0 || info.tile_n < 0 || info.tile_k < 0 || info.rows_per_program < 1) {
             error = "kernel '" + info.name + "' has negative launch metadata";
             return false;
         }
