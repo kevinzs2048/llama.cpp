@@ -726,6 +726,45 @@ inline bool run(const std::string & name, const program & p) {
         for (int32_t i = 0; i < n; ++i) { norm[i] = x[i] * s; out[i] = norm[i] * w[i]; }
         return true;
     }
+    if (name == "flagos_rms_norm_mul_rope_neox_f32_rec" || name == "flagos_rms_norm_mul_rope_neox_set_rows_f32_f16") {
+        // (x, weight, pos, out, ne0, ne1, ne2, n_dims, eps, theta_scale, freq_scale, attn_factor) or
+        // (x, weight, pos, idx_i64, out_f16, ne0, ne1, ne2, n_dims, dst_rows, eps, theta_scale, freq_scale,
+        //  attn_factor); one program per row, NEOX pairs, theta recurrence as the rope kernel
+        const bool store = name == "flagos_rms_norm_mul_rope_neox_set_rows_f32_f16";
+        const int a = store ? 5 : 4;
+        const int32_t ne0 = I(a), ne1 = I(a + 1), ne2 = I(a + 2), n_dims = I(a + 3);
+        const int s = store ? a + 5 : a + 4;
+        const float eps = S(s), theta_scale = S(s + 1), freq_scale = S(s + 2), attn_factor = S(s + 3);
+        const int64_t row = p.pid_x, token = (row / ne1) % ne2;
+        const float * x = F(0) + row * ne0;
+        const float * w = F(1);
+        const auto * positions = arg<const int32_t *>(p, 2);
+        double sum = 0.0;
+        for (int32_t i = 0; i < ne0; ++i) sum += double(x[i]) * x[i];
+        const float scale = 1.0f / std::sqrt(float(sum / ne0) + eps);
+        float y[1024];
+        if (ne0 > 1024) return false;
+        for (int32_t pr = 0; pr < ne0 / 2; ++pr) {
+            const bool rotated = pr < n_dims / 2;
+            const int32_t first = rotated ? pr : 2 * pr, second = rotated ? pr + n_dims / 2 : 2 * pr + 1;
+            float theta = float(positions[token]);
+            for (int32_t i = 1; i < n_dims / 2; ++i) if (pr >= i) theta *= theta_scale;
+            theta *= freq_scale;
+            const float cs = std::cos(theta) * attn_factor, sn = std::sin(theta) * attn_factor;
+            const float va = x[first] * scale * w[first], vb = x[second] * scale * w[second];
+            y[first] = rotated ? va * cs - vb * sn : va;
+            y[second] = rotated ? va * sn + vb * cs : vb;
+        }
+        if (!store) {
+            for (int32_t i = 0; i < ne0; ++i) F(3)[row * ne0 + i] = y[i];
+            return true;
+        }
+        const int64_t dst = arg<const int64_t *>(p, 3)[token];
+        if (dst < 0 || dst >= I(a + 4)) return true;
+        auto * out = arg<uint16_t *>(p, 4) + (dst * ne1 + row % ne1) * ne0;
+        for (int32_t i = 0; i < ne0; ++i) out[i] = f32_to_f16(y[i]);
+        return true;
+    }
     if (name == "flagos_rms_norm_mul_inplace_f32") {   // (out, x, weight, n_cols, eps)
         const int32_t n = I(3);
         const float * x = F(1) + int64_t(p.pid_x) * n;

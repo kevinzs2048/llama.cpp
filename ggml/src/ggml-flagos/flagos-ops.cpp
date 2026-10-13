@@ -632,6 +632,90 @@ bool plan_rms_norm_mul(const flagos_kernel_package & package, const ggml_cgraph 
     return true;
 }
 
+// RMS_NORM -> MUL(weight row) -> NEOX ROPE (attention q/k norms) in one pass,
+// one program per row (head of a token), BLOCK >= ne0 / 2 rotation pairs:
+// flagos_rms_norm_mul_rope_neox_f32_rec(x, weight, positions, out, ne0, ne1,
+//   ne2, n_dims, eps, theta_scale, freq_scale, attn_factor).
+// With the VIEW + SET_ROWS that stores the rotated rows into an F16 cache
+// (rms_norm_mul_rope_kv_store), the result goes straight to the cache rows:
+// flagos_rms_norm_mul_rope_neox_set_rows_f32_f16(x, weight, positions, index,
+//   out, ne0, ne1, ne2, n_dims, dst_rows, eps, theta_scale, freq_scale, attn_factor).
+// Same math as the separate kernels (theta recurrence of plan_rope); no
+// frequency factors or YaRN. The final node is the only required output.
+bool plan_rms_norm_mul_rope(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                            const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    const bool store = c.id == flagos_pattern_id::rms_norm_mul_rope_kv_store;
+    if (c.node_indices.size() != (store ? 5u : 3u) || !outputs_are(c, { store ? size_t(4) : size_t(2) })) {
+        return false;
+    }
+    const ggml_tensor * norm = graph->nodes[c.node_indices[0]];
+    const ggml_tensor * mul = graph->nodes[c.node_indices[1]];
+    const ggml_tensor * rope = graph->nodes[c.node_indices[2]];
+    float eps = 0.0f;
+    const ggml_tensor * weight = norm_mul_weight(norm, mul, eps);
+    if (weight == nullptr || rope->op != GGML_OP_ROPE || rope->src[0] != mul || rope->src[2] != nullptr) {
+        return false;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * pos = rope->src[1];
+    int32_t p[15];
+    std::memcpy(p, rope->op_params, sizeof(p));
+    float freq_base, freq_scale, ext_factor, attn_factor;
+    std::memcpy(&freq_base, &p[5], sizeof(float));
+    std::memcpy(&freq_scale, &p[6], sizeof(float));
+    std::memcpy(&ext_factor, &p[7], sizeof(float));
+    std::memcpy(&attn_factor, &p[8], sizeof(float));
+    const int64_t ne0 = norm->ne[0];
+    const int32_t n_dims = p[1];
+    if (p[2] != GGML_ROPE_TYPE_NEOX || pos == nullptr || pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) ||
+        pos->ne[0] != norm->ne[2] || pos->ne[1] != 1 || pos->ne[2] != 1 || pos->ne[3] != 1 ||
+        !is_contiguous_f32(rope) || !ggml_are_same_shape(rope, mul) || norm->ne[3] != 1 || ne0 % 2 != 0 ||
+        n_dims <= 0 || n_dims % 2 != 0 || n_dims > ne0 || !std::isfinite(freq_base) || freq_base <= 0.0f ||
+        !std::isfinite(freq_scale) || freq_scale <= 0.0f || ext_factor != 0.0f || !std::isfinite(attn_factor) ||
+        !std::isnormal(std::pow(freq_base, -2.0f / n_dims))) {
+        return false;
+    }
+    const int64_t rows = ggml_nrows(norm);
+    const char * name = store ? "flagos_rms_norm_mul_rope_neox_set_rows_f32_f16" : "flagos_rms_norm_mul_rope_neox_f32_rec";
+    const flagos_kernel_info * kernel = package.select(name, { { "ne0", ne0 } });
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != (store ? 14 : 12)) ||
+        kernel->block_size * 2 < ne0 || rows > INT32_MAX) {
+        return false;
+    }
+    const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
+    if (!store) {
+        // Each program reads its whole row before writing, so the result may
+        // reuse x exactly.
+        if (!same_or_disjoint(rope, x) || !distinct(rope, weight) || !distinct(rope, pos)) {
+            return false;
+        }
+        set_call(call, kernel, rows, { ptr(x), ptr(weight), ptr(pos), ptr(rope), i32(ne0), i32(norm->ne[1]),
+                 i32(norm->ne[2]), i32(n_dims), f32(eps), f32(theta_scale), f32(freq_scale), f32(attn_factor) });
+        return true;
+    }
+    const ggml_tensor * view = graph->nodes[c.node_indices[3]];
+    const ggml_tensor * set_rows = graph->nodes[c.node_indices[4]];
+    const ggml_tensor * index = set_rows->src[1];
+    const ggml_tensor * dst = set_rows->src[2];
+    if (view->op != GGML_OP_VIEW || view->src[0] != rope || view->view_offs != 0 ||
+        view->ne[0] != ne0 * norm->ne[1] || view->ne[1] != norm->ne[2] || view->ne[2] != 1 || view->ne[3] != 1 ||
+        !ggml_is_contiguous(view) || set_rows->op != GGML_OP_SET_ROWS || set_rows->src[0] != view ||
+        set_rows->type != GGML_TYPE_F16 || index == nullptr || index->type != GGML_TYPE_I64 ||
+        !ggml_is_contiguous(index) || index->ne[0] != view->ne[1] || index->ne[1] != 1 || index->ne[2] != 1 ||
+        index->ne[3] != 1 || dst == nullptr || dst->type != GGML_TYPE_F16 || !ggml_are_same_shape(set_rows, dst) ||
+        !ggml_is_contiguous(set_rows) || !ggml_is_contiguous(dst) || set_rows->ne[0] != view->ne[0] ||
+        set_rows->ne[2] != 1 || set_rows->ne[3] != 1 || !fits_i32(ggml_nelements(set_rows)) ||
+        (set_rows->data != nullptr && dst->data != nullptr && set_rows->data != dst->data) ||
+        !distinct(set_rows, x) || !distinct(set_rows, weight) || !distinct(set_rows, pos) ||
+        !distinct(set_rows, index)) {
+        return false;
+    }
+    set_call(call, kernel, rows, { ptr(x), ptr(weight), ptr(pos), ptr(index), ptr(set_rows), i32(ne0),
+             i32(norm->ne[1]), i32(norm->ne[2]), i32(n_dims), i32(set_rows->ne[1]), f32(eps), f32(theta_scale),
+             f32(freq_scale), f32(attn_factor) });
+    return true;
+}
+
 // ADD (residual) -> RMS_NORM -> MUL(weight row), keeping the residual sum:
 // flagos_add_rms_norm_mul_residual_f32(residual_out, mul_out, x, bias, weight, n, eps).
 // Each program reads its row before writing, so the residual may reuse an
@@ -2160,6 +2244,9 @@ bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph
             return plan_rms_norm_mul(package, graph, candidate, call);
         case flagos_pattern_id::add_rms_norm_mul:
             return plan_add_rms_norm_mul(package, graph, candidate, call);
+        case flagos_pattern_id::rms_norm_mul_rope:
+        case flagos_pattern_id::rms_norm_mul_rope_kv_store:
+            return plan_rms_norm_mul_rope(package, graph, candidate, call);
         case flagos_pattern_id::moe_weighted_sum:
             return plan_moe_weighted_sum(package, graph, candidate, call);
         case flagos_pattern_id::moe_topk_softmax:

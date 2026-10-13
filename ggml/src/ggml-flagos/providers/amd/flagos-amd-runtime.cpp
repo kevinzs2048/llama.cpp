@@ -84,10 +84,12 @@ struct amd_kernel {
 // FLAGOS_AMD_PROFILE=1: time every launch on the GPU with a pair of HIP
 // events and print the total per kernel at exit. Launches recorded into a
 // graph are not timed, so profile with graph capture off. Debug aid only.
+// FLAGOS_AMD_PROFILE=2 keeps a separate total per kernel and grid.
 struct amd_profile {
-    struct pending { const std::string * name; hipEvent_t begin, end; };
+    struct pending { std::string name; hipEvent_t begin, end; };
     struct total { double ms = 0; uint64_t count = 0; };
     bool enabled = false;
+    bool by_grid = false;
     std::mutex mutex;
     std::vector<pending> open;
     std::vector<hipEvent_t> pool;
@@ -105,7 +107,7 @@ struct amd_profile {
         for (const pending & p : open) {
             float ms = 0;
             if (hipEventElapsedTime(&ms, p.begin, p.end) == hipSuccess) {
-                total & t = totals[*p.name];
+                total & t = totals[p.name];
                 t.ms += ms;
                 ++t.count;
             }
@@ -134,7 +136,8 @@ amd_profile & profile() {
     static amd_profile p;
     static bool init = [] {
         const char * v = std::getenv("FLAGOS_AMD_PROFILE");
-        p.enabled = v != nullptr && v[0] == '1';
+        p.enabled = v != nullptr && (v[0] == '1' || v[0] == '2');
+        p.by_grid = p.enabled && v[0] == '2';
         return true;
     }();
     (void) init;
@@ -396,7 +399,12 @@ flagos_rt_status launch(flagos_rt_stream_t handle, flagos_rt_kernel_t kernel_han
     if (timed) {
         (void) hipEventRecord(end, stream->stream);
         std::lock_guard<std::mutex> lock(prof.mutex);
-        prof.open.push_back({ &kernel->name, begin, end });
+        std::string name = kernel->name;
+        if (prof.by_grid) {
+            name += " [" + std::to_string(launch->grid[0]) + "," + std::to_string(launch->grid[1]) + "," +
+                    std::to_string(launch->grid[2]) + "]";
+        }
+        prof.open.push_back({ std::move(name), begin, end });
     }
     return status;
 }
@@ -484,7 +492,6 @@ flagos_rt_status graph_capture_end_update(flagos_rt_stream_t handle, flagos_rt_g
 flagos_rt_status graph_launch(flagos_rt_stream_t handle, flagos_rt_graph_t graph) {
     // Under FLAGOS_AMD_PROFILE a replayed graph is timed as one unit, which
     // gives the GPU time of a whole token without per-kernel event overhead.
-    static const std::string replay_name = "[graph replay]";
     amd_profile & prof = profile();
     hipStream_t stream = reinterpret_cast<amd_stream *>(handle)->stream;
     hipEvent_t begin = nullptr, end = nullptr;
@@ -498,7 +505,7 @@ flagos_rt_status graph_launch(flagos_rt_stream_t handle, flagos_rt_graph_t graph
     if (prof.enabled) {
         (void) hipEventRecord(end, stream);
         std::lock_guard<std::mutex> lock(prof.mutex);
-        prof.open.push_back({ &replay_name, begin, end });
+        prof.open.push_back({ "[graph replay]", begin, end });
     }
     return status;
 }
@@ -525,6 +532,8 @@ int fusion_supported(flagos_rt_device_t, uint32_t pattern_id) {
         case 4:  // gated_delta_net_decode (cache write)
         case 5:  // gated_delta_net_prefill (cache write)
         case 7:  // ffn_swiglu (decode, Q4_0 / Q4_K)
+        case 13: // rms_norm_mul_rope
+        case 14: // rms_norm_mul_rope_kv_store
         case 17: // moe_weighted_sum
         case 18: // moe_topk_softmax
             return 1;
