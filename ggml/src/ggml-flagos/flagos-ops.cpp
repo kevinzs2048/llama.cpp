@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <initializer_list>
 #include <string>
 
@@ -1383,9 +1384,13 @@ bool plan_mul_mat_id_grouped(const flagos_kernel_package & package, const ggml_t
         return false;
     }
     const flagos_kernel_info * route = package.find("flagos_moe_route_i32");
+    // x_align / x_stride let a variant load each pair's activations as
+    // vectors (x pointer alignment in bytes, gcd of its row strides in elements).
     const std::initializer_list<flagos_kernel_fact> facts = {
         { "k", w->ne[0] }, { "rows", w->ne[1] }, { "columns", tokens },
         { "align", common_alignment({ w, x, op }) }, { "bytes", largest_nbytes({ w, x, op }) },
+        { "x_align", common_alignment({ x }) },
+        { "x_stride", std::gcd(int64_t(x->nb[1] / sizeof(float)), int64_t(x->nb[2] / sizeof(float))) },
     };
     const std::string name = std::string("flagos_mul_mat_id_") + type + "_f32_grouped";
     const flagos_kernel_info * gemm = package.select(name, facts);
