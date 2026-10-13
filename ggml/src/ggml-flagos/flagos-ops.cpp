@@ -2038,6 +2038,58 @@ bool plan_mul_mat_id(const flagos_kernel_package & package, const ggml_tensor * 
     }
     return true;
 }
+// MUL_MAT with F16 weights (2-D, dense rows) and F32 activations. One
+// column: flagos_mul_mat_f16_f32_gemv(w, x, out, k, rows), rows_per_program
+// rows per program (16-byte aligned operands, k % 8 == 0). More columns:
+// flagos_mul_mat_f16_f32_batched (and its variants) on the weights directly,
+// as the quantized prefill path does after dequantization.
+bool plan_mul_mat_f16w(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    if (w == nullptr || x == nullptr || w->type != GGML_TYPE_F16 || x->type != GGML_TYPE_F32 || !is_contiguous_f32(op) ||
+        !ggml_is_contiguous(w) || x->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const int64_t k = w->ne[0], rows = w->ne[1], columns = x->ne[1];
+    if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[0] != k ||
+        x->nb[1] != size_t(k) * sizeof(float) || op->ne[0] != rows || op->ne[1] != columns || op->ne[2] != 1 ||
+        op->ne[3] != 1 || !fits_i32(ggml_nelements(w)) || !fits_i32(ggml_nelements(x)) ||
+        !fits_i32(ggml_nelements(op)) || !distinct(op, w) || !distinct(op, x)) {
+        return false;
+    }
+    const std::initializer_list<flagos_kernel_fact> facts = {
+        { "k", k }, { "rows", rows }, { "columns", columns },
+        { "align", common_alignment({ w, x, op }) }, { "bytes", largest_nbytes({ w, x, op }) },
+    };
+    if (columns == 1) {
+        const flagos_kernel_info * gemv = package.select("flagos_mul_mat_f16_f32_gemv", facts);
+        if (gemv == nullptr || (gemv->argument_count >= 0 && gemv->argument_count != 5) || k % 8 != 0 ||
+            (op->data != nullptr && common_alignment({ w, x }) < 16)) {
+            return false;
+        }
+        const int64_t per = gemv->rows_per_program;
+        set_call(call, gemv, (rows + per - 1) / per, { ptr(w), ptr(x), ptr(op), i32(k), i32(rows) });
+        return true;
+    }
+    const auto usable = [&](const flagos_kernel_info * kern) {
+        return kern != nullptr && kern->tile_m > 0 && kern->tile_n > 0 &&
+            (kern->argument_count < 0 || kern->argument_count == 6) && (columns + kern->tile_n - 1) / kern->tile_n <= 65535;
+    };
+    const flagos_kernel_info * gemm = package.select("flagos_mul_mat_f16_f32_batched", facts);
+    if (!usable(gemm)) {
+        gemm = package.find("flagos_mul_mat_f16_f32_batched");
+        if (!usable(gemm)) {
+            return false;
+        }
+    }
+    set_call(call, gemm, (rows + gemm->tile_m - 1) / gemm->tile_m,
+             { ptr(w), ptr(x), ptr(op), i32(k), i32(rows), i32(columns) });
+    if (call != nullptr) {
+        call->grid[1] = static_cast<uint32_t>((columns + gemm->tile_n - 1) / gemm->tile_n);
+    }
+    return true;
+}
+
 } // namespace
 
 bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
@@ -2079,7 +2131,8 @@ bool flagos_op_plan(const flagos_kernel_package & package, const ggml_tensor * o
         case GGML_OP_UNARY:
             return plan_unary(package, op, call);
         case GGML_OP_MUL_MAT:
-            return plan_mul_mat(package, op, call) || plan_mul_mat_f32(package, op, call);
+            return plan_mul_mat(package, op, call) || plan_mul_mat_f32(package, op, call) ||
+                   plan_mul_mat_f16w(package, op, call);
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
