@@ -348,6 +348,39 @@ bool plan_mul_mat_f16(const flagos_kernel_package & package, const ggml_tensor *
     return true;
 }
 
+// Few-column MUL_MAT (parallel sequences, speculative decoding). The
+// batched kernel runs one program per row over all columns and is far
+// slower there, so up to GGML_FLAGOS_GEMV_MAX_COLUMNS columns (default 4;
+// 0 disables) repeat the decode GEMV once per column, twice that many for
+// types without a fused GEMM; from GGML_FLAGOS_GEMM_MIN_COLUMNS (default 5;
+// 0 disables) the fused-dequant GEMM is used. The dequantize + F16 GEMM path
+// keeps its own threshold (f16_prefill_min_columns).
+int64_t gemv_max_columns() {
+    static const int64_t value = [] {
+        const char * v = std::getenv("GGML_FLAGOS_GEMV_MAX_COLUMNS");
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(4);
+    }();
+    return value;
+}
+
+// Few columns with one weight read (flagos_mul_mat_<type>_f32_cols) up to
+// GGML_FLAGOS_GEMV_COLS_MAX columns (default 8; 0 disables).
+int64_t gemv_cols_max_columns() {
+    static const int64_t value = [] {
+        const char * v = std::getenv("GGML_FLAGOS_GEMV_COLS_MAX");
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(8);
+    }();
+    return value;
+}
+
+int64_t gemm_min_columns() {
+    static const int64_t value = [] {
+        const char * v = std::getenv("GGML_FLAGOS_GEMM_MIN_COLUMNS");
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(5);
+    }();
+    return value;
+}
+
 bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
     int32_t precision = 0;
     std::memcpy(&precision, op->op_params, sizeof(precision));
@@ -381,21 +414,61 @@ bool plan_mul_mat(const flagos_kernel_package & package, const ggml_tensor * op,
         set_call(call, kernel, (sig.rows + per - 1) / per, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
         return true;
     }
-    // Prefill with dequantization fused into the GEMM: flagos_mul_mat_<type>_f32_gemm
-    // (same arguments as _batched), grid (ceil(rows / tile_m), ceil(columns / tile_n)).
-    // The fused kernels are compiled for 16-byte aligned weights, x and output.
-    if (precision == GGML_PREC_DEFAULT && f16_prefill_min_columns() > 0 && sig.columns >= f16_prefill_min_columns() &&
-        common_alignment({ w, x, op }) >= 16 && sig.k % 16 == 0) {
-        const flagos_kernel_info * gemm = package.select(base + "_gemm", facts);
-        if (gemm != nullptr && (gemm->argument_count < 0 || gemm->argument_count == 7) && gemm->tile_m > 0 &&
-            gemm->tile_n > 0 && (sig.columns + gemm->tile_n - 1) / gemm->tile_n <= 65535) {
-            set_call(call, gemm, (sig.rows + gemm->tile_m - 1) / gemm->tile_m,
-                     { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows), i32(sig.columns) });
+    // Fused-dequant GEMM: flagos_mul_mat_<type>_f32_gemm (same arguments as
+    // _batched), grid (ceil(rows / tile_m), ceil(columns / tile_n)), compiled
+    // for 16-byte aligned weights, x and output.
+    const flagos_kernel_info * gemm = nullptr;
+    if (precision == GGML_PREC_DEFAULT && common_alignment({ w, x, op }) >= 16 && sig.k % 16 == 0) {
+        gemm = package.select(base + "_gemm", facts);
+        if (gemm != nullptr && ((gemm->argument_count >= 0 && gemm->argument_count != 7) || gemm->tile_m <= 0 ||
+                                gemm->tile_n <= 0 || (sig.columns + gemm->tile_n - 1) / gemm->tile_n > 65535)) {
+            gemm = nullptr;
+        }
+    }
+    // Few columns, one weight read: flagos_mul_mat_<type>_f32_cols (same
+    // arguments as _batched), grid (rows, ceil(columns / tile_n)); built for
+    // 16-byte aligned operands, rows % 16 == 0 and k % tile_k == 0.
+    if (sig.columns <= gemv_cols_max_columns() && common_alignment({ w, x, op }) >= 16 && sig.rows % 16 == 0) {
+        const flagos_kernel_info * few = package.select(base + "_cols", facts);
+        if (few != nullptr && (few->argument_count < 0 || few->argument_count == 7) && few->tile_n > 0 &&
+            (few->tile_k <= 0 || sig.k % few->tile_k == 0)) {
+            set_call(call, few, sig.rows, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows), i32(sig.columns) });
             if (call != nullptr) {
-                call->grid[1] = static_cast<uint32_t>((sig.columns + gemm->tile_n - 1) / gemm->tile_n);
+                call->grid[1] = static_cast<uint32_t>((sig.columns + few->tile_n - 1) / few->tile_n);
             }
             return true;
         }
+    }
+    // A few columns: the decode GEMV repeated per column (x and the output
+    // advance by one column per launch). Every launch's pointers must meet
+    // the variant's alignment, so the column strides bound the "align" fact.
+    if (sig.columns <= (gemm != nullptr ? 1 : 2) * gemv_max_columns()) {
+        int64_t align = common_alignment({ w, x, op });
+        for (const size_t stride : { x->nb[1], op->nb[1] }) {
+            align = std::min<int64_t>(align, int64_t(stride & (~stride + 1)));
+        }
+        const flagos_kernel_info * kernel = package.select(base, {
+            { "k", sig.k }, { "rows", sig.rows }, { "columns", 1 }, { "align", align },
+            { "bytes", largest_nbytes({ w, x, op }) },
+        });
+        if (kernel != nullptr && (kernel->argument_count < 0 || kernel->argument_count == 6)) {
+            const int64_t per = kernel->rows_per_program;
+            set_call(call, kernel, (sig.rows + per - 1) / per, { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows) });
+            if (call != nullptr) {
+                call->repeat = static_cast<uint32_t>(sig.columns);
+                call->advance[2] = static_cast<int64_t>(x->nb[1]);
+                call->advance[3] = static_cast<int64_t>(op->nb[1]);
+            }
+            return true;
+        }
+    }
+    if (gemm != nullptr && gemm_min_columns() > 0 && sig.columns >= gemm_min_columns()) {
+        set_call(call, gemm, (sig.rows + gemm->tile_m - 1) / gemm->tile_m,
+                 { ptr(w), ptr(w), ptr(x), ptr(op), i32(sig.k), i32(sig.rows), i32(sig.columns) });
+        if (call != nullptr) {
+            call->grid[1] = static_cast<uint32_t>((sig.columns + gemm->tile_n - 1) / gemm->tile_n);
+        }
+        return true;
     }
     if (plan_mul_mat_f16(package, op, sig, precision, call)) {
         return true;

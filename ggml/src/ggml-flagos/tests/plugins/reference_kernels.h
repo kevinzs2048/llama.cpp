@@ -664,14 +664,16 @@ inline bool run(const std::string & name, const program & p) {
         }
         return true;
     }
-    if (name == "flagos_mul_mat_f32_f32_strided_batched_ieee") {
-        // (w, x, out, k, rows, columns, heads, head_ratio, sample_ratio, sw1..3, sx1..3); tile 32 x 16
+    if (name.rfind("flagos_mul_mat_f32_f32_strided_", 0) == 0) {
+        // (w, x, out, k, rows, columns, heads, head_ratio, sample_ratio, sw1..3, sx1..3); every build
+        // (batched tiles, per-output GEMV) covers tile_m x tile_n outputs (base 32 x 16)
         const int32_t k = I(3), rows = I(4), cols = I(5), heads = I(6);
+        const int64_t tm = p.tile_m > 0 ? p.tile_m : 32, tn = p.tile_n > 0 ? p.tile_n : 16;
         const int64_t head = p.pid_z % heads, sample = p.pid_z / heads;
         const int64_t a_base = (head / I(7)) * I(10) + (sample / I(8)) * I(11);
         const int64_t b_base = head * I(13) + sample * I(14);
-        for (int64_t m = int64_t(p.pid_x) * 32; m < std::min<int64_t>(int64_t(p.pid_x) * 32 + 32, rows); ++m) {
-            for (int64_t n = int64_t(p.pid_y) * 16; n < std::min<int64_t>(int64_t(p.pid_y) * 16 + 16, cols); ++n) {
+        for (int64_t m = int64_t(p.pid_x) * tm; m < std::min<int64_t>(int64_t(p.pid_x) * tm + tm, rows); ++m) {
+            for (int64_t n = int64_t(p.pid_y) * tn; n < std::min<int64_t>(int64_t(p.pid_y) * tn + tn, cols); ++n) {
                 float acc = 0.0f;
                 for (int32_t kk = 0; kk < k; ++kk) acc += F(0)[a_base + m * I(9) + kk] * F(1)[b_base + n * I(12) + kk];
                 F(2)[(sample * heads + head) * int64_t(rows) * cols + n * rows + m] = acc;
@@ -854,12 +856,30 @@ inline bool run(const std::string & name, const program & p) {
         const auto * w = arg<const uint8_t *>(p, 0);
         auto * out = arg<uint16_t *>(p, 2);
         float tmp[256];
-        f.dequant(w + int64_t(p.pid_x) * f.block_bytes, tmp);
-        for (int i = 0; i < f.block_elems; ++i) out[int64_t(p.pid_x) * f.block_elems + i] = f32_to_f16(tmp[i]);
+        // _blocks: block_size / block_elems quant blocks per program, bounded by n_blocks (arg 3).
+        const bool many = name.size() > 7 && name.compare(name.size() - 7, 7, "_blocks") == 0;
+        const int64_t per = many ? int64_t(p.block) / f.block_elems : 1;
+        const int64_t b0 = int64_t(p.pid_x) * per, b1 = many ? std::min<int64_t>(b0 + per, I(3)) : b0 + 1;
+        for (int64_t b = b0; b < b1; ++b) {
+            f.dequant(w + b * f.block_bytes, tmp);
+            for (int i = 0; i < f.block_elems; ++i) out[b * f.block_elems + i] = f32_to_f16(tmp[i]);
+        }
         return true;
     }
     // F16 GEMM: (w_f16, x, y, k, rows, columns); grid (ceil(rows / tile_m),
     // ceil(columns / tile_n)); activations are rounded to F16, F32 accumulate.
+    if (name.rfind("flagos_mul_mat_f16_f32_gemv", 0) == 0) {   // (w_f16, x, out, k, rows); tile_m rows per program
+        const auto * w = arg<const uint16_t *>(p, 0);
+        const int32_t k = I(3), rows = I(4);
+        const int64_t per = std::max<uint32_t>(p.tile_m, 1u);
+        const int64_t r0 = int64_t(p.pid_x) * per, r1 = std::min<int64_t>(r0 + per, rows);
+        for (int64_t r = r0; r < r1; ++r) {
+            double sum = 0.0;
+            for (int32_t i = 0; i < k; ++i) sum += double(f16_to_f32(w[r * k + i])) * F(1)[i];
+            F(2)[r] = float(sum);
+        }
+        return true;
+    }
     if (name.rfind("flagos_mul_mat_f16_f32_batched", 0) == 0) {
         const auto * w = arg<const uint16_t *>(p, 0);
         const float * x = F(1);
@@ -889,6 +909,20 @@ inline bool run(const std::string & name, const program & p) {
         const int32_t k = I(4);
         const int32_t rows = I(5);
         const bool batched = name.find("_batched") != std::string::npos;
+        if (name.find("_f32_gemm") != std::string::npos) {   // _batched ABI, grid (ceil(rows / tile_m), ceil(columns / tile_n))
+            const int64_t r0 = int64_t(p.pid_x) * p.tile_m, r1 = std::min<int64_t>(r0 + p.tile_m, rows);
+            const int64_t c0 = int64_t(p.pid_y) * p.tile_n, c1 = std::min<int64_t>(c0 + p.tile_n, I(6));
+            for (int64_t c = c0; c < c1; ++c) {
+                for (int64_t r = r0; r < r1; ++r) quant_dot_rows(f, w, x, y, k, rows, r, c);
+            }
+            return true;
+        }
+        if (name.find("_f32_cols") != std::string::npos) {   // _batched ABI, grid (rows, ceil(columns / tile_n))
+            const int64_t c0 = int64_t(p.pid_y) * p.tile_n;
+            const int64_t c1 = std::min<int64_t>(c0 + p.tile_n, I(6));
+            for (int64_t c = c0; c < c1; ++c) quant_dot_rows(f, w, x, y, k, rows, p.pid_x, c);
+            return true;
+        }
         if (!batched) {
             quant_dot_rows(f, w, x, y, k, rows, p.pid_x, 0);
             return true;
