@@ -1344,7 +1344,10 @@ bool plan_rms_norm_strided(const flagos_kernel_package & package, const ggml_ten
 // SSM_CONV (Mamba / Gated DeltaNet short convolution):
 // flagos_ssm_conv_f32(s, c, out, d_conv, d_inner, n_tokens, n_seqs, ss1, ss2, sc1, so0, so1),
 // grid (n_tokens, n_seqs, ceil(d_inner / BLOCK)).
-bool plan_ssm_conv(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+// SSM_CONV (conv) written to out: conv itself, or the SILU that consumes it
+// (pattern ssm_conv_silu, kernel flagos_ssm_conv_silu_f32 with the same ABI).
+bool plan_ssm_conv_into(const flagos_kernel_package & package, const ggml_tensor * op, const ggml_tensor * out,
+                        const char * name, flagos_kernel_call * call) {
     const ggml_tensor * s = op->src[0];
     const ggml_tensor * c = op->src[1];
     if (s == nullptr || c == nullptr || op->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 ||
@@ -1353,11 +1356,12 @@ bool plan_ssm_conv(const flagos_kernel_package & package, const ggml_tensor * op
         c->ne[2] != 1 || c->ne[3] != 1 || s->ne[0] != c->ne[0] - 1 + op->ne[1] || s->ne[1] != c->ne[1] ||
         s->ne[2] != op->ne[2] || s->ne[3] != 1 || op->ne[0] != c->ne[1] || op->ne[3] != 1 ||
         !fits_i32(ggml_nelements(op)) || op->ne[1] > INT32_MAX || op->ne[2] > 65535 ||
-        partially_overlaps(op, s) || partially_overlaps(op, c) ||
-        (op->data != nullptr && (op->data == s->data || op->data == c->data))) {
+        out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || !ggml_are_same_shape(out, op) ||
+        partially_overlaps(out, s) || partially_overlaps(out, c) ||
+        (out->data != nullptr && (out->data == s->data || out->data == c->data))) {
         return false;
     }
-    const flagos_kernel_info * kernel = find_kernel(package, "flagos_ssm_conv_f32", 12, op->ne[1]);
+    const flagos_kernel_info * kernel = find_kernel(package, name, 12, op->ne[1]);
     if (kernel == nullptr || kernel->block_size <= 0) {
         return false;
     }
@@ -1365,14 +1369,34 @@ bool plan_ssm_conv(const flagos_kernel_package & package, const ggml_tensor * op
     if (channel_programs > 65535) {
         return false;
     }
-    set_call(call, kernel, op->ne[1], { ptr(s), ptr(c), ptr(op), i32(c->ne[0]), i32(op->ne[0]), i32(op->ne[1]),
+    set_call(call, kernel, op->ne[1], { ptr(s), ptr(c), ptr(out), i32(c->ne[0]), i32(op->ne[0]), i32(op->ne[1]),
              i32(op->ne[2]), i32(s->nb[1] / sizeof(float)), i32(s->nb[2] / sizeof(float)), i32(c->nb[1] / sizeof(float)),
-             i32(op->nb[1] / sizeof(float)), i32(op->nb[2] / sizeof(float)) });
+             i32(out->nb[1] / sizeof(float)), i32(out->nb[2] / sizeof(float)) });
     if (call != nullptr) {
         call->grid[1] = static_cast<uint32_t>(op->ne[2]);
         call->grid[2] = static_cast<uint32_t>(channel_programs);
     }
     return true;
+}
+
+bool plan_ssm_conv(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
+    return plan_ssm_conv_into(package, op, op, "flagos_ssm_conv_f32", call);
+}
+
+// SSM_CONV -> SILU: the conv result is not materialized; the SILU output may
+// reuse the conv buffer (each element is written once, nothing reads it).
+bool plan_ssm_conv_silu(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                        const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    if (c.node_indices.size() != 2 || !outputs_are(c, { 1 })) {
+        return false;
+    }
+    const ggml_tensor * conv = graph->nodes[c.node_indices[0]];
+    const ggml_tensor * silu = graph->nodes[c.node_indices[1]];
+    if (conv->op != GGML_OP_SSM_CONV || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+        silu->src[0] != conv) {
+        return false;
+    }
+    return plan_ssm_conv_into(package, conv, silu, "flagos_ssm_conv_silu_f32", call);
 }
 
 // 16-byte alignment, decided structurally before allocation: allocations
@@ -2302,6 +2326,8 @@ bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph
             return plan_rms_norm_mul_rope(package, graph, candidate, call);
         case flagos_pattern_id::mul_mat_siblings:
             return plan_mul_mat_siblings(package, graph, candidate, call);
+        case flagos_pattern_id::ssm_conv_silu:
+            return plan_ssm_conv_silu(package, graph, candidate, call);
         case flagos_pattern_id::moe_weighted_sum:
             return plan_moe_weighted_sum(package, graph, candidate, call);
         case flagos_pattern_id::moe_topk_softmax:

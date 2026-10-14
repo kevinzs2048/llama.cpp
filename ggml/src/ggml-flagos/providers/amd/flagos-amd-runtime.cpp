@@ -529,6 +529,7 @@ int fusion_supported(flagos_rt_device_t, uint32_t pattern_id) {
     switch (pattern_id) {
         case 1:  // rms_norm_mul
         case 2:  // add_rms_norm_mul
+        case 3:  // ssm_conv_silu
         case 4:  // gated_delta_net_decode (cache write)
         case 5:  // gated_delta_net_prefill (cache write)
         case 7:  // ffn_swiglu (decode, Q4_0 / Q4_K)

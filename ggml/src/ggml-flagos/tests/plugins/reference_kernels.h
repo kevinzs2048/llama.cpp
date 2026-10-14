@@ -303,14 +303,16 @@ inline bool run(const std::string & name, const program & p) {
         for (int32_t c = 0; c < n; ++c) F(0)[row * n + c] = x[c] * scale;
         return true;
     }
-    if (name == "flagos_ssm_conv_f32") {   // (s, c, out, d_conv, d_inner, n_tokens, n_seqs, ss1, ss2, sc1, so0, so1)
+    if (name == "flagos_ssm_conv_f32" || name == "flagos_ssm_conv_silu_f32") {
+        // (s, c, out, d_conv, d_inner, n_tokens, n_seqs, ss1, ss2, sc1, so0, so1); _silu applies x * sigmoid(x)
+        const bool silu = name == "flagos_ssm_conv_silu_f32";
         const int64_t t = p.pid_x, seq = p.pid_y;
         const int32_t d_conv = I(3), d_inner = I(4);
         const int64_t c0 = int64_t(p.pid_z) * p.block, c1 = std::min<int64_t>(c0 + p.block, d_inner);
         for (int64_t ch = c0; ch < c1; ++ch) {
             float acc = 0.0f;
             for (int32_t tap = 0; tap < d_conv; ++tap) acc += F(0)[seq * I(8) + ch * I(7) + t + tap] * F(1)[ch * I(9) + tap];
-            F(2)[seq * I(11) + t * I(10) + ch] = acc;
+            F(2)[seq * I(11) + t * I(10) + ch] = silu ? acc / (1.0f + std::exp(-acc)) : acc;
         }
         return true;
     }
