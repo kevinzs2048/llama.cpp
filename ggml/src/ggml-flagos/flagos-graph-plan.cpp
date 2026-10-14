@@ -33,6 +33,7 @@ const char * flagos_pattern_name(flagos_pattern_id id) {
         case flagos_pattern_id::gdn_gate_projections:    return "gdn_gate_projections";
         case flagos_pattern_id::moe_weighted_sum:        return "moe_weighted_sum";
         case flagos_pattern_id::moe_topk_softmax:        return "moe_topk_softmax";
+        case flagos_pattern_id::mul_mat_siblings:        return "mul_mat_siblings";
     }
     return "unknown";
 }
@@ -110,6 +111,7 @@ flagos_fusion_scope flagos_pattern_scope(flagos_pattern_id id) {
         case flagos_pattern_id::gdn_gate_projections:
         case flagos_pattern_id::moe_weighted_sum:
         case flagos_pattern_id::moe_topk_softmax:
+        case flagos_pattern_id::mul_mat_siblings:
             return flagos_fusion_scope::graph;
     }
     return flagos_fusion_scope::graph;
@@ -1466,6 +1468,57 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                     flagos_tensor_bytes(alpha_softplus);
                 candidate.eliminated_launches = 5;
                 candidates.push_back(std::move(candidate));
+            }
+        }
+
+        // Decode projections sharing one activation (attention Q, K, V): the
+        // two or three MUL_MATs that read the same single-column src1 between
+        // its first reader and the next barrier, found from the first reader.
+        // All of them, and each adjacent pair, are candidates: an early write
+        // of a later output is often unsafe (the allocator reuses it for the
+        // nodes in between), so the planner keeps whichever passes. A
+        // gate/up pair scores below ffn_swiglu.
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
+            ggml_nelements(node->src[1]) == node->src[1]->ne[0]) {
+            const ggml_tensor * shared = node->src[1];
+            bool first = true;
+            for (int j = i - 1; j >= 0 && cgraph->nodes[j] != shared; --j) {
+                const ggml_tensor * earlier = cgraph->nodes[j];
+                if (earlier->op == GGML_OP_MUL_MAT && earlier->src[1] == shared) {
+                    first = false;
+                    break;
+                }
+                if (flagos_is_graph_barrier(earlier)) {
+                    break;
+                }
+            }
+            std::vector<int> siblings = { i };
+            for (int j = i + 1; first && j < cgraph->n_nodes && siblings.size() <= 3; ++j) {
+                const ggml_tensor * other = cgraph->nodes[j];
+                if (flagos_is_graph_barrier(other)) {
+                    break;
+                }
+                if (other->op == GGML_OP_MUL_MAT && other->src[1] == shared) {
+                    siblings.push_back(j);
+                }
+            }
+            if (first && siblings.size() >= 2 && siblings.size() <= 3) {
+                std::vector<std::vector<int>> groups;
+                if (siblings.size() == 3) {
+                    groups.push_back(siblings);
+                }
+                for (size_t s = 0; s + 1 < siblings.size(); ++s) {
+                    groups.push_back({ siblings[s], siblings[s + 1] });
+                }
+                for (const auto & group : groups) {
+                    flagos_pattern_candidate candidate;
+                    candidate.id = flagos_pattern_id::mul_mat_siblings;
+                    candidate.scope = flagos_pattern_scope(candidate.id);
+                    candidate.node_indices = group;
+                    candidate.eliminated_read_bytes = (group.size() - 1) * flagos_tensor_bytes(shared);
+                    candidate.eliminated_launches = static_cast<uint32_t>(group.size() - 1);
+                    candidates.push_back(candidate);
+                }
             }
         }
 

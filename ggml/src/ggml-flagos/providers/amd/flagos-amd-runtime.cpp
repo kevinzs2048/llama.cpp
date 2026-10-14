@@ -536,6 +536,7 @@ int fusion_supported(flagos_rt_device_t, uint32_t pattern_id) {
         case 14: // rms_norm_mul_rope_kv_store
         case 17: // moe_weighted_sum
         case 18: // moe_topk_softmax
+        case 19: // mul_mat_siblings (decode Q/K/V GEMVs)
             return 1;
         default:
             return 0;

@@ -726,6 +726,28 @@ inline bool run(const std::string & name, const program & p) {
         for (int32_t i = 0; i < n; ++i) { norm[i] = x[i] * s; out[i] = norm[i] * w[i]; }
         return true;
     }
+    if (name == "flagos_mul_mat3_q4_0_f32") {
+        // (w0_u8, w0_f16, w1_u8, w1_f16, w2_u8, w2_f16, x, out0, out1, out2, k, rows0, rows1, rows2);
+        // one program per row of the three matrices in turn
+        const int32_t k = I(10);
+        int64_t row = p.pid_x;
+        int m = 0;
+        while (m < 2 && row >= I(11 + m)) { row -= I(11 + m); ++m; }
+        const auto * w = arg<const uint8_t *>(p, 2 * m) + row * (k / 32) * 18;
+        const float * x = F(6);
+        double sum = 0.0;
+        for (int32_t b = 0; b < k / 32; ++b) {
+            const uint8_t * blk = w + b * 18;
+            const float d = f16_to_f32(uint16_t(blk[0] | (blk[1] << 8)));
+            float acc = 0.0f;
+            for (int j = 0; j < 16; ++j) {
+                acc += float(int(blk[2 + j] & 15) - 8) * x[b * 32 + j] + float(int(blk[2 + j] >> 4) - 8) * x[b * 32 + j + 16];
+            }
+            sum += double(d) * acc;
+        }
+        F(7 + m)[row] = float(sum);
+        return true;
+    }
     if (name == "flagos_rms_norm_mul_rope_neox_f32_rec" || name == "flagos_rms_norm_mul_rope_neox_set_rows_f32_f16") {
         // (x, weight, pos, out, ne0, ne1, ne2, n_dims, eps, theta_scale, freq_scale, attn_factor) or
         // (x, weight, pos, idx_i64, out_f16, ne0, ne1, ne2, n_dims, dst_rows, eps, theta_scale, freq_scale,

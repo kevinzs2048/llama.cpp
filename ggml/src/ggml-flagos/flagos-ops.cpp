@@ -632,6 +632,59 @@ bool plan_rms_norm_mul(const flagos_kernel_package & package, const ggml_cgraph 
     return true;
 }
 
+// Two or three decode GEMVs that share one activation (pattern
+// mul_mat_siblings: attention Q, K, V) in one launch over all their rows:
+// flagos_mul_mat3_<q>_f32(w0_u8, w0_f16, w1_u8, w1_f16, w2_u8, w2_f16, x,
+//   out0, out1, out2, k, rows0, rows1, rows2), grid rows0 + rows1 + rows2;
+// a pair passes its second matrix again with rows2 = 0. Q4_0 only; the
+// kernel is built for 16-byte aligned operands and k a multiple of tile_k.
+bool plan_mul_mat_siblings(const flagos_kernel_package & package, const ggml_cgraph * graph,
+                           const flagos_pattern_candidate & c, flagos_kernel_call * call) {
+    const size_t n = c.node_indices.size();
+    if (n != 2 && n != 3) {
+        return false;
+    }
+    const ggml_tensor * op[3];
+    flagos_quantized_matmul_signature sig[3];
+    for (size_t i = 0; i < n; ++i) {
+        op[i] = graph->nodes[c.node_indices[i]];
+        if (!flagos_describe_quantized_matmul(op[i], &sig[i]) || sig[i].columns != 1 ||
+            sig[i].weight_kind != flagos_quantized_matmul_kind::q4_0 || sig[i].k != sig[0].k ||
+            op[i]->src[1] != op[0]->src[1] || sig[i].rows % 16 != 0 ||
+            size_t(sig[i].rows) * op[i]->src[0]->nb[1] > size_t(INT32_MAX)) {
+            return false;
+        }
+    }
+    const ggml_tensor * x = op[0]->src[1];
+    for (size_t i = 0; i < n; ++i) {
+        if (!distinct(op[i], x) || !distinct(op[i], op[i]->src[0])) {
+            return false;
+        }
+        for (size_t j = 0; j < n; ++j) {
+            if (j != i && (!distinct(op[i], op[j]) || !distinct(op[i], op[j]->src[0]))) {
+                return false;
+            }
+        }
+    }
+    if (n == 2) {
+        op[2] = op[1];
+        sig[2] = sig[1];
+        sig[2].rows = 0;
+    }
+    const int64_t total = sig[0].rows + sig[1].rows + sig[2].rows;
+    const int64_t align = common_alignment({ op[0], op[1], op[2], op[0]->src[0], op[1]->src[0], op[2]->src[0], x });
+    const flagos_kernel_info * kernel = package.select("flagos_mul_mat3_q4_0_f32",
+                                                       { { "k", sig[0].k }, { "rows", total }, { "align", align } });
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 14) || total > INT32_MAX ||
+        (kernel->tile_k > 0 && sig[0].k % kernel->tile_k != 0) || align < 16) {
+        return false;
+    }
+    set_call(call, kernel, total, { ptr(op[0]->src[0]), ptr(op[0]->src[0]), ptr(op[1]->src[0]), ptr(op[1]->src[0]),
+             ptr(op[2]->src[0]), ptr(op[2]->src[0]), ptr(x), ptr(op[0]), ptr(op[1]), ptr(op[2]), i32(sig[0].k),
+             i32(sig[0].rows), i32(sig[1].rows), i32(sig[2].rows) });
+    return true;
+}
+
 // RMS_NORM -> MUL(weight row) -> NEOX ROPE (attention q/k norms) in one pass,
 // one program per row (head of a token), BLOCK >= ne0 / 2 rotation pairs:
 // flagos_rms_norm_mul_rope_neox_f32_rec(x, weight, positions, out, ne0, ne1,
@@ -2247,6 +2300,8 @@ bool flagos_fusion_plan(const flagos_kernel_package & package, const ggml_cgraph
         case flagos_pattern_id::rms_norm_mul_rope:
         case flagos_pattern_id::rms_norm_mul_rope_kv_store:
             return plan_rms_norm_mul_rope(package, graph, candidate, call);
+        case flagos_pattern_id::mul_mat_siblings:
+            return plan_mul_mat_siblings(package, graph, candidate, call);
         case flagos_pattern_id::moe_weighted_sum:
             return plan_moe_weighted_sum(package, graph, candidate, call);
         case flagos_pattern_id::moe_topk_softmax:

@@ -37,6 +37,9 @@ enum class flagos_pattern_id : uint32_t {
     // MoE router: SOFT_MAX, ARGSORT and its top-k VIEW, GET_ROWS of the
     // selected probabilities, SUM_ROWS, CLAMP, DIV (llama.cpp norm_w).
     moe_topk_softmax     = 18,
+    // Two or three decode MUL_MATs reading the same activation (attention
+    // Q, K and V projections) before the next graph barrier.
+    mul_mat_siblings     = 19,
 };
 
 const char * flagos_pattern_name(flagos_pattern_id id);
