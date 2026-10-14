@@ -1249,6 +1249,62 @@ bool plan_moe_topk_softmax(const flagos_kernel_package & package, const ggml_cgr
 // flagos_ffn_swiglu_<q4_0|q4_k>_f32_decode(gate_u8, gate_f16, up_u8, up_f16, x,
 // out, k, rows), block_size rows per program; only the GLU output leaves.
 // The GLU's first input is the SiLU (gate) side whatever the node order.
+int64_t moe_grouped_min_tokens();
+bool plan_mul_mat_id(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call);
+
+// Routed-expert form of ffn_swiglu (decode): gate and up MUL_MAT_IDs with
+// the same input and ids, Q4_0 weights of equal shape and strides, then the
+// SWIGLU. flagos_mul_mat_id_swiglu_q4_0_f32(gate_u8, gate_f16, up_u8, up_f16,
+// x, ids, out, k, rows, picks, tokens, input_picks, experts, sw1, sw2, sx1,
+// sx2, si0, si1), grid (ceil(rows / rows_per_program), picks * tokens), the
+// argument layout of the routed GEMV. Token counts that take the grouped
+// prefill path are left to it.
+bool plan_moe_ffn_swiglu(const flagos_kernel_package & package, const ggml_tensor * gate, const ggml_tensor * up,
+                         const ggml_tensor * glu, flagos_kernel_call * call) {
+    const ggml_tensor * wg = gate->src[0];
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * x = gate->src[1];
+    const ggml_tensor * ids = gate->src[2];
+    if (up->op != GGML_OP_MUL_MAT_ID || up->src[1] != x || up->src[2] != ids || wg == nullptr || wu == nullptr ||
+        x == nullptr || ids == nullptr || wg->type != GGML_TYPE_Q4_0 || wu->type != GGML_TYPE_Q4_0 ||
+        !ggml_are_same_shape(wg, wu) || wg->nb[1] != wu->nb[1] || wg->nb[2] != wu->nb[2] ||
+        !ggml_are_same_shape(gate, up) || !ggml_are_same_shape(glu, gate) || !is_contiguous_f32(glu) ||
+        !is_contiguous_f32(gate) || !is_contiguous_f32(up)) {
+        return false;
+    }
+    // The routed GEMV's own checks (shapes, strides, offsets, op params) for both projections.
+    flagos_kernel_call probe;
+    if (!plan_mul_mat_id(package, gate, &probe) || !plan_mul_mat_id(package, up, &probe)) {
+        return false;
+    }
+    const int64_t picks = ids->ne[0], tokens = ids->ne[1];
+    if (moe_grouped_min_tokens() > 0 && tokens >= moe_grouped_min_tokens()) {
+        return false;
+    }
+    for (const ggml_tensor * t : { wg, wu, x, ids }) {
+        if (!distinct(glu, t)) {
+            return false;
+        }
+    }
+    const flagos_kernel_info * kernel = package.select("flagos_mul_mat_id_swiglu_q4_0_f32", {
+        { "k", wg->ne[0] }, { "rows", wg->ne[1] }, { "columns", tokens },
+        { "align", common_alignment({ wg, wu, x, glu }) }, { "bytes", largest_nbytes({ wg, wu, x, glu }) },
+    });
+    if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 19) || kernel->block_size != 32 ||
+        (kernel->tile_k > 0 && wg->ne[0] % kernel->tile_k != 0)) {
+        return false;
+    }
+    const int64_t per = std::max<int64_t>(kernel->tile_m, 1);
+    set_call(call, kernel, (wg->ne[1] + per - 1) / per, { ptr(wg), ptr(wg), ptr(wu), ptr(wu), ptr(x), ptr(ids), ptr(glu),
+             i32(wg->ne[0]), i32(wg->ne[1]), i32(picks), i32(tokens), i32(x->ne[1]), i32(wg->ne[2]),
+             i32(wg->nb[1]), i32(wg->nb[2]), i32(x->nb[1] / 4), i32(x->nb[2] / 4), i32(ids->nb[0] / 4),
+             i32(ids->nb[1] / 4) });
+    if (call != nullptr) {
+        call->grid[1] = static_cast<uint32_t>(picks * tokens);
+    }
+    return true;
+}
+
 bool plan_ffn_swiglu(const flagos_kernel_package & package, const ggml_cgraph * graph,
                      const flagos_pattern_candidate & c, flagos_kernel_call * call) {
     if (c.node_indices.size() != 3 || !outputs_are(c, { 2 })) {
@@ -1265,6 +1321,9 @@ bool plan_ffn_swiglu(const flagos_kernel_package & package, const ggml_cgraph * 
     const ggml_tensor * up = glu->src[0] == first ? second : first;
     if (glu->src[1] != up) {
         return false;
+    }
+    if (gate->op == GGML_OP_MUL_MAT_ID) {
+        return plan_moe_ffn_swiglu(package, gate, up, glu, call);
     }
     flagos_quantized_matmul_signature gs, us;
     if (!flagos_describe_quantized_matmul(gate, &gs) || !flagos_describe_quantized_matmul(up, &us) ||

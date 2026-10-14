@@ -1525,7 +1525,8 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
         // Parallel FFN projections followed by a SwiGLU.  Providers may
         // lower this as a true fused projection/activation kernel, or decline
         // it and execute the individual nodes through their normal paths.
-        if (node->op == GGML_OP_MUL_MAT) {
+        // Routed experts match too: two MUL_MAT_IDs with the same input and ids.
+        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
             int gate_index = -1;
             int glu_index = -1;
             for (int j = i + 1; j < cgraph->n_nodes; ++j) {
@@ -1534,8 +1535,9 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                     (glu->src[0] == node || glu->src[1] == node)) {
                     const ggml_tensor * other = glu->src[0] == node ? glu->src[1] : glu->src[0];
                     for (int producer = i + 1; producer < j; ++producer) {
-                        if (other != nullptr && other->op == GGML_OP_MUL_MAT &&
-                            cgraph->nodes[producer] == other) {
+                        if (other != nullptr && other->op == node->op && cgraph->nodes[producer] == other &&
+                            (node->op == GGML_OP_MUL_MAT ||
+                             (other->src[1] == node->src[1] && other->src[2] == node->src[2]))) {
                             gate_index = producer;
                             glu_index = j;
                             break;

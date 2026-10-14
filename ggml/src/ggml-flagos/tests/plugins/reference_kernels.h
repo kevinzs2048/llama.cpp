@@ -681,6 +681,122 @@ inline bool run(const std::string & name, const program & p) {
         }
         return true;
     }
+    if (name == "flagos_moe_route_i32") {   // (ids, list, counts, picks, tokens, si0, si1, cap); grid (experts)
+        const int32_t picks = I(3), tokens = I(4), cap = I(7);
+        const auto * ids = arg<const int32_t *>(p, 0);
+        auto * list = arg<int32_t *>(p, 1);
+        int32_t found = 0;
+        for (int32_t pair = 0; pair < picks * tokens; ++pair) {
+            if (ids[(pair % picks) * I(5) + (pair / picks) * I(6)] == int32_t(p.pid_x)) {
+                list[int64_t(p.pid_x) * cap + found++] = pair;
+            }
+        }
+        arg<int32_t *>(p, 2)[p.pid_x] = found;
+        return true;
+    }
+    if (name.rfind("flagos_mul_mat_id_", 0) == 0 && name.find("_grouped") != std::string::npos) {
+        // (w_u8, w_f16, x, list, counts, out, k, rows, picks, input_picks, sw1_b, sw2_b, sx1, sx2, cap);
+        // grid (ceil(rows / tile_m), experts): every listed (pick, token) pair of the expert
+        quant_format f;
+        if (!quant_format_of(name, f)) return false;
+        const int32_t k = I(6), rows = I(7), picks = I(8), input_picks = I(9), cap = I(14);
+        const int64_t expert = p.pid_y, sw1 = I(10), sw2 = I(11), sx1 = I(12), sx2 = I(13);
+        const auto * list = arg<const int32_t *>(p, 3) + expert * cap;
+        const int32_t count = arg<const int32_t *>(p, 4)[expert];
+        float tmp[256];
+        for (int64_t r = int64_t(p.pid_x) * p.tile_m; r < std::min<int64_t>(int64_t(p.pid_x) * p.tile_m + p.tile_m, rows); ++r) {
+            const uint8_t * wr = arg<const uint8_t *>(p, 0) + expert * sw2 + r * sw1;
+            for (int32_t i = 0; i < count; ++i) {
+                const int64_t pair = list[i];
+                const float * x = F(2) + (pair / picks) * sx2 + ((pair % picks) % input_picks) * sx1;
+                double sum = 0.0;
+                for (int32_t b = 0; b < k / f.block_elems; ++b) {
+                    f.dequant(wr + b * f.block_bytes, tmp);
+                    for (int j = 0; j < f.block_elems; ++j) sum += double(tmp[j]) * x[b * f.block_elems + j];
+                }
+                F(5)[pair * rows + r] = float(sum);
+            }
+        }
+        return true;
+    }
+    if (name == "flagos_moe_weighted_sum_f32" || name == "flagos_moe_weighted_sum_token_f32") {
+        // (experts, weights, out, n_embd, n_used): out[e, t] = sum_i experts[e, i, t] * weights[i, t] in
+        // GGML's order. Plain: grid (ceil(n_embd / BLOCK), tokens); token: one program per token, the
+        // output may reuse the weights (read first).
+        const bool token_kernel = name == "flagos_moe_weighted_sum_token_f32";
+        const int32_t n = I(3), used = I(4);
+        const int64_t t = token_kernel ? p.pid_x : p.pid_y;
+        std::vector<float> w(F(1) + t * used, F(1) + t * used + used);
+        const int64_t e0 = token_kernel ? 0 : int64_t(p.pid_x) * p.block;
+        const int64_t e1 = token_kernel ? n : std::min<int64_t>(e0 + p.block, n);
+        const float * base = F(0) + t * used * int64_t(n);
+        for (int64_t e = e0; e < e1; ++e) {
+            float acc = base[e] * w[0];
+            for (int32_t i = 1; i < used; ++i) acc += base[i * int64_t(n) + e] * w[i];
+            F(2)[t * n + e] = acc;
+        }
+        return true;
+    }
+    if (name == "flagos_concat_dim0_bt_f32") {
+        // (a, b, out, a_ne0, ne0, ne1, sa1, sb0); grid (ceil(ne0 / tile_n), ceil(ne1 / tile_m)); b transposed
+        const int32_t a_ne0 = I(3), ne0 = I(4), ne1 = I(5), sa1 = I(6), sb0 = I(7);
+        for (int64_t r = int64_t(p.pid_y) * p.tile_m; r < std::min<int64_t>(int64_t(p.pid_y) * p.tile_m + p.tile_m, ne1); ++r) {
+            for (int64_t c = int64_t(p.pid_x) * p.tile_n; c < std::min<int64_t>(int64_t(p.pid_x) * p.tile_n + p.tile_n, ne0); ++c) {
+                F(2)[r * ne0 + c] = c < a_ne0 ? F(0)[r * sa1 + c] : F(1)[(c - a_ne0) * sb0 + r];
+            }
+        }
+        return true;
+    }
+    if (name == "flagos_moe_topk_softmax_f32") {
+        // (logits, ids_i32, weights, n_expert, n_used, ids_stride, logits_stride, clamp_min, clamp_max);
+        // one token per program; ids may alias the logits row (read first)
+        const int32_t n_expert = I(3), n_used = I(4);
+        const int64_t t = p.pid_x;
+        std::vector<float> prob(F(0) + t * I(6), F(0) + t * I(6) + n_expert);
+        const float mx = *std::max_element(prob.begin(), prob.end());
+        float sum = 0.0f;
+        for (float & v : prob) { v = std::exp(v - mx); sum += v; }
+        for (float & v : prob) v /= sum;
+        std::vector<float> picked(n_used);
+        float total = 0.0f;
+        for (int32_t i = 0; i < n_used; ++i) {
+            const int32_t best = int32_t(std::max_element(prob.begin(), prob.end()) - prob.begin());   // first max
+            arg<int32_t *>(p, 1)[t * I(5) + i] = best;
+            picked[i] = prob[best];
+            total += prob[best];
+            prob[best] = -1.0f;
+        }
+        total = std::min(std::max(total, S(7)), S(8));
+        for (int32_t i = 0; i < n_used; ++i) F(2)[t * n_used + i] = picked[i] / total;
+        return true;
+    }
+    if (name == "flagos_mul_mat_id_swiglu_q4_0_f32") {
+        // (gate_u8, gate_f16, up_u8, up_f16, x, ids, out, k, rows, picks, tokens, input_picks, experts,
+        //  sw1_b, sw2_b, sx1, sx2, si0, si1); grid (ceil(rows / tile_m), picks * tokens)
+        quant_format f;
+        if (!quant_format_of("flagos_mul_mat_q4_0_f32", f)) return false;
+        const int32_t k = I(7), rows = I(8), picks = I(9), input_picks = I(11), experts = I(12);
+        const int64_t sw1 = I(13), sw2 = I(14), sx1 = I(15), sx2 = I(16), si0 = I(17), si1 = I(18);
+        const int64_t pick = p.pid_y % picks, token = p.pid_y / picks;
+        const int64_t expert = arg<const int32_t *>(p, 5)[pick * si0 + token * si1];
+        const bool valid = expert >= 0 && expert < experts;
+        const float * x = F(4) + token * sx2 + (pick % input_picks) * sx1;
+        const int64_t per = std::max<uint32_t>(p.tile_m, 1u);
+        float tmp[32];
+        for (int64_t r = int64_t(p.pid_x) * per; r < std::min<int64_t>(int64_t(p.pid_x) * per + per, rows); ++r) {
+            double dot[2] = { 0.0, 0.0 };
+            for (int m = 0; m < 2 && valid; ++m) {
+                const uint8_t * wr = arg<const uint8_t *>(p, 2 * m) + expert * sw2 + r * sw1;
+                for (int32_t b = 0; b < k / 32; ++b) {
+                    f.dequant(wr + b * f.block_bytes, tmp);
+                    for (int i = 0; i < 32; ++i) dot[m] += double(tmp[i]) * x[b * 32 + i];
+                }
+            }
+            const float g = float(dot[0]), u = float(dot[1]);
+            F(6)[(token * picks + pick) * rows + r] = g / (1.0f + std::exp(-g)) * u;
+        }
+        return true;
+    }
     if (name.rfind("flagos_mul_mat_id_", 0) == 0) {
         // quantized (17): (w_u8, w_f16, x, ids, out, k, rows, picks, tokens, input_picks, experts, sw1_b, sw2_b, sx1, sx2, si0, si1)
         // f32 (16):       (w, x, ids, out, k, rows, picks, tokens, input_picks, experts, sw1, sw2, sx1, sx2, si0, si1)
