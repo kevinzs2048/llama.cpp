@@ -382,7 +382,8 @@ inline bool run(const std::string & name, const program & p) {
         for (int d = 0; d < D; ++d) out[h * soh + d] = num[d] / (den > 0.0f ? den : 1.0f);
         return true;
     }
-    if (name == "flagos_ffn_swiglu_q4_0_f32_decode" || name == "flagos_ffn_swiglu_q4_k_f32_decode") {
+    if (name == "flagos_ffn_swiglu_q4_0_f32_decode" || name == "flagos_ffn_swiglu_q4_k_f32_decode" ||
+        name == "flagos_ffn_swiglu_q8_0_f32_decode" || name == "flagos_ffn_swiglu_q5_0_f32_decode") {
         // (gate_u8, gate_f16, up_u8, up_f16, x, out, k, rows); block rows per program,
         // out[row] = silu(gate[row] . x) * (up[row] . x)
         quant_format f;

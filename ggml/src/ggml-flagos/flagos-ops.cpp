@@ -1246,7 +1246,7 @@ bool plan_moe_topk_softmax(const flagos_kernel_package & package, const ggml_cgr
 }
 
 // Dense FFN decode (pattern ffn_swiglu: two quantized GEMVs and their SWIGLU):
-// flagos_ffn_swiglu_<q4_0|q4_k>_f32_decode(gate_u8, gate_f16, up_u8, up_f16, x,
+// flagos_ffn_swiglu_<q4_0|q4_k|q8_0|q5_0>_f32_decode(gate_u8, gate_f16, up_u8, up_f16, x,
 // out, k, rows), block_size rows per program; only the GLU output leaves.
 // The GLU's first input is the SiLU (gate) side whatever the node order.
 int64_t moe_grouped_min_tokens();
@@ -1333,11 +1333,14 @@ bool plan_ffn_swiglu(const flagos_kernel_package & package, const ggml_cgraph * 
     }
     const char * name = gs.weight_kind == flagos_quantized_matmul_kind::q4_0 ? "flagos_ffn_swiglu_q4_0_f32_decode"
                       : gs.weight_kind == flagos_quantized_matmul_kind::q4_k ? "flagos_ffn_swiglu_q4_k_f32_decode"
+                      : gs.weight_kind == flagos_quantized_matmul_kind::q8_0 ? "flagos_ffn_swiglu_q8_0_f32_decode"
+                      : gs.weight_kind == flagos_quantized_matmul_kind::q5_0 ? "flagos_ffn_swiglu_q5_0_f32_decode"
                       : nullptr;
     const flagos_kernel_info * kernel = name == nullptr ? nullptr
         : package.select(name, { { "k", gs.k }, { "rows", gs.rows } });
     const ggml_tensor * x = gate->src[1];
     if (kernel == nullptr || (kernel->argument_count >= 0 && kernel->argument_count != 8) || kernel->block_size <= 0 ||
+        (kernel->tile_k > 0 && gs.k % kernel->tile_k != 0) ||
         x == nullptr || x != up->src[1] || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
         !ggml_is_contiguous(gate->src[0]) || !ggml_is_contiguous(up->src[0]) || !is_contiguous_f32(glu) ||
         gs.rows % kernel->block_size != 0 || gs.rows > INT32_MAX || gs.k > INT32_MAX ||
