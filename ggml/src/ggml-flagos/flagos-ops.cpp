@@ -2160,12 +2160,13 @@ bool plan_mul_mat_f32(const flagos_kernel_package & package, const ggml_tensor *
     return true;
 }
 
-// Smallest token count for the grouped MUL_MAT_ID path;
-// GGML_FLAGOS_MOE_GROUPED_MIN_TOKENS overrides it, 0 disables the path.
+// Smallest token count for the grouped MUL_MAT_ID path (default 8: from 8
+// parallel sequences on, reading each expert once beats the routed GEMV per
+// pick); GGML_FLAGOS_MOE_GROUPED_MIN_TOKENS overrides it, 0 disables the path.
 int64_t moe_grouped_min_tokens() {
     static const int64_t value = [] {
         const char * v = std::getenv("GGML_FLAGOS_MOE_GROUPED_MIN_TOKENS");
-        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(32);
+        return v != nullptr && v[0] != '\0' ? int64_t(std::strtoll(v, nullptr, 10)) : int64_t(8);
     }();
     return value;
 }
