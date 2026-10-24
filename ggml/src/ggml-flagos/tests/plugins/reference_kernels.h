@@ -695,6 +695,71 @@ inline bool run(const std::string & name, const program & p) {
         arg<int32_t *>(p, 2)[p.pid_x] = found;
         return true;
     }
+    if (name == "flagos_quantize_rows_q8_1_f32") {
+        // (x, xq, xd, xs, k, input_picks, sx1, sx2, n_rows); grid (ceil(n_rows / tile_m), ceil(k / block)):
+        // row r = token * input_picks + pick as GGML Q8_1 per 32 values: d = amax / 127 (F16-rounded),
+        // q = round(x * 127 / amax) half away from zero, s = d * sum(q) (F16-rounded)
+        const int32_t k = I(4), ip = I(5), n_rows = I(8), nb = k / 32;
+        const int64_t sx1 = I(6), sx2 = I(7), per = p.block / 32;
+        auto * xq = arg<int8_t *>(p, 1);
+        for (int64_t r = int64_t(p.pid_x) * p.tile_m; r < std::min<int64_t>(int64_t(p.pid_x) * p.tile_m + p.tile_m, n_rows); ++r) {
+            for (int64_t b = int64_t(p.pid_y) * per; b < std::min<int64_t>(int64_t(p.pid_y) * per + per, nb); ++b) {
+                const float * v = F(0) + (r / ip) * sx2 + (r % ip) * sx1 + b * 32;
+                float amax = 0.0f;
+                for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(v[j]));
+                const float d = amax / 127.0f, inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+                int32_t sum = 0;
+                for (int j = 0; j < 32; ++j) {
+                    const float s = v[j] * inv;
+                    const int32_t q = int32_t(s >= 0.0f ? std::floor(s + 0.5f) : std::ceil(s - 0.5f));
+                    xq[r * k + b * 32 + j] = int8_t(q);
+                    sum += q;
+                }
+                F(2)[r * nb + b] = f16_to_f32(f32_to_f16(d));
+                F(3)[r * nb + b] = f16_to_f32(f32_to_f16(d * float(sum)));
+            }
+        }
+        return true;
+    }
+    if (name.rfind("flagos_mul_mat_id_", 0) == 0 && name.find("_q8_grouped") != std::string::npos) {
+        // (w_u8, w_f16, xq, xd, xs, list, counts, out, k, rows, picks, input_picks, sw1_b, sw2_b, cap);
+        // grid (rows / tile_m, experts): integer quants times the Q8_1 rows per 32-value block,
+        // d_w d_x sum(q_w q_x) (+ m_w s_x for Q4_1)
+        quant_format f;
+        if (!quant_format_of(name, f) || f.block_elems != 32) return false;
+        const int32_t k = I(8), rows = I(9), picks = I(10), input_picks = I(11), cap = I(14), nb = k / 32;
+        const int64_t expert = p.pid_y, sw1 = I(12), sw2 = I(13);
+        const auto * xq = arg<const int8_t *>(p, 2);
+        const auto * list = arg<const int32_t *>(p, 5) + expert * cap;
+        const int32_t count = arg<const int32_t *>(p, 6)[expert];
+        for (int64_t r = int64_t(p.pid_x) * p.tile_m; r < std::min<int64_t>(int64_t(p.pid_x) * p.tile_m + p.tile_m, rows); ++r) {
+            const uint8_t * wr = arg<const uint8_t *>(p, 0) + expert * sw2 + r * sw1;
+            for (int32_t i = 0; i < count; ++i) {
+                const int64_t pair = list[i];
+                const int64_t xr = (pair / picks) * input_picks + (pair % picks) % input_picks;
+                float acc = 0.0f;
+                for (int32_t b = 0; b < nb; ++b) {
+                    const uint8_t * blk = wr + b * f.block_bytes;
+                    const int8_t * a = xq + xr * k + b * 32;
+                    int32_t isum = 0;
+                    float mn = 0.0f;
+                    if (f.block_bytes == 34) {
+                        for (int j = 0; j < 32; ++j) isum += int32_t(int8_t(blk[2 + j])) * a[j];
+                    } else {
+                        const int off = f.block_bytes == 18 ? 2 : 4, bias = f.block_bytes == 18 ? 8 : 0;
+                        for (int j = 0; j < 16; ++j) {
+                            isum += (int32_t(blk[off + j] & 15) - bias) * a[j];
+                            isum += (int32_t(blk[off + j] >> 4) - bias) * a[16 + j];
+                        }
+                        if (f.block_bytes == 20) mn = f16_at(blk + 2);
+                    }
+                    acc += f16_at(blk) * F(3)[xr * nb + b] * float(isum) + mn * F(4)[xr * nb + b];
+                }
+                F(7)[pair * rows + r] = acc;
+            }
+        }
+        return true;
+    }
     if (name.rfind("flagos_mul_mat_id_", 0) == 0 && name.find("_grouped") != std::string::npos) {
         // (w_u8, w_f16, x, list, counts, out, k, rows, picks, input_picks, sw1_b, sw2_b, sx1, sx2, cap);
         // grid (ceil(rows / tile_m), experts): every listed (pick, token) pair of the expert

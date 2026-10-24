@@ -2171,11 +2171,28 @@ int64_t moe_grouped_min_tokens() {
     return value;
 }
 
+// Whether the grouped MUL_MAT_ID may take the integer (Q8_1 activation)
+// kernels when the package has them; GGML_FLAGOS_MOE_Q8=0 keeps the F32
+// activation kernels.
+static bool moe_q8_enabled() {
+    static const bool value = [] {
+        const char * v = std::getenv("GGML_FLAGOS_MOE_Q8");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return value;
+}
+
 // Grouped MUL_MAT_ID for many tokens, after plan_mul_mat_id validated the
 // op: flagos_moe_route_i32 lists each expert's (pick, token) pairs in the
 // workspace (counts at 0, lists at list_offset, cap = picks * tokens per
 // expert), then flagos_mul_mat_id_<type>_f32_grouped multiplies each
 // expert's weight tile by its pairs, grid (ceil(rows / tile_m), experts).
+// Integer form, preferred when the package has it and rows is a multiple of
+// its tile_m: flagos_quantize_rows_q8_1_f32 first writes the activation rows
+// (token * input_picks + pick) as GGML Q8_1 (int8 quants xq, F32 scales xd
+// and scaled sums xs per 32 values) after the lists, grid (ceil(n_rows /
+// tile_m), ceil(k / block_size)); flagos_mul_mat_id_<type>_q8_grouped then
+// uses the CPU's integer vec_dot per block.
 bool plan_mul_mat_id_grouped(const flagos_kernel_package & package, const ggml_tensor * op, flagos_kernel_call * call) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
@@ -2207,6 +2224,71 @@ bool plan_mul_mat_id_grouped(const flagos_kernel_package & package, const ggml_t
         { "x_align", common_alignment({ x }) },
         { "x_stride", std::gcd(int64_t(x->nb[1] / sizeof(float)), int64_t(x->nb[2] / sizeof(float))) },
     };
+    auto add_route = [&]() {
+        flagos_kernel_call::step & rt = call->before[call->n_before++];
+        rt.kernel = route;
+        rt.grid[0] = static_cast<uint32_t>(experts);
+        rt.n_args = 8;
+        rt.args[0] = ptr(ids);
+        rt.args[1] = workspace_offset(list_offset);
+        rt.args[2] = workspace_offset(0);
+        rt.args[3] = i32(picks);
+        rt.args[4] = i32(tokens);
+        rt.args[5] = i32(ids->nb[0] / 4);
+        rt.args[6] = i32(ids->nb[1] / 4);
+        rt.args[7] = i32(cap);
+        rt.in_workspace[1] = true;
+        rt.in_workspace[2] = true;
+    };
+    if (route != nullptr && (route->argument_count < 0 || route->argument_count == 8) && moe_q8_enabled()) {
+        const std::string q8_name = std::string("flagos_mul_mat_id_") + type + "_q8_grouped";
+        const flagos_kernel_info * quant = package.find("flagos_quantize_rows_q8_1_f32");
+        const flagos_kernel_info * q8 = package.select(q8_name, facts);
+        if (q8 == nullptr) {
+            q8 = package.find(q8_name);
+        }
+        const int64_t k = w->ne[0], rows = w->ne[1], n_rows = tokens * x->ne[1], blocks = k / 32;
+        const uint64_t xq_offset = (bytes + 255) & ~uint64_t(255);
+        const uint64_t xd_offset = (xq_offset + uint64_t(n_rows) * uint64_t(k) + 255) & ~uint64_t(255);
+        const uint64_t xs_offset = (xd_offset + uint64_t(n_rows) * uint64_t(blocks) * sizeof(float) + 255) & ~uint64_t(255);
+        const uint64_t q8_bytes = xs_offset + uint64_t(n_rows) * uint64_t(blocks) * sizeof(float);
+        if (quant != nullptr && (quant->argument_count < 0 || quant->argument_count == 9) && quant->tile_m > 0 &&
+            quant->block_size > 0 && quant->block_size % 32 == 0 &&
+            q8 != nullptr && (q8->argument_count < 0 || q8->argument_count == 15) && q8->tile_m > 0 &&
+            rows % q8->tile_m == 0 && k % 32 == 0 && n_rows <= INT32_MAX / k && q8_bytes <= uint64_t(INT32_MAX)) {
+            if (call == nullptr) {
+                return true;
+            }
+            set_call(call, q8, rows / q8->tile_m,
+                     { ptr(w), ptr(w), workspace_offset(xq_offset), workspace_offset(xd_offset),
+                       workspace_offset(xs_offset), workspace_offset(list_offset), workspace_offset(0), ptr(op),
+                       i32(k), i32(rows), i32(picks), i32(x->ne[1]), i32(w->nb[1]), i32(w->nb[2]), i32(cap) });
+            call->grid[1] = static_cast<uint32_t>(experts);
+            for (int i = 2; i <= 6; ++i) {
+                call->in_workspace[i] = true;
+            }
+            call->workspace_bytes = q8_bytes;
+            add_route();
+            flagos_kernel_call::step & qs = call->before[call->n_before++];
+            qs.kernel = quant;
+            qs.grid[0] = static_cast<uint32_t>((n_rows + quant->tile_m - 1) / quant->tile_m);
+            qs.grid[1] = static_cast<uint32_t>((k + quant->block_size - 1) / quant->block_size);
+            qs.n_args = 9;
+            qs.args[0] = ptr(x);
+            qs.args[1] = workspace_offset(xq_offset);
+            qs.args[2] = workspace_offset(xd_offset);
+            qs.args[3] = workspace_offset(xs_offset);
+            qs.args[4] = i32(k);
+            qs.args[5] = i32(x->ne[1]);
+            qs.args[6] = i32(x->nb[1] / 4);
+            qs.args[7] = i32(x->nb[2] / 4);
+            qs.args[8] = i32(n_rows);
+            qs.in_workspace[1] = true;
+            qs.in_workspace[2] = true;
+            qs.in_workspace[3] = true;
+            return true;
+        }
+    }
     const std::string name = std::string("flagos_mul_mat_id_") + type + "_f32_grouped";
     const flagos_kernel_info * gemm = package.select(name, facts);
     if (gemm == nullptr) {
@@ -2228,20 +2310,7 @@ bool plan_mul_mat_id_grouped(const flagos_kernel_package & package, const ggml_t
     call->in_workspace[3] = true;
     call->in_workspace[4] = true;
     call->workspace_bytes = bytes;
-    flagos_kernel_call::step & rt = call->before[call->n_before++];
-    rt.kernel = route;
-    rt.grid[0] = static_cast<uint32_t>(experts);
-    rt.n_args = 8;
-    rt.args[0] = ptr(ids);
-    rt.args[1] = workspace_offset(list_offset);
-    rt.args[2] = workspace_offset(0);
-    rt.args[3] = i32(picks);
-    rt.args[4] = i32(tokens);
-    rt.args[5] = i32(ids->nb[0] / 4);
-    rt.args[6] = i32(ids->nb[1] / 4);
-    rt.args[7] = i32(cap);
-    rt.in_workspace[1] = true;
-    rt.in_workspace[2] = true;
+    add_route();
     return true;
 }
 
