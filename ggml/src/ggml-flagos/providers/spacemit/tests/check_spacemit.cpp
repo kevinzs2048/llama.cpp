@@ -30,6 +30,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-flagos.h"
+#include "flagos-registry.h"  // flagos_registry_get_device_info (no longer pulled in by the public ggml-flagos.h)
 #include "ggml.h"
 #include "providers/spacemit/flagos-spacemit-exec.h"  // spacemit_ordered_counts_take (E3b-diag)
 #include "providers/spacemit/flagos-spacemit-ime.h"   // spacemit_mm_paths_take
