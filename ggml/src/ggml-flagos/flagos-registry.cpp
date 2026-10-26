@@ -1,6 +1,8 @@
 #include "ggml-flagos.h"
 #include "flagos-provider.h"
 #include "flagos-registry.h"
+#include "flagos-loader.h"
+#include "flagos-rt-device.h"
 
 #include "../ggml-backend-impl.h"
 #include "../ggml-impl.h"
@@ -84,8 +86,40 @@ static std::vector<const flagos_provider_v1 *> flagos_compiled_providers() {
     return providers;
 }
 
+// Provider plugins found on the search path. Loaded once, on first use by
+// either the registry or the DL score function, and never unloaded.
+static const flagos_loader_result & flagos_plugins() {
+    static flagos_loader_result result;
+    static std::once_flag once;
+    std::call_once(once, []() {
+        result = flagos_loader_load_all();
+        for (const std::string & rejected : result.rejected) {
+            GGML_LOG_WARN("FlagOS: skipped provider plugin %s\n", rejected.c_str());
+        }
+        for (const flagos_loaded_provider & plugin : result.providers) {
+            GGML_LOG_DEBUG("FlagOS: loaded provider plugin '%s' from %s\n", plugin.name.c_str(), plugin.path.c_str());
+        }
+    });
+    return result;
+}
+
 static std::vector<const flagos_provider_v1 *> flagos_all_providers() {
     std::vector<const flagos_provider_v1 *> providers = flagos_compiled_providers();
+    std::vector<flagos_runtime_source> runtimes;
+    for (const flagos_loaded_provider & plugin : flagos_plugins().providers) {
+        if (plugin.entry->kind == FLAGOS_PROVIDER_ENTRY_DEVICE) {
+            providers.push_back(plugin.entry->device);
+        } else {
+            runtimes.push_back({ plugin.entry->runtime, plugin.dir.c_str() });
+        }
+    }
+    // RUNTIME-kind plugins get core-owned GGML devices, exposed through one
+    // adapter descriptor so selection and profiles work for both kinds.
+    if (!runtimes.empty()) {
+        if (const flagos_provider_v1 * adapter = flagos_runtime_adapter(runtimes)) {
+            providers.push_back(adapter);
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(flagos_provider_mutex);
         providers.insert(providers.end(), flagos_extra_providers.begin(), flagos_extra_providers.end());
@@ -171,7 +205,7 @@ ggml_backend_reg_t ggml_backend_flagos_reg() {
                 flagos_device_identity identity {};
                 flagos_device_caps caps {};
                 flagos_device_profile profile {};
-                if (device == nullptr ||
+                if (!flagos_device_interface_is_valid(device) ||
                     !provider->device_identity(local_index, &identity) ||
                     !flagos_device_identity_is_valid(provider, local_index, &identity) ||
                     flagos_device_identity_is_registered(identity) ||
@@ -336,11 +370,14 @@ ggml_backend_t ggml_backend_flagos_init(int device) {
         return nullptr;
     }
     const flagos_registered_device & selected = flagos_devices[device];
-    if (!selected.provider->set_device(selected.local_index)) {
+    if (selected.provider->set_device && !selected.provider->set_device(selected.local_index)) {
         return nullptr;
     }
-    flagos_active_device.store(device);
-    return ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, device), nullptr);
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, device), nullptr);
+    if (backend) {
+        flagos_active_device.store(device);
+    }
+    return backend;
 }
 
 bool ggml_backend_is_flagos(ggml_backend_t backend) {
@@ -370,7 +407,7 @@ void ggml_backend_flagos_set_device(int device) {
         GGML_ABORT("FlagOS: invalid device %d", device);
     }
     const flagos_registered_device & selected = flagos_devices[device];
-    if (!selected.provider->set_device(selected.local_index)) {
+    if (selected.provider->set_device && !selected.provider->set_device(selected.local_index)) {
         GGML_ABORT("FlagOS: failed to select device %d", device);
     }
     flagos_active_device.store(device);
@@ -381,17 +418,12 @@ int ggml_backend_flagos_get_device() {
     const int active = flagos_active_device.load();
     if (active >= 0 && static_cast<size_t>(active) < flagos_devices.size()) {
         const flagos_registered_device & selected = flagos_devices[active];
-        if (selected.provider->get_device() == static_cast<int>(selected.local_index)) {
+        if (!selected.provider->get_device ||
+            selected.provider->get_device() == static_cast<int>(selected.local_index)) {
             return active;
         }
     }
     return -1;
-}
-
-void ggml_backend_flagos_reg_devices() {
-    // Registration is done by ggml-backend-reg.cpp (GGML_USE_FLAGOS) or by the
-    // dynamic loader. Calling ggml_backend_register() from here would make this
-    // backend library depend on libggml, which links it (undefined on macOS).
 }
 
 static int ggml_backend_flagos_score() {

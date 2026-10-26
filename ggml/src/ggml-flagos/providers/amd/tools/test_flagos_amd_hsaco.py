@@ -48,7 +48,7 @@ def _argument(offset: int, size: int, pointer: bool, scalar_address_space=False)
 
 
 def _descriptor(name="kernel", target="gfx1150", scratch_pointer=True,
-                scalar_address_space=False, version=(1, 2)) -> bytes:
+                scalar_address_space=False, version=(1, 2), resources=()) -> bytes:
     arguments = [_argument(0, 8, True), _argument(8, 4, False, scalar_address_space),
                  _argument(16, 8, scratch_pointer), _argument(24, 8, True)]
     kernel = _map([
@@ -60,6 +60,7 @@ def _descriptor(name="kernel", target="gfx1150", scratch_pointer=True,
         (".private_segment_fixed_size", _uint(0)),
         (".symbol", _string(f"{name}.kd")),
         (".wavefront_size", _uint(32)),
+        *resources,
     ])
     return _map([
         ("amdhsa.kernels", _array([kernel])),
@@ -90,6 +91,33 @@ def _hsaco(descriptor=None, duplicate_note=False) -> bytes:
 
 
 class HsacoMetadataTest(unittest.TestCase):
+    def test_optional_resource_fields(self):
+        old = parse_hsaco(_hsaco())
+        self.assertIsNone(old.vgpr_count)
+        self.assertIsNone(old.sgpr_count)
+        self.assertIsNone(old.vgpr_spill_count)
+        self.assertIsNone(old.sgpr_spill_count)
+        metadata = parse_hsaco(_hsaco(_descriptor(resources=[
+            (".vgpr_count", _uint(256)), (".sgpr_count", _uint(68)),
+            (".vgpr_spill_count", _uint(55)), (".sgpr_spill_count", _uint(0)),
+        ])))
+        self.assertEqual(metadata.vgpr_count, 256)
+        self.assertEqual(metadata.sgpr_count, 68)
+        self.assertEqual(metadata.vgpr_spill_count, 55)
+        self.assertEqual(metadata.sgpr_spill_count, 0)
+
+    def test_invalid_resource_fields(self):
+        for field in (".vgpr_count", ".sgpr_count", ".vgpr_spill_count", ".sgpr_spill_count"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(RuntimeError, "negative metadata integer"):
+                    parse_hsaco(_hsaco(_descriptor(resources=[(field, b"\xD0\xFF")])))
+                with self.assertRaisesRegex(RuntimeError, "unsigned MessagePack integer"):
+                    parse_hsaco(_hsaco(_descriptor(resources=[(field, _string("256"))])))
+                with self.assertRaisesRegex(RuntimeError, "duplicate AMDGPU metadata field"):
+                    parse_hsaco(_hsaco(_descriptor(resources=[
+                        (field, _uint(1)), (field, _uint(2)),
+                    ])))
+
     def test_valid_contract(self):
         metadata = parse_hsaco(_hsaco())
         self.assertEqual(metadata.target, "amdgcn-amd-amdhsa--gfx1150")

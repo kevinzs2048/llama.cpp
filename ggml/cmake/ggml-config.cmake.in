@@ -85,6 +85,11 @@ if (NOT GGML_SHARED_LIB)
         set(GGML_VULKAN_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:Vulkan::Vulkan>)
     endif()
 
+    if (GGML_FLAGOS AND GGML_FLAGOS_AMD)
+        find_dependency(hip CONFIG)
+        list(APPEND GGML_FLAGOS_INTERFACE_LINK_LIBRARIES hip::host ${CMAKE_DL_LIBS})
+    endif()
+
     if (GGML_HIP)
         find_dependency(hip)
         find_dependency(hipblas)

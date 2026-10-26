@@ -1,0 +1,1276 @@
+#include "flagos-rt-device.h"
+
+#include "flagos-graph-plan.h"
+#include "flagos-ops.h"
+#include "flagos-package.h"
+
+#include "../ggml-backend-impl.h"
+#include "../ggml-impl.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+struct rt_device {
+    const flagos_runtime_v1 * rt = nullptr;
+    std::string provider;
+    size_t local_index = 0;
+    flagos_rt_device_t handle = nullptr;
+    flagos_rt_device_props props {};
+    std::string name;
+    std::string description;
+    std::string target;
+    std::string package_format;
+    uint64_t uuid_hi = 0;
+    uint64_t uuid_lo = 0;
+    ggml_backend_device dev {};
+    ggml_backend_buffer_type buft {};
+    flagos_kernel_package package;
+    // Optional runtime capabilities, resolved once against the table's
+    // struct_size (fields appended after a provider was built read as NULL).
+    bool has_events = false;
+    bool has_capture = false;
+    bool has_update = false;
+    bool has_fusion = false;
+    bool has_device_sync = false;
+
+    std::mutex kernel_mutex;
+    std::unordered_map<std::string, flagos_rt_module_t> modules;  // by artifact file
+    std::unordered_map<std::string, flagos_rt_kernel_t> kernels;  // by kernel name
+};
+
+std::vector<std::unique_ptr<rt_device>> g_devices;
+
+// GGML_FLAGOS_GUARD=1 (debug, for validating kernel packages): every
+// device tensor is allocated with a redzone after its data. Before a node
+// runs, the redzone of its output (or of the tensor it views) and the
+// workspace tail are filled with a pattern; after the node they are read
+// back, so a kernel that writes past its output is reported by name.
+// Launches are synchronous and graph capture is off in this mode. Fused
+// patterns are not guarded: their intermediates may share memory with
+// tensors the fused kernel still reads.
+constexpr size_t kGuardBytes = 256;
+constexpr uint8_t kGuardByte = 0xA5;
+
+bool guard_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_FLAGOS_GUARD");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+rt_device * device_of(ggml_backend_dev_t dev) {
+    return static_cast<rt_device *>(dev->context);
+}
+
+bool rt_check(flagos_rt_status status, const rt_device * device, const char * what) {
+    if (status == FLAGOS_RT_OK) {
+        return true;
+    }
+    GGML_LOG_ERROR("FlagOS %s: %s failed with status %d\n", device->name.c_str(), what, status);
+    return false;
+}
+
+uint64_t fnv1a(const std::string & text, uint64_t seed = 0xcbf29ce484222325ull) {
+    uint64_t hash = seed;
+    for (unsigned char c : text) {
+        hash = (hash ^ c) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+// Load (once) the module that holds a kernel and resolve the kernel handle.
+flagos_rt_kernel_t resolve_kernel(rt_device * device, const flagos_kernel_call & call) {
+    const flagos_kernel_info & info = *call.kernel;
+    std::lock_guard<std::mutex> lock(device->kernel_mutex);
+    const auto found = device->kernels.find(info.name);
+    if (found != device->kernels.end()) {
+        return found->second;
+    }
+    flagos_rt_module_t module = nullptr;
+    const auto loaded = device->modules.find(info.file);
+    if (loaded != device->modules.end()) {
+        module = loaded->second;
+    } else {
+        std::vector<uint8_t> image;
+        std::string error;
+        if (!device->package.read_artifact(info, image, error)) {
+            GGML_LOG_ERROR("FlagOS %s: %s\n", device->name.c_str(), error.c_str());
+            return nullptr;
+        }
+        if (!rt_check(device->rt->module_load(device->handle, image.data(), image.size(), &module), device,
+                      "module_load")) {
+            return nullptr;
+        }
+        device->modules.emplace(info.file, module);
+    }
+    flagos_rt_kernel_desc desc {};
+    desc.struct_size = sizeof(desc);
+    desc.symbol = info.symbol.c_str();
+    desc.threads = static_cast<uint32_t>(info.num_warps * info.warp_size);
+    desc.block_size = static_cast<uint32_t>(info.block_size);
+    desc.shared_memory = static_cast<uint32_t>(info.shared_memory);
+    desc.n_args = call.n_args;
+    desc.global_scratch_size = info.global_scratch_size;
+    desc.global_scratch_align = static_cast<uint32_t>(info.global_scratch_align);
+    desc.profile_scratch_size = info.profile_scratch_size;
+    desc.profile_scratch_align = static_cast<uint32_t>(info.profile_scratch_align);
+    flagos_rt_kernel_t kernel = nullptr;
+    if (!rt_check(device->rt->kernel_get(module, &desc, &kernel), device, "kernel_get")) {
+        return nullptr;
+    }
+    device->kernels.emplace(info.name, kernel);
+    return kernel;
+}
+
+// ---------------------------------------------------------------------------
+// Buffer
+
+struct rt_buffer {
+    rt_device * device;
+    flagos_rt_buffer_t buffer;
+    void * base;
+};
+
+rt_buffer * buffer_of(ggml_backend_buffer_t buffer) {
+    return static_cast<rt_buffer *>(buffer->context);
+}
+
+void buffer_free(ggml_backend_buffer_t buffer) {
+    rt_buffer * ctx = buffer_of(buffer);
+    ctx->device->rt->buffer_free(ctx->buffer);
+    delete ctx;
+}
+
+void * buffer_get_base(ggml_backend_buffer_t buffer) {
+    return buffer_of(buffer)->base;
+}
+
+void buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    rt_buffer * ctx = buffer_of(buffer);
+    rt_check(ctx->device->rt->memset(nullptr, static_cast<char *>(tensor->data) + offset, value, size), ctx->device,
+             "memset");
+}
+
+void buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    rt_buffer * ctx = buffer_of(buffer);
+    rt_check(ctx->device->rt->memcpy(nullptr, static_cast<char *>(tensor->data) + offset, data, size,
+                                     FLAGOS_RT_COPY_HOST_TO_DEVICE), ctx->device, "memcpy h2d");
+}
+
+void buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    rt_buffer * ctx = buffer_of(buffer);
+    rt_check(ctx->device->rt->memcpy(nullptr, data, static_cast<const char *>(tensor->data) + offset, size,
+                                     FLAGOS_RT_COPY_DEVICE_TO_HOST), ctx->device, "memcpy d2h");
+}
+
+bool buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    rt_buffer * ctx = buffer_of(buffer);
+    if (src->buffer == nullptr) {
+        return false;
+    }
+    flagos_rt_copy_kind kind;
+    if (src->buffer->buft == buffer->buft) {
+        kind = FLAGOS_RT_COPY_DEVICE_TO_DEVICE;
+    } else if (ggml_backend_buffer_is_host(src->buffer)) {
+        kind = FLAGOS_RT_COPY_HOST_TO_DEVICE;
+    } else {
+        return false;
+    }
+    return rt_check(ctx->device->rt->memcpy(nullptr, dst->data, src->data, ggml_nbytes(src), kind), ctx->device,
+                    "memcpy tensor");
+}
+
+void buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    rt_buffer * ctx = buffer_of(buffer);
+    // Clearing (e.g. the KV cache) must not race with queued kernels.
+    if (ctx->device->has_device_sync) {
+        rt_check(ctx->device->rt->device_synchronize(ctx->device->handle), ctx->device, "device_synchronize");
+    }
+    rt_check(ctx->device->rt->memset(nullptr, ctx->base, value, buffer->size), ctx->device, "memset buffer");
+}
+
+const ggml_backend_buffer_i buffer_interface = {
+    /* .free_buffer   = */ buffer_free,
+    /* .get_base      = */ buffer_get_base,
+    /* .init_tensor   = */ nullptr,
+    /* .memset_tensor = */ buffer_memset_tensor,
+    /* .set_tensor    = */ buffer_set_tensor,
+    /* .get_tensor    = */ buffer_get_tensor,
+    /* .set_tensor_2d = */ nullptr,
+    /* .get_tensor_2d = */ nullptr,
+    /* .cpy_tensor    = */ buffer_cpy_tensor,
+    /* .clear         = */ buffer_clear,
+    /* .reset         = */ nullptr,
+};
+
+const char * buft_get_name(ggml_backend_buffer_type_t buft) {
+    return static_cast<rt_device *>(buft->context)->name.c_str();
+}
+
+size_t buft_get_alignment(ggml_backend_buffer_type_t buft) {
+    const uint32_t alignment = static_cast<rt_device *>(buft->context)->props.alignment;
+    return alignment >= 32 ? alignment : 128;
+}
+
+ggml_backend_buffer_t buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    rt_device * device = static_cast<rt_device *>(buft->context);
+    flagos_rt_buffer_t handle = nullptr;
+    if (!rt_check(device->rt->buffer_alloc(device->handle, size == 0 ? 1 : size, &handle), device, "buffer_alloc")) {
+        return nullptr;
+    }
+    void * base = device->rt->buffer_base(handle);
+    // GGML places tensors at offsets aligned relative to the base, so a
+    // misaligned base would silently shrink the usable buffer.
+    if (base == nullptr || reinterpret_cast<uintptr_t>(base) % buft_get_alignment(buft) != 0) {
+        GGML_LOG_ERROR("FlagOS %s: runtime returned a buffer not aligned to %zu bytes\n", device->name.c_str(),
+                       buft_get_alignment(buft));
+        device->rt->buffer_free(handle);
+        return nullptr;
+    }
+    auto * ctx = new rt_buffer { device, handle, base };
+    return ggml_backend_buffer_init(buft, buffer_interface, ctx, size);
+}
+
+size_t buft_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
+    return ggml_nbytes(tensor) + (guard_enabled() ? kGuardBytes : 0);
+}
+
+const ggml_backend_buffer_type_i buft_interface = {
+    /* .get_name       = */ buft_get_name,
+    /* .alloc_buffer   = */ buft_alloc_buffer,
+    /* .get_alignment  = */ buft_get_alignment,
+    /* .get_max_size   = */ nullptr,
+    /* .get_alloc_size = */ buft_get_alloc_size,
+    /* .is_host        = */ nullptr,
+};
+
+// ---------------------------------------------------------------------------
+// Backend
+
+struct rt_backend {
+    rt_device * device;
+    flagos_rt_stream_t stream;
+    // Fusion: the Common planner finds candidates, the provider opts in per
+    // pattern, the shared L2 decides whether the package can run it. Plans
+    // are cached per graph structure (decode graphs repeat every token).
+    flagos_graph_plan_cache plans;
+    flagos_fusion_interface fusion {};
+    // GGML_FLAGOS_STATS=1: executed nodes per op, printed when the backend
+    // is freed, to measure how much of a model runs on the device.
+    bool stats = false;
+    uint64_t graphs = 0;
+    std::unordered_map<std::string, uint64_t> executed;
+    // Graph capture (Tier 2): the core decides when a plan may be recorded
+    // and replayed; the provider records and replays (HIP Graph, CUDA Graph,
+    // NPU graph offload). Opt-in with GGML_FLAGOS_GRAPH_CAPTURE=1.
+    struct capture_entry {
+        uint64_t fingerprint;
+        flagos_graph_binding_snapshot bindings;
+        flagos_rt_graph_t graph;
+        uint64_t last_used;
+    };
+    bool capture = false;
+    std::vector<capture_entry> captures;
+    std::unordered_map<uint64_t, uint32_t> capture_sightings;
+    uint64_t capture_tick = 0;
+    uint64_t replays = 0;
+    uint64_t recordings = 0;
+    uint64_t updates = 0;
+    bool recording = false;
+    // Workspace for calls that need device scratch (flagos_kernel_call::
+    // workspace_bytes); grows on demand and is never shrunk.
+    flagos_rt_buffer_t workspace = nullptr;
+    char * workspace_base = nullptr;
+    uint64_t workspace_size = 0;
+};
+
+rt_backend * backend_of(ggml_backend_t backend) {
+    return static_cast<rt_backend *>(backend->context);
+}
+
+const char * backend_get_name(ggml_backend_t backend) {
+    return backend_of(backend)->device->name.c_str();
+}
+
+void backend_free(ggml_backend_t backend) {
+    rt_backend * ctx = backend_of(backend);
+    if (ctx->stats) {
+        uint64_t total = 0;
+        std::string text;
+        for (const auto & [op, count] : ctx->executed) {
+            // "variant:<kernel>" and "kernel:<name>" lines break launches
+            // down further; do not count them twice.
+            total += op.rfind("variant:", 0) == 0 || op.rfind("kernel:", 0) == 0 ? 0 : count;
+            text += " " + op + "=" + std::to_string(count);
+        }
+        std::fprintf(stderr, "FlagOS %s: %llu graphs, %llu kernel launches:%s\n", ctx->device->name.c_str(),
+                     (unsigned long long) ctx->graphs, (unsigned long long) total, text.c_str());
+    }
+    ctx->device->rt->stream_synchronize(ctx->stream);
+    for (const auto & entry : ctx->captures) {
+        ctx->device->rt->graph_destroy(entry.graph);
+    }
+    if (ctx->workspace != nullptr) {
+        ctx->device->rt->buffer_free(ctx->workspace);
+    }
+    if (ctx->stats && ctx->capture) {
+        std::fprintf(stderr, "FlagOS %s: graph capture: %llu recorded, %llu updated in place, %llu launched\n",
+                     ctx->device->name.c_str(), (unsigned long long) ctx->recordings, (unsigned long long) ctx->updates,
+                     (unsigned long long) ctx->replays);
+    }
+    ctx->device->rt->stream_destroy(ctx->stream);
+    delete ctx;
+    delete backend;
+}
+
+void backend_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    rt_backend * ctx = backend_of(backend);
+    rt_check(ctx->device->rt->memcpy(ctx->stream, static_cast<char *>(tensor->data) + offset, data, size,
+                                     FLAGOS_RT_COPY_HOST_TO_DEVICE), ctx->device, "async memcpy h2d");
+}
+
+void backend_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    rt_backend * ctx = backend_of(backend);
+    rt_check(ctx->device->rt->memcpy(ctx->stream, data, static_cast<const char *>(tensor->data) + offset, size,
+                                     FLAGOS_RT_COPY_DEVICE_TO_HOST), ctx->device, "async memcpy d2h");
+}
+
+void backend_synchronize(ggml_backend_t backend) {
+    rt_backend * ctx = backend_of(backend);
+    rt_check(ctx->device->rt->stream_synchronize(ctx->stream), ctx->device, "stream_synchronize");
+}
+
+bool launch_call(rt_backend * ctx, const flagos_kernel_call & call);
+
+// Make the workspace at least `bytes` large. Growing it frees the old
+// buffer, so the stream is drained first and recorded graphs, which hold
+// the old address, are dropped; it never happens while recording.
+char * ensure_workspace(rt_backend * ctx, uint64_t bytes) {
+    if (bytes <= ctx->workspace_size) {
+        return ctx->workspace_base;
+    }
+    rt_device * device = ctx->device;
+    const flagos_runtime_v1 * rt = device->rt;
+    if (ctx->recording) {
+        GGML_LOG_ERROR("FlagOS %s: workspace must grow while recording a graph\n", device->name.c_str());
+        return nullptr;
+    }
+    if (!rt_check(rt->stream_synchronize(ctx->stream), device, "stream_synchronize")) {
+        return nullptr;
+    }
+    for (const auto & entry : ctx->captures) {
+        rt->graph_destroy(entry.graph);
+    }
+    ctx->captures.clear();
+    if (ctx->workspace != nullptr) {
+        rt->buffer_free(ctx->workspace);
+        ctx->workspace = nullptr;
+        ctx->workspace_base = nullptr;
+        ctx->workspace_size = 0;
+    }
+    constexpr uint64_t granule = uint64_t(64) << 20;
+    const uint64_t size = (bytes + granule - 1) / granule * granule;
+    flagos_rt_buffer_t buffer = nullptr;
+    if (!rt_check(rt->buffer_alloc(device->handle, size, &buffer), device, "workspace buffer_alloc")) {
+        return nullptr;
+    }
+    ctx->workspace = buffer;
+    ctx->workspace_base = static_cast<char *>(rt->buffer_base(buffer));
+    ctx->workspace_size = size;
+    return ctx->workspace_base;
+}
+
+// Redzones checked around one node (GGML_FLAGOS_GUARD). Only memory this
+// device allocated with a redzone is guarded: the output's own tensor, or
+// the tensor it views, and the tail of the workspace the call uses.
+struct guard_zone {
+    char * begin;
+    std::string what;
+};
+
+std::vector<guard_zone> guard_zones(rt_backend * ctx, const ggml_tensor * node, const flagos_kernel_call & call) {
+    std::vector<guard_zone> zones;
+    const ggml_tensor * base = node->view_src != nullptr ? node->view_src : node;
+    if (base->buffer != nullptr && base->buffer->buft == &ctx->device->buft && base->data != nullptr) {
+        zones.push_back({ static_cast<char *>(base->data) + ggml_nbytes(base),
+                          std::string("tensor '") + base->name + "'" });
+    }
+    if (call.workspace_bytes > 0 && ctx->workspace_base != nullptr &&
+        call.workspace_bytes + kGuardBytes <= ctx->workspace_size) {
+        zones.push_back({ ctx->workspace_base + call.workspace_bytes, "workspace" });
+    }
+    return zones;
+}
+
+bool guard_arm(rt_backend * ctx, const std::vector<guard_zone> & zones) {
+    rt_device * device = ctx->device;
+    // The fill runs outside the stream; earlier work must not race with it.
+    if (!rt_check(device->rt->stream_synchronize(ctx->stream), device, "stream_synchronize")) {
+        return false;
+    }
+    for (const guard_zone & zone : zones) {
+        if (!rt_check(device->rt->memset(nullptr, zone.begin, kGuardByte, kGuardBytes), device, "guard memset")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool guard_check(rt_backend * ctx, const std::vector<guard_zone> & zones, const ggml_tensor * node,
+                 const flagos_kernel_call & call) {
+    rt_device * device = ctx->device;
+    if (!rt_check(device->rt->stream_synchronize(ctx->stream), device, "stream_synchronize")) {
+        return false;
+    }
+    bool ok = true;
+    for (const guard_zone & zone : zones) {
+        uint8_t bytes[kGuardBytes];
+        if (!rt_check(device->rt->memcpy(nullptr, bytes, zone.begin, kGuardBytes, FLAGOS_RT_COPY_DEVICE_TO_HOST), device,
+                      "guard memcpy")) {
+            return false;
+        }
+        size_t first = kGuardBytes, last = 0;
+        for (size_t i = 0; i < kGuardBytes; ++i) {
+            if (bytes[i] != kGuardByte) {
+                first = std::min(first, i);
+                last = i;
+            }
+        }
+        if (first < kGuardBytes) {
+            std::string kernels;
+            for (uint32_t s = 0; s < call.n_before; ++s) {
+                kernels += call.before[s].kernel->name + " -> ";
+            }
+            kernels += call.kernel->name;
+            GGML_LOG_ERROR("FlagOS %s: GUARD %s (%s %s) wrote past the end of the %s: bytes %zu..%zu of the redzone changed\n",
+                           device->name.c_str(), kernels.c_str(), ggml_op_desc(node), node->name, zone.what.c_str(),
+                           first, last);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// Execute one node through the shared op adapter.
+bool compute_node(rt_backend * ctx, ggml_tensor * node) {
+    if (ggml_is_empty(node) || flagos_op_is_noop(node)) {
+        return true;
+    }
+    flagos_kernel_call call;
+    if (!flagos_op_plan(ctx->device->package, node, &call)) {
+        // supports_op promised this node; refusing here means the graph
+        // changed after placement.
+        GGML_LOG_ERROR("FlagOS %s: no kernel for %s (%s)\n", ctx->device->name.c_str(), ggml_op_desc(node), node->name);
+        return false;
+    }
+    if (guard_enabled()) {
+        // Allocate the workspace first so its tail can be armed.
+        if (call.workspace_bytes > 0 && ensure_workspace(ctx, call.workspace_bytes + kGuardBytes) == nullptr) {
+            return false;
+        }
+        const std::vector<guard_zone> zones = guard_zones(ctx, node, call);
+        if (!guard_arm(ctx, zones) || !launch_call(ctx, call) || !guard_check(ctx, zones, node, call)) {
+            return false;
+        }
+    } else if (!launch_call(ctx, call)) {
+        return false;
+    }
+    if (ctx->stats) {
+        ++ctx->executed[ggml_op_desc(node)];
+    }
+    return true;
+}
+
+bool run_plan(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & plan) {
+    for (const flagos_plan_step & step : plan.steps) {
+        if (step.kind == flagos_execution_kind::pattern) {
+            if (!flagos_execute_fusion_step(ctx->fusion, cgraph, step)) {
+                GGML_LOG_ERROR("FlagOS %s: fused %s failed\n", ctx->device->name.c_str(),
+                               flagos_pattern_name(step.candidate.id));
+                return false;
+            }
+            continue;
+        }
+        if (!compute_node(ctx, cgraph->nodes[step.candidate.node_indices[0]])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Largest workspace any direct node of the plan needs.
+bool reserve_plan_workspace(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & plan) {
+    uint64_t bytes = 0;
+    for (const flagos_plan_step & step : plan.steps) {
+        if (step.kind == flagos_execution_kind::pattern) {
+            continue;
+        }
+        ggml_tensor * node = cgraph->nodes[step.candidate.node_indices[0]];
+        flagos_kernel_call call;
+        if (!ggml_is_empty(node) && !flagos_op_is_noop(node) && flagos_op_plan(ctx->device->package, node, &call)) {
+            bytes = std::max(bytes, call.workspace_bytes);
+        }
+    }
+    return bytes == 0 || ensure_workspace(ctx, bytes) != nullptr;
+}
+
+// Graph capture policy. Recordings are kept per (structure, bindings):
+//  - exact match -> replay;
+//  - a structure seen before with new bindings -> record it as a new entry,
+//    or, once that structure already has kMaxPerStructure entries, re-record
+//    into its least recently used entry in place (graph_capture_end_update)
+//    and replace that entry if the runtime had to build a fresh graph;
+//  - a structure seen for the first time is only counted, so one-off graphs
+//    are never recorded.
+// Recording does not execute work, so a new or updated graph is launched
+// right away. Returns false when the caller should run the plan directly.
+bool run_captured(rt_backend * ctx, ggml_cgraph * cgraph, const flagos_graph_plan & plan, bool & ok) {
+    constexpr size_t kCapacity = 128;
+    static const size_t kMaxPerStructure = [] {
+        const char * value = std::getenv("GGML_FLAGOS_GRAPH_CAPTURE_PER_STRUCTURE");
+        const long n = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+        return n > 0 ? size_t(n) : size_t(4);
+    }();
+    const flagos_runtime_v1 * rt = ctx->device->rt;
+    if (!plan.capture_safe() || cgraph->n_nodes < 4) {
+        return false;
+    }
+    flagos_graph_binding_snapshot bindings;
+    if (!flagos_graph_binding_snapshot_create(cgraph, plan, &bindings)) {
+        return false;
+    }
+    rt_backend::capture_entry * lru_same = nullptr;
+    size_t same_count = 0;
+    for (auto & entry : ctx->captures) {
+        if (entry.fingerprint != plan.structural_fingerprint) {
+            continue;
+        }
+        if (entry.bindings.fingerprint == bindings.fingerprint &&
+            flagos_graph_binding_snapshot_matches(cgraph, plan, entry.bindings)) {
+            entry.last_used = ++ctx->capture_tick;
+            ok = rt_check(rt->graph_launch(ctx->stream, entry.graph), ctx->device, "graph_launch");
+            ctx->replays += ok;
+            return true;
+        }
+        ++same_count;
+        if (lru_same == nullptr || entry.last_used < lru_same->last_used) {
+            lru_same = &entry;
+        }
+    }
+    if (ctx->capture_sightings.size() > 4096) {
+        ctx->capture_sightings.clear();  // bounded; a cleared key only delays recording
+    }
+    if (same_count == 0 && ++ctx->capture_sightings[plan.structural_fingerprint] < 2) {
+        return false;
+    }
+    const bool update = ctx->device->has_update && same_count >= kMaxPerStructure;
+    if (update) {
+        // The executable may still be running its previous launch.
+        if (!rt_check(rt->stream_synchronize(ctx->stream), ctx->device, "stream_synchronize")) {
+            return false;
+        }
+    }
+    // Recorded launches keep the workspace address, so size it before
+    // recording; growing it later drops every recording.
+    if (!reserve_plan_workspace(ctx, cgraph, plan)) {
+        return false;
+    }
+    if (rt->graph_capture_begin(ctx->stream) != FLAGOS_RT_OK) {
+        return false;
+    }
+    ctx->recording = true;
+    const bool recorded = run_plan(ctx, cgraph, plan);
+    ctx->recording = false;
+    flagos_rt_graph_t graph = nullptr;
+    const bool ended = update
+        ? rt->graph_capture_end_update(ctx->stream, lru_same->graph, &graph) == FLAGOS_RT_OK && graph != nullptr
+        : rt->graph_capture_end(ctx->stream, &graph) == FLAGOS_RT_OK && graph != nullptr;
+    if (!recorded || !ended) {
+        if (graph != nullptr && !(update && graph == lru_same->graph)) {
+            rt->graph_destroy(graph);
+        }
+        // Nothing ran while recording; fall back to direct execution.
+        return false;
+    }
+    if (update) {
+        if (graph != lru_same->graph) {
+            rt->graph_destroy(lru_same->graph);   // the stream was synchronized above
+            lru_same->graph = graph;
+        } else {
+            ++ctx->updates;
+        }
+        lru_same->bindings = std::move(bindings);
+        lru_same->last_used = ++ctx->capture_tick;
+    } else {
+        if (ctx->captures.size() >= kCapacity) {
+            auto lru = std::min_element(ctx->captures.begin(), ctx->captures.end(),
+                [](const auto & a, const auto & b) { return a.last_used < b.last_used; });
+            rt->stream_synchronize(ctx->stream);
+            rt->graph_destroy(lru->graph);
+            ctx->captures.erase(lru);
+        }
+        ctx->captures.push_back({ plan.structural_fingerprint, std::move(bindings), graph, ++ctx->capture_tick });
+        ++ctx->recordings;
+    }
+    ok = rt_check(rt->graph_launch(ctx->stream, graph), ctx->device, "graph_launch");
+    ctx->replays += ok;
+    return true;
+}
+
+enum ggml_status backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    rt_backend * ctx = backend_of(backend);
+    ctx->graphs += ctx->stats ? 1 : 0;
+    // Without fusion or capture there is nothing to plan; run node by node.
+    if (!ctx->device->has_fusion && !ctx->capture) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (!compute_node(ctx, cgraph->nodes[i])) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+    const flagos_graph_plan & plan = ctx->plans.get_or_create(cgraph, ctx->fusion);
+    bool ok = true;
+    if (ctx->capture && run_captured(ctx, cgraph, plan, ok)) {
+        return ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+    }
+    return run_plan(ctx, cgraph, plan) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+}
+
+void backend_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    rt_backend * ctx = backend_of(backend);
+    rt_check(ctx->device->rt->event_record(static_cast<flagos_rt_event_t>(event->context), ctx->stream), ctx->device,
+             "event_record");
+}
+
+void backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    rt_backend * ctx = backend_of(backend);
+    rt_check(ctx->device->rt->event_wait(ctx->stream, static_cast<flagos_rt_event_t>(event->context)), ctx->device,
+             "event_wait");
+}
+
+ggml_backend_i backend_interface(const rt_device * device) {
+    const bool events = device->has_events;
+    return {
+        /* .get_name            = */ backend_get_name,
+        /* .free                = */ backend_free,
+        /* .set_tensor_async    = */ backend_set_tensor_async,
+        /* .get_tensor_async    = */ backend_get_tensor_async,
+        /* .set_tensor_2d_async = */ nullptr,
+        /* .get_tensor_2d_async = */ nullptr,
+        /* .cpy_tensor_async    = */ nullptr,
+        /* .synchronize         = */ backend_synchronize,
+        /* .graph_plan_create   = */ nullptr,
+        /* .graph_plan_free     = */ nullptr,
+        /* .graph_plan_update   = */ nullptr,
+        /* .graph_plan_compute  = */ nullptr,
+        /* .graph_compute       = */ backend_graph_compute,
+        /* .event_record        = */ events ? backend_event_record : nullptr,
+        /* .event_wait          = */ events ? backend_event_wait : nullptr,
+        /* .graph_optimize      = */ nullptr,
+    };
+}
+
+ggml_guid_t backend_guid() {
+    static ggml_guid guid = { 0x46, 0x4c, 0x41, 0x47, 0x4f, 0x53, 0x2d, 0x52, 0x54, 0x2d, 0x76, 0x31, 0x00, 0x00, 0x00, 0x01 };
+    return &guid;
+}
+
+// ---------------------------------------------------------------------------
+// Device
+
+const char * dev_get_name(ggml_backend_dev_t dev) {
+    return device_of(dev)->name.c_str();
+}
+
+const char * dev_get_description(ggml_backend_dev_t dev) {
+    return device_of(dev)->description.c_str();
+}
+
+void dev_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    rt_device * device = device_of(dev);
+    uint64_t f = 0;
+    uint64_t t = 0;
+    if (device->rt->device_memory(device->handle, &f, &t) != FLAGOS_RT_OK) {
+        f = 0;
+        t = device->props.memory_total;
+    }
+    *free = static_cast<size_t>(f);
+    *total = static_cast<size_t>(t);
+}
+
+enum ggml_backend_dev_type dev_get_type(ggml_backend_dev_t dev) {
+    switch (device_of(dev)->props.type) {
+        case FLAGOS_RT_DEVICE_GPU:  return GGML_BACKEND_DEVICE_TYPE_GPU;
+        case FLAGOS_RT_DEVICE_IGPU: return GGML_BACKEND_DEVICE_TYPE_IGPU;
+        default:                    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    }
+}
+
+void dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    rt_device * device = device_of(dev);
+    props->name = device->name.c_str();
+    props->description = device->description.c_str();
+    dev_get_memory(dev, &props->memory_free, &props->memory_total);
+    props->type = dev_get_type(dev);
+    props->device_id = nullptr;
+    props->caps = {
+        /* .async                = */ true,
+        /* .host_buffer          = */ false,
+        /* .buffer_from_host_ptr = */ false,
+        /* .events               = */ device->has_events,
+        /* .mmap_support         = */ false,
+    };
+}
+
+// Check the kernel a plan selected against its manifest metadata and the
+// device limits, so supports_op never accepts a node the runtime would
+// refuse at launch: the manifest must declare the argument count and the
+// launch geometry, and the kernel may not need compiler scratch (no runtime
+// allocates it yet).
+bool kernel_fits_device(const rt_device * device, const flagos_kernel_info & k) {
+    if (k.argument_count < 0 || uint32_t(k.argument_count) > FLAGOS_MAX_EXPLICIT_KERNEL_ARGS || k.num_warps <= 0 ||
+        k.warp_size <= 0 || k.global_scratch_size != 0 || k.profile_scratch_size != 0) {
+        return false;
+    }
+    const uint32_t threads = uint32_t(k.num_warps * k.warp_size);
+    const flagos_rt_device_props & p = device->props;
+    return (p.max_threads_per_block == 0 || threads <= p.max_threads_per_block) &&
+        (p.shared_memory_per_block == 0 || uint32_t(k.shared_memory) <= p.shared_memory_per_block);
+}
+
+bool kernel_launchable(const rt_device * device, const flagos_kernel_call & call) {
+    for (uint32_t s = 0; s < call.n_before; ++s) {
+        const flagos_kernel_call::step & step = call.before[s];
+        if (step.kernel == nullptr || uint32_t(step.kernel->argument_count) != step.n_args ||
+            !kernel_fits_device(device, *step.kernel)) {
+            return false;
+        }
+    }
+    return call.kernel != nullptr && uint32_t(call.kernel->argument_count) == call.n_args &&
+        kernel_fits_device(device, *call.kernel);
+}
+
+flagos_lowering_choice fusion_query(void * user_data, const ggml_cgraph * graph, const flagos_pattern_candidate & candidate) {
+    auto * ctx = static_cast<rt_backend *>(user_data);
+    rt_device * device = ctx->device;
+    flagos_lowering_choice choice;
+    flagos_kernel_call probe;
+    if (device->has_fusion &&
+        device->rt->fusion_supported(device->handle, static_cast<uint32_t>(candidate.id)) &&
+        flagos_fusion_plan(device->package, graph, candidate, &probe) && kernel_launchable(device, probe)) {
+        choice.supported = true;
+        choice.capture_safe = true;
+        choice.implementation_id = static_cast<uint64_t>(candidate.id);
+        choice.score = 1;
+    }
+    static const bool trace = [] {
+        const char * value = std::getenv("GGML_FLAGOS_TRACE_SUPPORT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (trace) {
+        std::fprintf(stderr, "FlagOS %s: pattern %s (%zu nodes, %zu required outputs) %s\n", device->name.c_str(),
+                     flagos_pattern_name(candidate.id), candidate.node_indices.size(),
+                     candidate.required_output_node_indices.size(), choice.supported ? "accepted" : "declined");
+    }
+    return choice;
+}
+
+bool env_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// Debug aids for bringing up a runtime (both off by default):
+//  GGML_FLAGOS_TRACE_LAUNCH=1 prints every launch (kernel, grid, scalar
+//    arguments) to stderr before it is issued, flushed, so after a device
+//    hang the last line names the kernel that never finished.
+//  GGML_FLAGOS_SYNC_LAUNCH=1 synchronizes after every launch and reports
+//    the kernel whose execution failed.
+bool launch_once(rt_backend * ctx, flagos_rt_kernel_t kernel, const flagos_rt_launch & launch, const flagos_kernel_call & call) {
+    static const bool trace = env_flag("GGML_FLAGOS_TRACE_LAUNCH");
+    static const bool sync = env_flag("GGML_FLAGOS_SYNC_LAUNCH");
+    rt_device * device = ctx->device;
+    if (trace) {
+        std::string text;
+        char buffer[64];
+        for (uint32_t i = 0; i < launch.n_args; ++i) {
+            const flagos_rt_arg & a = launch.args[i];
+            switch (a.kind) {
+                case FLAGOS_RT_ARG_PTR: std::snprintf(buffer, sizeof(buffer), " %p", a.value.ptr); break;
+                case FLAGOS_RT_ARG_I32: std::snprintf(buffer, sizeof(buffer), " %d", a.value.i32); break;
+                case FLAGOS_RT_ARG_U32: std::snprintf(buffer, sizeof(buffer), " %u", a.value.u32); break;
+                case FLAGOS_RT_ARG_I64: std::snprintf(buffer, sizeof(buffer), " %lld", (long long) a.value.i64); break;
+                case FLAGOS_RT_ARG_F32: std::snprintf(buffer, sizeof(buffer), " %g", a.value.f32); break;
+                default:                std::snprintf(buffer, sizeof(buffer), " %g", a.value.f64); break;
+            }
+            text += buffer;
+        }
+        std::fprintf(stderr, "FlagOS launch %s grid=%u,%u,%u args:%s\n", call.kernel->name.c_str(),
+                     launch.grid[0], launch.grid[1], launch.grid[2], text.c_str());
+        std::fflush(stderr);
+    }
+    if (!rt_check(device->rt->launch(ctx->stream, kernel, &launch), device, call.kernel->name.c_str())) {
+        return false;
+    }
+    if (ctx->stats) {
+        // Every launched kernel, so a package's coverage can be measured.
+        ++ctx->executed["kernel:" + call.kernel->name];
+    }
+    if (sync && !rt_check(device->rt->stream_synchronize(ctx->stream), device,
+                          ("execution of " + call.kernel->name).c_str())) {
+        return false;
+    }
+    return true;
+}
+
+bool launch_call(rt_backend * ctx, const flagos_kernel_call & call) {
+    rt_device * device = ctx->device;
+    char * workspace = nullptr;
+    if (call.workspace_bytes > 0 && (workspace = ensure_workspace(ctx, call.workspace_bytes)) == nullptr) {
+        return false;
+    }
+    auto resolve = [workspace](flagos_rt_arg * args, const bool * in_workspace, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (in_workspace[i]) {
+                GGML_ASSERT(workspace != nullptr && args[i].kind == FLAGOS_RT_ARG_PTR);
+                args[i].value.ptr = workspace + reinterpret_cast<uintptr_t>(args[i].value.ptr);
+            }
+        }
+    };
+    for (uint32_t s = 0; s < call.n_before; ++s) {
+        const flagos_kernel_call::step & step = call.before[s];
+        flagos_kernel_call one;
+        one.kernel = step.kernel;
+        std::memcpy(one.grid, step.grid, sizeof(one.grid));
+        one.n_args = step.n_args;
+        std::memcpy(one.args, step.args, sizeof(one.args));
+        resolve(one.args, step.in_workspace, one.n_args);
+        flagos_rt_kernel_t kernel = resolve_kernel(device, one);
+        flagos_rt_launch launch {};
+        launch.struct_size = sizeof(launch);
+        std::memcpy(launch.grid, one.grid, sizeof(launch.grid));
+        launch.n_args = one.n_args;
+        launch.args = one.args;
+        if (kernel == nullptr || !launch_once(ctx, kernel, launch, one)) {
+            return false;
+        }
+    }
+    flagos_rt_kernel_t kernel = resolve_kernel(device, call);
+    if (kernel == nullptr) {
+        return false;
+    }
+    if (ctx->stats && !call.kernel->contract.empty()) {
+        ++ctx->executed["variant:" + call.kernel->name];
+    }
+    if (ctx->stats && call.n_before > 0) {
+        ++ctx->executed["variant:" + call.before[0].kernel->name + "+" + call.kernel->name];
+    }
+    flagos_rt_arg base[FLAGOS_MAX_KERNEL_ARGS];
+    std::memcpy(base, call.args, sizeof(base));
+    resolve(base, call.in_workspace, call.n_args);
+    flagos_rt_launch launch {};
+    launch.struct_size = sizeof(launch);
+    std::memcpy(launch.grid, call.grid, sizeof(launch.grid));
+    launch.n_args = call.n_args;
+    launch.args = base;
+    if (call.repeat <= 1) {
+        return launch_once(ctx, kernel, launch, call);
+    }
+    flagos_rt_arg args[FLAGOS_MAX_KERNEL_ARGS];
+    std::memcpy(args, base, sizeof(args));
+    launch.args = args;
+    for (uint32_t r = 0; r < call.repeat; ++r) {
+        for (uint32_t i = 0; i < call.n_args; ++i) {
+            if (call.advance[i] != 0) {
+                GGML_ASSERT(base[i].kind == FLAGOS_RT_ARG_PTR);
+                args[i].value.ptr = static_cast<char *>(base[i].value.ptr) + int64_t(r) * call.advance[i];
+            }
+        }
+        if (!launch_once(ctx, kernel, launch, call)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool fusion_execute(void * user_data, ggml_cgraph * graph, const flagos_plan_step & step) {
+    auto * ctx = static_cast<rt_backend *>(user_data);
+    flagos_kernel_call call;
+    if (!flagos_fusion_plan(ctx->device->package, graph, step.candidate, &call) || !launch_call(ctx, call)) {
+        return false;
+    }
+    if (ctx->stats) {
+        ++ctx->executed[std::string("fused:") + flagos_pattern_name(step.candidate.id)];
+    }
+    return true;
+}
+
+rt_backend * make_backend_context(rt_device * device, flagos_rt_stream_t stream) {
+    auto * ctx = new rt_backend;
+    ctx->device = device;
+    ctx->stream = stream;
+    const char * stats = std::getenv("GGML_FLAGOS_STATS");
+    ctx->stats = stats != nullptr && stats[0] != '\0' && stats[0] != '0';
+    ctx->fusion.query_lowering = fusion_query;
+    ctx->fusion.validate_lowering = fusion_query;
+    ctx->fusion.execute_fusion = fusion_execute;
+    ctx->fusion.user_data = ctx;
+    const flagos_runtime_v1 * rt = device->rt;
+    const char * capture = std::getenv("GGML_FLAGOS_GRAPH_CAPTURE");
+    (void) rt;
+    ctx->capture = capture != nullptr && capture[0] == '1' && device->has_capture && !guard_enabled();
+    return ctx;
+}
+
+ggml_backend_t dev_init_backend(ggml_backend_dev_t dev, const char *) {
+    rt_device * device = device_of(dev);
+    flagos_rt_stream_t stream = nullptr;
+    if (!rt_check(device->rt->stream_create(device->handle, &stream), device, "stream_create")) {
+        return nullptr;
+    }
+    return new ggml_backend {
+        /* .guid    = */ backend_guid(),
+        /* .iface   = */ backend_interface(device),
+        /* .device  = */ dev,
+        /* .context = */ make_backend_context(device, stream),
+    };
+}
+
+ggml_backend_buffer_type_t dev_get_buffer_type(ggml_backend_dev_t dev) {
+    return &device_of(dev)->buft;
+}
+
+// GGML_FLAGOS_TRACE_SUPPORT=1 logs every node the device declines, with
+// types, shapes and strides, to see which contract a model misses.
+void trace_declined(const rt_device * device, const ggml_tensor * op) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_FLAGOS_TRACE_SUPPORT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    std::string text = std::string(ggml_op_desc(op)) + " " + op->name + " -> " + ggml_type_name(op->type);
+    auto describe = [&text](const char * label, const ggml_tensor * t) {
+        char buffer[256];
+        std::snprintf(buffer, sizeof(buffer), " %s=%s[%lld,%lld,%lld,%lld]/nb[%zu,%zu,%zu,%zu]", label, ggml_type_name(t->type),
+                      (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                      t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+        text += buffer;
+    };
+    describe("dst", op);
+    for (int i = 0; i < GGML_MAX_SRC && op->src[i] != nullptr; ++i) {
+        describe(("src" + std::to_string(i)).c_str(), op->src[i]);
+    }
+    // Written to stderr directly: tools may silence the GGML log while they
+    // probe placement, which is exactly when this trace is wanted.
+    std::fprintf(stderr, "FlagOS %s: declined %s\n", device->name.c_str(), text.c_str());
+}
+
+// GGML_FLAGOS_DISABLE_OPS=MUL_MAT_ID,ARGSORT,... declines those ops (by
+// ggml_op_desc name) so they fall back to another backend; used to bisect
+// numerical differences.
+bool op_disabled(const ggml_tensor * op) {
+    static const std::vector<std::string> disabled = [] {
+        std::vector<std::string> names;
+        if (const char * value = std::getenv("GGML_FLAGOS_DISABLE_OPS")) {
+            std::string list(value);
+            size_t start = 0;
+            while (start <= list.size()) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                if (end > start) names.push_back(list.substr(start, end - start));
+                start = end + 1;
+            }
+        }
+        return names;
+    }();
+    if (disabled.empty()) {
+        return false;
+    }
+    const std::string name = ggml_op_desc(op);
+    return std::find(disabled.begin(), disabled.end(), name) != disabled.end();
+}
+
+bool dev_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    rt_device * device = device_of(dev);
+    if (op_disabled(op)) {
+        return false;
+    }
+    // Empty nodes (for example cache copies while GGML reserves a graph for
+    // zero sequences) need no kernel; graph_compute skips them.
+    if (ggml_is_empty(op) || flagos_op_is_noop(op)) {
+        return true;
+    }
+    flagos_kernel_call probe;
+    if (flagos_op_plan(device->package, op, &probe) && kernel_launchable(device, probe)) {
+        return true;
+    }
+    trace_declined(device, op);
+    return false;
+}
+
+bool dev_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    return buft == &device_of(dev)->buft;
+}
+
+ggml_backend_event_t dev_event_new(ggml_backend_dev_t dev) {
+    rt_device * device = device_of(dev);
+    flagos_rt_event_t event = nullptr;
+    if (!device->has_events ||
+        !rt_check(device->rt->event_create(device->handle, &event), device, "event_create")) {
+        return nullptr;
+    }
+    return new ggml_backend_event { dev, event };
+}
+
+void dev_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    device_of(dev)->rt->event_destroy(static_cast<flagos_rt_event_t>(event->context));
+    delete event;
+}
+
+void dev_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    rt_device * device = device_of(dev);
+    rt_check(device->rt->event_synchronize(static_cast<flagos_rt_event_t>(event->context)), device, "event_synchronize");
+}
+
+ggml_backend_device_i device_interface(const rt_device * device) {
+    const bool events = device->has_events;
+    return {
+        /* .get_name             = */ dev_get_name,
+        /* .get_description      = */ dev_get_description,
+        /* .get_memory           = */ dev_get_memory,
+        /* .get_type             = */ dev_get_type,
+        /* .get_props            = */ dev_get_props,
+        /* .init_backend         = */ dev_init_backend,
+        /* .get_buffer_type      = */ dev_get_buffer_type,
+        /* .get_host_buffer_type = */ nullptr,
+        /* .buffer_from_host_ptr = */ nullptr,
+        /* .supports_op          = */ dev_supports_op,
+        /* .supports_buft        = */ dev_supports_buft,
+        /* .offload_op           = */ nullptr,
+        /* .event_new            = */ events ? dev_event_new : nullptr,
+        /* .event_free           = */ events ? dev_event_free : nullptr,
+        /* .event_synchronize    = */ events ? dev_event_synchronize : nullptr,
+    };
+}
+
+// Kernel package lookup: GGML_FLAGOS_KERNEL_DIR (as the package itself or as
+// a root holding one directory per target), then the runtime's default.
+std::string find_package_dir(const rt_device & device, const char * plugin_dir) {
+    std::error_code ec;
+    if (const char * root = std::getenv("GGML_FLAGOS_KERNEL_DIR")) {
+        const fs::path base(root);
+        if (fs::is_regular_file(base / device.target / "manifest.json", ec)) {
+            return (base / device.target).string();
+        }
+        if (fs::is_regular_file(base / "manifest.json", ec)) {
+            return base.string();
+        }
+    }
+    if (device.props.package_dir != nullptr && device.props.package_dir[0] != '\0') {
+        fs::path dir(device.props.package_dir);
+        if (dir.is_relative() && plugin_dir != nullptr) {
+            dir = fs::path(plugin_dir) / dir;
+        }
+        return dir.string();
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// Adapter descriptor exposing every runtime device to the registry.
+
+bool adapter_probe(ggml_backend_reg_t) {
+    return !g_devices.empty();
+}
+
+size_t adapter_device_count() {
+    return g_devices.size();
+}
+
+ggml_backend_dev_t adapter_device_get(size_t index) {
+    return index < g_devices.size() ? &g_devices[index]->dev : nullptr;
+}
+
+bool adapter_device_identity(size_t index, flagos_device_identity * identity) {
+    if (index >= g_devices.size() || identity == nullptr) {
+        return false;
+    }
+    const rt_device & device = *g_devices[index];
+    const bool unified = (device.props.memory_flags & FLAGOS_RT_MEM_UNIFIED) != 0;
+    *identity = {
+        FLAGOS_RUNTIME_ADAPTER_ID,
+        device.uuid_hi,
+        device.uuid_lo,
+        unified ? fnv1a(device.provider + ":unified") : (device.uuid_hi ^ device.uuid_lo),
+        static_cast<uint32_t>(index),
+    };
+    return true;
+}
+
+bool adapter_device_caps(size_t index, flagos_device_caps * caps) {
+    if (index >= g_devices.size() || caps == nullptr) {
+        return false;
+    }
+    const rt_device & device = *g_devices[index];
+    flagos_provider_kind kind = flagos_provider_kind::other;
+    switch (device.props.type) {
+        case FLAGOS_RT_DEVICE_GPU:
+        case FLAGOS_RT_DEVICE_IGPU:      kind = flagos_provider_kind::gpu; break;
+        case FLAGOS_RT_DEVICE_NPU:       kind = flagos_provider_kind::ai_accelerator; break;
+        case FLAGOS_RT_DEVICE_CPU_ACCEL: kind = flagos_provider_kind::cpu_accelerator; break;
+        default:                         kind = flagos_provider_kind::other; break;
+    }
+    uint64_t memory = FLAGOS_MEMORY_DEVICE_LOCAL;
+    if (device.props.memory_flags & FLAGOS_RT_MEM_UNIFIED) {
+        memory |= FLAGOS_MEMORY_UNIFIED_COHERENT;
+    }
+    if (device.props.memory_flags & FLAGOS_RT_MEM_HOST_VISIBLE) {
+        memory |= FLAGOS_MEMORY_HOST_VISIBLE;
+    }
+    uint64_t execution = FLAGOS_EXECUTION_ASYNC_QUEUE | FLAGOS_EXECUTION_AOT_MODULE;
+    if (device.has_events) {
+        execution |= FLAGOS_EXECUTION_EVENTS;
+    }
+    if (device.has_capture) {
+        execution |= FLAGOS_EXECUTION_NATIVE_GRAPH;
+    }
+    *caps = { kind, memory, execution, device.package_format.c_str() };
+    return true;
+}
+
+bool adapter_is_backend(ggml_backend_t backend) {
+    return backend != nullptr && backend->iface.get_name == backend_get_name;
+}
+
+int adapter_score() {
+    return g_devices.empty() ? 0 : 1;
+}
+
+bool adapter_device_profile(size_t index, flagos_device_profile * profile) {
+    if (index >= g_devices.size() || profile == nullptr) {
+        return false;
+    }
+    const rt_device & device = *g_devices[index];
+    *profile = {};
+    profile->struct_size = sizeof(*profile);
+    switch (device.props.type) {
+        case FLAGOS_RT_DEVICE_GPU:
+        case FLAGOS_RT_DEVICE_IGPU:      profile->engine = flagos_engine_kind::gpu; break;
+        case FLAGOS_RT_DEVICE_NPU:       profile->engine = flagos_engine_kind::npu; break;
+        case FLAGOS_RT_DEVICE_CPU_ACCEL: profile->engine = flagos_engine_kind::cpu; break;
+        default:                         profile->engine = flagos_engine_kind::other; break;
+    }
+    profile->lane_count = device.props.warp_size;
+    profile->concurrency = device.props.compute_units;
+    profile->vendor = device.provider.c_str();
+    profile->architecture = device.props.name;
+    profile->target = device.target.c_str();
+    profile->runtime = device.provider.c_str();
+    profile->aot_format = device.package_format.c_str();
+    return true;
+}
+
+} // namespace
+
+const flagos_provider_v1 * flagos_runtime_adapter(const std::vector<flagos_runtime_source> & runtimes) {
+    static const flagos_provider_v1 adapter = {
+        FLAGOS_PROVIDER_API_VERSION,
+        sizeof(flagos_provider_v1),
+        { FLAGOS_RUNTIME_ADAPTER_ID, "flagos-runtime", 1 },
+        adapter_probe,
+        adapter_device_count,
+        adapter_device_get,
+        adapter_device_identity,
+        adapter_device_caps,
+        adapter_is_backend,
+        nullptr,
+        nullptr,
+        adapter_score,
+        adapter_device_profile,
+    };
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        for (const flagos_runtime_source & source : runtimes) {
+            const flagos_runtime_v1 * rt = source.runtime;
+            uint32_t count = 0;
+            if (rt->device_count(&count) != FLAGOS_RT_OK) {
+                GGML_LOG_WARN("FlagOS: runtime '%s' failed to count devices\n", rt->name);
+                continue;
+            }
+            for (uint32_t index = 0; index < count; ++index) {
+                auto device = std::make_unique<rt_device>();
+                device->rt = rt;
+                device->provider = rt->name;
+                device->local_index = g_devices.size();
+                device->name = std::string("FlagOS-") + rt->name + std::to_string(index);
+                if (rt->device_open(index, &device->handle) != FLAGOS_RT_OK) {
+                    GGML_LOG_WARN("FlagOS: runtime '%s' failed to open device %u\n", rt->name, index);
+                    continue;
+                }
+                device->props.struct_size = sizeof(device->props);
+                if (rt->device_props(device->handle, &device->props) != FLAGOS_RT_OK ||
+                    device->props.struct_size < offsetof(flagos_rt_device_props, package_dir)) {
+                    GGML_LOG_WARN("FlagOS: runtime '%s' device %u has no valid properties\n", rt->name, index);
+                    rt->device_close(device->handle);
+                    continue;
+                }
+                using rt_t = flagos_runtime_v1;
+                device->has_events = FLAGOS_RT_HAS(rt_t, rt, event_create) && FLAGOS_RT_HAS(rt_t, rt, event_destroy) &&
+                    FLAGOS_RT_HAS(rt_t, rt, event_record) && FLAGOS_RT_HAS(rt_t, rt, event_wait) &&
+                    FLAGOS_RT_HAS(rt_t, rt, event_synchronize);
+                device->has_capture = FLAGOS_RT_HAS(rt_t, rt, graph_capture_begin) &&
+                    FLAGOS_RT_HAS(rt_t, rt, graph_capture_end) && FLAGOS_RT_HAS(rt_t, rt, graph_launch) &&
+                    FLAGOS_RT_HAS(rt_t, rt, graph_destroy);
+                device->has_update = device->has_capture && FLAGOS_RT_HAS(rt_t, rt, graph_capture_end_update);
+                device->has_fusion = FLAGOS_RT_HAS(rt_t, rt, fusion_supported);
+                device->has_device_sync = FLAGOS_RT_HAS(rt_t, rt, device_synchronize);
+                const flagos_rt_device_props & p = device->props;
+                device->target = p.target ? p.target : "";
+                device->package_format = p.package_format ? p.package_format : "";
+                device->description = std::string(p.description ? p.description : rt->name) + " (" + device->target + ")";
+                device->uuid_hi = p.uuid_hi;
+                device->uuid_lo = p.uuid_lo;
+                if (device->uuid_hi == 0 && device->uuid_lo == 0) {
+                    device->uuid_hi = fnv1a(device->provider);
+                    device->uuid_lo = fnv1a(device->target, index + 1);
+                }
+                const std::string package_dir = find_package_dir(*device, source.plugin_dir);
+                std::string error;
+                if (package_dir.empty()) {
+                    GGML_LOG_WARN("FlagOS %s: no kernel package; only view operations are supported\n",
+                                  device->name.c_str());
+                } else if (!device->package.open(package_dir, error)) {
+                    GGML_LOG_WARN("FlagOS %s: kernel package %s rejected: %s\n", device->name.c_str(),
+                                  package_dir.c_str(), error.c_str());
+                } else {
+                    // A variant is chosen at launch, after supports_op
+                    // accepted the base kernel, so keep only variants this
+                    // device can launch.
+                    const rt_device * d = device.get();
+                    device->package.retain_variants([d](const flagos_kernel_info & k) { return kernel_fits_device(d, k); });
+                    GGML_LOG_DEBUG("FlagOS %s: kernel package %s (%zu kernels, %zu variants)\n", device->name.c_str(),
+                                   package_dir.c_str(), device->package.size(), device->package.variant_count());
+                }
+                device->buft = { buft_interface, &device->dev, device.get() };
+                device->dev = { device_interface(device.get()), nullptr, device.get() };
+                g_devices.push_back(std::move(device));
+            }
+        }
+    });
+    return g_devices.empty() ? nullptr : &adapter;
+}

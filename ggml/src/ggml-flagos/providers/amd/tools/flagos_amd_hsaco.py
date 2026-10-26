@@ -35,6 +35,10 @@ class HsacoKernel:
     wavefront_size: int
     group_segment_fixed_size: int
     private_segment_fixed_size: int
+    vgpr_count: int | None = None
+    sgpr_count: int | None = None
+    vgpr_spill_count: int | None = None
+    sgpr_spill_count: int | None = None
 
 
 class _Reader:
@@ -198,6 +202,9 @@ def _kernel(reader: _Reader) -> dict:
         ".kernarg_segment_size", ".max_flat_workgroup_size", ".wavefront_size",
         ".group_segment_fixed_size", ".private_segment_fixed_size",
     }
+    resource_fields = {
+        ".vgpr_count", ".sgpr_count", ".vgpr_spill_count", ".sgpr_spill_count",
+    }
     for _ in range(reader.map_size()):
         key = reader.string()
         if key == ".args":
@@ -207,7 +214,7 @@ def _kernel(reader: _Reader) -> dict:
             _unique(values, key, tuple(_argument(reader) for _ in range(count)))
         elif key in (".name", ".symbol"):
             _unique(values, key, reader.string())
-        elif key in integer_fields:
+        elif key in integer_fields | resource_fields:
             _unique(values, key, reader.unsigned())
         else:
             reader.skip()
@@ -264,7 +271,9 @@ def _metadata(descriptor: bytes) -> HsacoKernel:
         root["amdhsa.target"], kernel[".name"], kernel[".symbol"], kernel[".args"],
         kernel[".kernarg_segment_size"], kernel[".max_flat_workgroup_size"],
         kernel[".wavefront_size"], kernel[".group_segment_fixed_size"],
-        kernel[".private_segment_fixed_size"])
+        kernel[".private_segment_fixed_size"],
+        kernel.get(".vgpr_count"), kernel.get(".sgpr_count"),
+        kernel.get(".vgpr_spill_count"), kernel.get(".sgpr_spill_count"))
 
 
 def parse_hsaco(data: bytes) -> HsacoKernel:

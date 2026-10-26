@@ -15,9 +15,20 @@ bool flagos_provider_is_valid(const flagos_provider_v1 * provider) {
         provider->device_identity != nullptr &&
         provider->device_caps != nullptr &&
         provider->is_backend != nullptr &&
-        provider->set_device != nullptr &&
-        provider->get_device != nullptr &&
         provider->score != nullptr;
+}
+
+bool flagos_device_interface_is_valid(ggml_backend_dev_t device) {
+    return device != nullptr &&
+        device->iface.get_name != nullptr &&
+        device->iface.get_description != nullptr &&
+        device->iface.get_memory != nullptr &&
+        device->iface.get_type != nullptr &&
+        device->iface.get_props != nullptr &&
+        device->iface.init_backend != nullptr &&
+        device->iface.get_buffer_type != nullptr &&
+        device->iface.supports_op != nullptr &&
+        device->iface.supports_buft != nullptr;
 }
 
 bool flagos_device_identity_is_valid(
@@ -86,6 +97,12 @@ bool flagos_provider_get_device_profile(
         provider->get_device_profile(local_index, profile)) {
         return flagos_device_profile_is_valid(profile);
     }
+
+    // A declined optional query may have written only part of its result.
+    // Build the conservative fallback without any of those unverified fields.
+    *profile = {};
+    profile->struct_size = sizeof(flagos_device_profile);
+    profile->version = 1;
 
     flagos_device_caps caps {};
     if (!provider->device_caps(local_index, &caps) ||

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import hashlib
 import struct
 import subprocess
 import sys
@@ -118,14 +119,27 @@ def _write_package(root: Path, names: str | list[str], package: bool) -> None:
     (root / "manifest.json").write_text(json.dumps(manifest))
 
 
+def _write_asset(root: Path, name="table", filename="table.bin", data=b"reference-table"):
+    path = root / "manifest.json"
+    manifest = json.loads(path.read_text())
+    (root / filename).write_bytes(data)
+    manifest.setdefault("assets", []).append({
+        "name": name, "file": filename, "binary_size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    })
+    path.write_text(json.dumps(manifest))
+
+
 class MergePackageTest(unittest.TestCase):
-    def _merge(self, base: Path, extension: Path, output: Path, tuning="", add_missing=False):
+    def _merge(self, base: Path, extension: Path, output: Path, tuning="", add_missing=False, replace_existing=False):
         command = [sys.executable, str(MERGE), "--base-dir", str(base),
                    "--additional-dir", str(extension), "--output-dir", str(output)]
         if tuning:
             command += ["--tuning-profile", tuning]
         if add_missing:
             command += ["--add-missing"]
+        if replace_existing:
+            command += ["--replace-existing"]
         return subprocess.run(command, text=True, capture_output=True, check=False)
 
     def test_legacy_base_plus_v2_extension(self):
@@ -204,6 +218,46 @@ class MergePackageTest(unittest.TestCase):
             )
             self.assertEqual(manifest["kernels"][0]["block_size"], 8)
 
+    def test_replace_existing_same_artifact_preserves_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_package(root / "base", ["a", "keep"], package=True)
+            _write_package(root / "extension", "a", package=True)
+            _write_asset(root / "base")
+            path = root / "extension/manifest.json"
+            manifest = json.loads(path.read_text())
+            manifest["kernels"][0]["block_size"] = 16
+            path.write_text(json.dumps(manifest))
+            artifact = root / "extension/a.hsaco"
+            artifact.write_bytes(artifact.read_bytes() + b"replacement")
+            rejected = self._merge(root / "base", root / "extension", root / "rejected")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse((root / "rejected").exists())
+            result = self._merge(root / "base", root / "extension", root / "out", replace_existing=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            merged = json.loads((root / "out/manifest.json").read_text())
+            self.assertEqual([k["name"] for k in merged["kernels"]], ["a", "keep"])
+            self.assertEqual(merged["kernels"][0]["block_size"], 16)
+            self.assertEqual((root / "out/a.hsaco").read_bytes(), artifact.read_bytes())
+            self.assertEqual((root / "out/keep.hsaco").read_bytes(), (root / "base/keep.hsaco").read_bytes())
+            self.assertEqual((root / "out/table.bin").read_bytes(), b"reference-table")
+
+    def test_replace_existing_rejects_constant_file_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_package(root / "base", "a", package=True)
+            _write_package(root / "extension", "a", package=True)
+            _write_asset(root / "base", filename="conflict.hsaco")
+            path = root / "extension/manifest.json"
+            manifest = json.loads(path.read_text())
+            manifest["kernels"][0]["file"] = "conflict.hsaco"
+            path.write_text(json.dumps(manifest))
+            (root / "extension/a.hsaco").rename(root / "extension/conflict.hsaco")
+            result = self._merge(root / "base", root / "extension", root / "out", replace_existing=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("kernel and constant asset file collision", result.stderr)
+            self.assertFalse((root / "out").exists())
+
     def test_exact_block_contract_requires_boolean(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -216,6 +270,71 @@ class MergePackageTest(unittest.TestCase):
             result = self._merge(root / "base", root / "extension", root / "out")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("exact_block_size", result.stderr)
+
+
+class ConstantAssetMergeTest(unittest.TestCase):
+    _merge = MergePackageTest._merge
+    def test_constants_from_both_inputs_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_package(root / "base", "base", True)
+            _write_package(root / "extension", "extension", True)
+            _write_asset(root / "base", "first", "first.bin")
+            _write_asset(root / "extension", "second", "second.bin")
+            result = self._merge(root / "base", root / "extension", root / "out")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((root / "out/manifest.json").read_text())
+            self.assertEqual([a["name"] for a in manifest["assets"]], ["first", "second"])
+            for asset in manifest["assets"]:
+                self.assertEqual((root / "out" / asset["file"]).read_bytes(), b"reference-table")
+
+    def test_identical_constant_is_deduplicated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder in ("base", "extension"):
+                _write_package(root / folder, folder, True)
+                _write_asset(root / folder)
+            result = self._merge(root / "base", root / "extension", root / "out")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(json.loads((root / "out/manifest.json").read_text())["assets"]), 1)
+
+    def test_conflicting_constants_do_not_publish(self):
+        for collision in ("name", "file", "kernel"):
+            with self.subTest(collision=collision), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_package(root / "base", "base", True)
+                _write_package(root / "extension", "extension", True)
+                _write_asset(root / "base")
+                if collision == "name":
+                    _write_asset(root / "extension", data=b"changed-table")
+                elif collision == "file":
+                    _write_asset(root / "extension", name="other")
+                else:
+                    _write_asset(root / "extension", filename="base.hsaco")
+                result = self._merge(root / "base", root / "extension", root / "out")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / "out").exists())
+
+    def test_invalid_constant_metadata_does_not_publish(self):
+        mutations = [
+            lambda a: a.update(binary_size=True), lambda a: a.update(binary_size=0),
+            lambda a: a.update(binary_size=16*1024*1024+1),
+            lambda a: a.update(sha256="a"*64), lambda a: a.update(file="../table.bin"),
+            lambda a: a.update(name="a\0b"), lambda a: a.pop("sha256"),
+        ]
+        for mutate in mutations:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_package(root / "base", "base", True)
+                _write_package(root / "extension", "extension", True)
+                _write_asset(root / "extension")
+                path = root / "extension/manifest.json"
+                manifest = json.loads(path.read_text())
+                mutate(manifest["assets"][0])
+                path.write_text(json.dumps(manifest))
+                result = self._merge(root / "base", root / "extension", root / "out")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / "out").exists())
 
 
 if __name__ == "__main__":

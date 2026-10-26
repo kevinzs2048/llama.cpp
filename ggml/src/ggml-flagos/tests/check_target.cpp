@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 static void check(bool condition, const char * expression, int line) {
     if (!condition) {
@@ -121,6 +122,12 @@ int main() {
     const flagos_kernel_shape shape { 4096, 32, 4096 };
     CHECK(flagos_check_kernel_variant(&tie_profile, &invalid_quality, &shape).reason ==
         flagos_support_reason::invalid_variant);
+
+    flagos_kernel_variant minimum_score = quality_tie[0];
+    minimum_score.score = std::numeric_limits<int64_t>::min();
+    CHECK(select(tie_profile, &minimum_score, 1) == &minimum_score);
+    minimum_score.quality = flagos_support_state::unsupported;
+    CHECK(select(tie_profile, &minimum_score, 1) == nullptr);
 
     std::puts("FlagOS target capability checks passed");
     return 0;

@@ -153,6 +153,27 @@ def stop_process_group(process: subprocess.Popen, grace_seconds: int = 5) -> boo
     return False
 
 
+class RunningHealthFailure(RuntimeError):
+    pass
+
+
+def wait_with_health_checks(process: subprocess.Popen, timeout_seconds: float) -> int:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+        try:
+            return process.wait(timeout=min(2.0, remaining))
+        except subprocess.TimeoutExpired:
+            try:
+                errors = kernel_gpu_errors()
+            except KernelLogUnavailable as error:
+                raise RunningHealthFailure(str(error)) from error
+            if errors:
+                raise RunningHealthFailure(errors[-1])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout", type=int, default=180, help="wall timeout in seconds")
@@ -172,11 +193,17 @@ def main() -> int:
         action="store_true",
         help="print machine-readable status with --check-only",
     )
+    parser.add_argument(
+        "--continuous-health-guard", action="store_true",
+        help="continue healthy serialized runs without a per-boot count ceiling",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command and args.command[0] == "--" else args.command
     if args.timeout <= 0 or (args.max_processes_per_boot is not None and args.max_processes_per_boot <= 0):
         parser.error("limits must be positive")
+    if args.continuous_health_guard and args.max_processes_per_boot is not None:
+        parser.error("continuous health mode cannot be combined with a count limit")
     if args.check_only and command:
         parser.error("--check-only does not accept a command")
     if args.json and not args.check_only:
@@ -310,7 +337,8 @@ def main() -> int:
                     "commands_succeeded": succeeded,
                     "commands_failed": failed,
                     "limit": limit,
-                    "remaining": max(0, limit - started),
+                    "remaining": None if args.continuous_health_guard else max(0, limit - started),
+                    "count_limit_enforced": not args.continuous_health_guard,
                 }, separators=(",", ":")))
                 return 0
             if limit_recorded or args.max_processes_per_boot is not None:
@@ -323,7 +351,7 @@ def main() -> int:
                 f"{succeeded} succeeded, {failed} failed"
             )
             return 0
-        if started >= limit:
+        if not args.continuous_health_guard and started >= limit:
             print(
                 "FlagOS AMD guard: per-boot model-process limit reached; "
                 "use repetitions inside one process or reboot before another A/B pair",
@@ -385,7 +413,9 @@ def main() -> int:
 
             state.pop("processes_started", None)
             state["commands_started"] = started + 1
-            state["last_process_limit"] = limit
+            if not args.continuous_health_guard:
+                state["last_process_limit"] = limit
+            state["last_count_limit_mode"] = "continuous-health" if args.continuous_health_guard else "bounded"
             state["last_started_unix"] = int(time.time())
             state["last_command"] = command
             try:
@@ -403,7 +433,7 @@ def main() -> int:
             raise_interrupt = True
             if interrupted_signum is not None:
                 raise GuardInterrupted(interrupted_signum)
-            return_code = process.wait(timeout=args.timeout)
+            return_code = wait_with_health_checks(process, args.timeout)
             raise_interrupt = False
             if not wait_process_group_gone(process, 1):
                 print(
@@ -412,6 +442,13 @@ def main() -> int:
                 )
                 terminated_cleanly = stop_process_group(process)
                 return_code = 125
+        except RunningHealthFailure as error:
+            raise_interrupt = False
+            state["unhealthy"] = True
+            state["last_live_health_error"] = str(error)
+            print(f"FlagOS AMD guard: running health check failed; terminating: {error}", file=sys.stderr)
+            terminated_cleanly = stop_process_group(process)
+            return_code = 125
         except subprocess.TimeoutExpired:
             raise_interrupt = False
             print(
@@ -448,6 +485,7 @@ def main() -> int:
             state["launch_in_progress"] = False
             state["unhealthy"] = True
             state["last_log_check_error"] = str(error)
+            state["commands_failed"] = failed + 1
             state["last_return_code"] = return_code
             write_state(state_file, state)
             print(

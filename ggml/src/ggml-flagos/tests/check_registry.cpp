@@ -25,11 +25,10 @@ static constexpr uint64_t AMD_ID = 2;
 static constexpr uint64_t ARM_ACCEL_ID = 3;
 
 static ggml_backend_device denglin_devices[2] {};
-static ggml_backend_device amd_devices[1] {};
+static ggml_backend_device amd_devices[2] {};
 static ggml_backend_device arm_accel_devices[1] {};
 static int denglin_current_device = 0;
 static int amd_current_device = 0;
-static int arm_accel_current_device = 0;
 
 static bool mock_probe(ggml_backend_reg_t) {
     return true;
@@ -81,18 +80,18 @@ static int denglin_get_device() {
 }
 
 static size_t amd_device_count() {
-    return 1;
+    return 2;
 }
 
 static ggml_backend_dev_t amd_device_get(size_t index) {
-    return index == 0 ? &amd_devices[0] : nullptr;
+    return index < 2 ? &amd_devices[index] : nullptr;
 }
 
 static bool amd_device_identity(size_t index, flagos_device_identity * identity) {
-    if (index != 0 || identity == nullptr) {
+    if (index >= 2 || identity == nullptr) {
         return false;
     }
-    *identity = { AMD_ID, AMD_ID, 1, 20, 0 };
+    *identity = { AMD_ID, AMD_ID, index + 1, 20, static_cast<uint32_t>(index) };
     return true;
 }
 
@@ -135,18 +134,6 @@ static bool arm_accel_device_caps(size_t index, flagos_device_caps * caps) {
         nullptr,
     };
     return true;
-}
-
-static bool arm_accel_set_device(size_t index) {
-    if (index != 0) {
-        return false;
-    }
-    arm_accel_current_device = 0;
-    return true;
-}
-
-static int arm_accel_get_device() {
-    return arm_accel_current_device;
 }
 
 static int mock_score() {
@@ -253,15 +240,61 @@ static const flagos_provider_v1 * mock_arm_accel_provider() {
         arm_accel_device_identity,
         arm_accel_device_caps,
         mock_is_backend,
-        arm_accel_set_device,
-        arm_accel_get_device,
+        nullptr,
+        nullptr,
         mock_score,
         arm_accel_device_profile,
     };
     return &provider;
 }
 
+static ggml_backend_device_i mock_device_interface() {
+    ggml_backend_device_i iface {};
+    iface.get_name = [](ggml_backend_dev_t) { return "mock"; };
+    iface.get_description = [](ggml_backend_dev_t) { return "mock device"; };
+    iface.get_memory = [](ggml_backend_dev_t, size_t * free, size_t * total) { *free = *total = 0; };
+    iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+    iface.get_props = [](ggml_backend_dev_t, ggml_backend_dev_props * props) {
+        *props = {};
+        props->name = "mock";
+        props->description = "mock device";
+        props->type = GGML_BACKEND_DEVICE_TYPE_GPU;
+    };
+    iface.init_backend = [](ggml_backend_dev_t, const char *) -> ggml_backend_t { return nullptr; };
+    iface.get_buffer_type = [](ggml_backend_dev_t) -> ggml_backend_buffer_type_t { return nullptr; };
+    iface.supports_op = [](ggml_backend_dev_t, const ggml_tensor *) { return false; };
+    iface.supports_buft = [](ggml_backend_dev_t, ggml_backend_buffer_type_t) { return false; };
+    return iface;
+}
+
+static void check_device_interface_contract() {
+    CHECK(!flagos_device_interface_is_valid(nullptr));
+    ggml_backend_device device {};
+    CHECK(!flagos_device_interface_is_valid(&device));
+    device.iface = mock_device_interface();
+    CHECK(flagos_device_interface_is_valid(&device));
+#define CHECK_REQUIRED_CALLBACK(callback) \
+    device.iface = mock_device_interface(); \
+    device.iface.callback = nullptr; \
+    CHECK(!flagos_device_interface_is_valid(&device))
+    CHECK_REQUIRED_CALLBACK(get_name);
+    CHECK_REQUIRED_CALLBACK(get_description);
+    CHECK_REQUIRED_CALLBACK(get_memory);
+    CHECK_REQUIRED_CALLBACK(get_type);
+    CHECK_REQUIRED_CALLBACK(get_props);
+    CHECK_REQUIRED_CALLBACK(init_backend);
+    CHECK_REQUIRED_CALLBACK(get_buffer_type);
+    CHECK_REQUIRED_CALLBACK(supports_op);
+    CHECK_REQUIRED_CALLBACK(supports_buft);
+#undef CHECK_REQUIRED_CALLBACK
+}
+
 int main() {
+    check_device_interface_contract();
+    for (auto & device : denglin_devices) { device.iface = mock_device_interface(); }
+    amd_devices[0].iface = mock_device_interface();
+    arm_accel_devices[0].iface = mock_device_interface();
+    // amd_devices[1] has a valid identity but no required device callbacks.
     CHECK(flagos_registry_register_provider(mock_arm_accel_provider()));
     CHECK(!flagos_registry_register_provider(mock_arm_accel_provider()));
     ggml_backend_reg_t reg = ggml_backend_flagos_reg();
@@ -292,6 +325,13 @@ int main() {
     CHECK(denglin_current_device == 0);
     CHECK(amd_current_device == 0);
 
+    // Providers may omit the legacy selection hooks; a failed backend
+    // initialization must not change the active device.
+    ggml_backend_flagos_set_device(3);
+    CHECK(ggml_backend_flagos_get_device() == 3);
+    CHECK(ggml_backend_flagos_init(2) == nullptr);
+    CHECK(ggml_backend_flagos_get_device() == 3);
+
     flagos_device_profile profile {};
     CHECK(flagos_registry_get_device_profile(2, &profile));
     CHECK(profile.engine == flagos_engine_kind::gpu);
@@ -307,7 +347,8 @@ int main() {
     CHECK(info.struct_size == sizeof(flagos_device_info));
     CHECK(info.global_index == 3);
     CHECK(info.local_index == 0);
-    CHECK(info.name == nullptr);
+    CHECK(info.name != nullptr);
+    CHECK(std::strcmp(info.name, "mock") == 0);
     CHECK(info.provider.name != nullptr);
     CHECK(std::strcmp(info.provider.name, "mock-arm-accel") == 0);
     CHECK(info.identity.memory_domain_id == ARM_ACCEL_ID);

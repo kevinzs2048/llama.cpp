@@ -625,7 +625,7 @@ def flagos_concat_f32(
     b_offset = b0 * bs0 + b1 * bs1 + b2 * bs2 + b3 * bs3
     value_a = tl.load(a + a_offset, mask=from_a, other=0.0)
     value_b = tl.load(b + b_offset, mask=valid & ~from_a, other=0.0)
-    tl.store(output + offsets, value_a + value_b, mask=valid)
+    tl.store(output + offsets, tl.where(from_a, value_a, value_b), mask=valid)
 
 
 @triton.jit

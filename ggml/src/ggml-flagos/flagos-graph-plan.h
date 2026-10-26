@@ -31,6 +31,15 @@ enum class flagos_pattern_id : uint32_t {
     ffn_swiglu_down      = 15,
     // Parallel GDN alpha/beta projections and their decode gate epilogues.
     gdn_gate_projections = 16,
+    // MoE expert aggregation: MUL(experts, routing weights), one VIEW per
+    // used expert, and the chain of ADDs that sums them.
+    moe_weighted_sum     = 17,
+    // MoE router: SOFT_MAX, ARGSORT and its top-k VIEW, GET_ROWS of the
+    // selected probabilities, SUM_ROWS, CLAMP, DIV (llama.cpp norm_w).
+    moe_topk_softmax     = 18,
+    // Two or three decode MUL_MATs reading the same activation (attention
+    // Q, K and V projections) before the next graph barrier.
+    mul_mat_siblings     = 19,
 };
 
 const char * flagos_pattern_name(flagos_pattern_id id);
@@ -44,6 +53,7 @@ enum class flagos_quantized_matmul_kind : uint32_t {
     q5_k = 4,
     q4_1 = 5,
     q8_0 = 6,
+    q5_0 = 7,
 };
 
 // Provider-neutral description of a GGML quantized matrix multiply. The
@@ -74,12 +84,22 @@ enum class flagos_fusion_scope : uint32_t {
 
 flagos_fusion_scope flagos_pattern_scope(flagos_pattern_id id);
 
+// Prove that the split exposes all operand consumers; absent metadata fails closed.
+bool flagos_graph_exposes_all_consumers(const ggml_cgraph * graph, const ggml_tensor * tensor);
+
 struct flagos_pattern_candidate {
     flagos_pattern_id id = flagos_pattern_id::none;
     flagos_fusion_scope scope = flagos_fusion_scope::graph;
     std::vector<int> node_indices;
-    // The provider must write every listed output.
+    // The provider must write every listed output. Missing whole-graph use
+    // metadata makes every covered node output observable.
     std::vector<int> required_output_node_indices;
+    // Producers the pattern absorbs instead of executing them: nodes before
+    // the entry whose outputs only covered or absorbed nodes read (e.g. the
+    // GET_ROWS that gathers a recurrent state a fused kernel reads from the
+    // cache itself). They are skipped, so no node between one of them and
+    // the entry may write what it reads.
+    std::vector<int> absorbed_node_indices;
     uint64_t eliminated_read_bytes = 0;
     uint64_t eliminated_write_bytes = 0;
     uint32_t eliminated_launches = 0;
@@ -179,6 +199,7 @@ struct flagos_canonical_tensor {
 };
 
 struct flagos_canonical_node {
+    int32_t use_count = -1;
     flagos_canonical_tensor output;
     std::array<flagos_canonical_tensor, 10> sources;
 

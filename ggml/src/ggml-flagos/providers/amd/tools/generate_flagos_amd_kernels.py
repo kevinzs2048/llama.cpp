@@ -19,6 +19,7 @@ read for lower VGPR pressure.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib
 import json
@@ -88,6 +89,24 @@ FLAGGEMS_AOT_COMMIT = ""
 FLAGGEMS_AOT_TREE_STATE = "unknown"
 
 
+@contextmanager
+def amd_hint_context():
+    try:
+        from triton.compiler import hint_manager
+    except ImportError:
+        yield
+        return
+    if not hasattr(hint_manager, "HintManager") or not hasattr(hint_manager, "_global_hint_manager"):
+        raise RuntimeError("unsupported FlagTree hint API for explicit HIP compilation")
+    previous = hint_manager._global_hint_manager
+    # The CLI compiles for HIP; driver discovery can select CUDA or require a GPU.
+    hint_manager._global_hint_manager = hint_manager.HintManager("hip")
+    try:
+        yield
+    finally:
+        hint_manager._global_hint_manager = previous
+
+
 def assert_common_kernel_close(actual, expected, *args, **kwargs) -> None:
     rtol = kwargs.get("rtol")
     atol = kwargs.get("atol")
@@ -106,7 +125,11 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_flaggems_aot_export():
+def load_flaggems_aot_export(
+        name="flagos_add_rms_norm_mul_residual_f32",
+        semantic="transformer.add_rms_norm_scale_residual.v1",
+        runtime_arguments=("residual_output", "mul_output", "x", "bias", "weight", "n_cols", "eps"),
+        constexpr_arguments=("BLOCK",)):
     source = os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE")
     if not source:
         return None, None, "", "unknown"
@@ -124,13 +147,12 @@ def load_flaggems_aot_export():
     module_file = Path(module.__file__).resolve()
     if not module_file.is_relative_to(package_dir.resolve()):
         raise RuntimeError(f"flag_gems_aot was imported from an unexpected path: {module_file}")
-    export = module.get_kernel_export("flagos_add_rms_norm_mul_residual_f32")
+    export = module.get_kernel_export(name)
     if (export.abi != "flag-gems-aot-v1" or
-            export.semantic != "transformer.add_rms_norm_scale_residual.v1" or
-            export.runtime_arguments != (
-                "residual_output", "mul_output", "x", "bias", "weight", "n_cols", "eps") or
-            export.constexpr_arguments != ("BLOCK",)):
-        raise RuntimeError("incompatible FlagGems residual AOT export contract")
+            export.semantic != semantic or
+            export.runtime_arguments != runtime_arguments or
+            export.constexpr_arguments != constexpr_arguments):
+        raise RuntimeError(f"incompatible FlagGems AOT export contract: {name}")
     commit = os.environ.get("FLAGOS_FLAGGEMS_COMMIT", "")
     if not commit:
         result = subprocess.run(
@@ -155,8 +177,8 @@ def package_metadata() -> dict:
         ("flagos_amd_hsaco.py", Path(__file__).resolve().parent / "flagos_amd_hsaco.py"),
     ]
     sources.extend((path.name, path) for path in TUNING_PROFILE_KERNEL_LISTS)
-    if FLAGGEMS_AOT_EXPORT is not None:
-        for source in FLAGGEMS_AOT_EXPORT.source_files:
+    for export in FLAGGEMS_AOT_EXPORTS:
+        for source in export.source_files:
             source_path = Path(source).resolve()
             if FLAGGEMS_AOT_SOURCE_ROOT is None or not source_path.is_file() or not source_path.is_relative_to(
                     FLAGGEMS_AOT_SOURCE_ROOT):
@@ -164,7 +186,7 @@ def package_metadata() -> dict:
             sources.append((f"FlagGems/{source_path.relative_to(FLAGGEMS_AOT_SOURCE_ROOT)}", source_path))
     source_entries = [
         {"name": name, "sha256": sha256_file(source)}
-        for name, source in sources
+        for name, source in dict(sources).items()
     ]
     combined = hashlib.sha256()
     for source in source_entries:
@@ -183,15 +205,15 @@ def package_metadata() -> dict:
         "source_sha256": combined.hexdigest(),
         "sources": source_entries,
     }
-    if FLAGGEMS_AOT_EXPORT is not None:
+    if FLAGGEMS_AOT_EXPORTS:
         metadata["source_dependencies"] = [{
             "name": "FlagGems",
             "commit": FLAGGEMS_AOT_COMMIT or "unknown",
             "tree_state": FLAGGEMS_AOT_TREE_STATE,
-            "abi": FLAGGEMS_AOT_EXPORT.abi,
-            "kernel": FLAGGEMS_AOT_EXPORT.name,
-            "semantic": FLAGGEMS_AOT_EXPORT.semantic,
-        }]
+            "abi": export.abi,
+            "kernel": export.name,
+            "semantic": export.semantic,
+        } for export in FLAGGEMS_AOT_EXPORTS]
     tuning_profile = os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME", "")
     if tuning_profile:
         tuning_profile_contracts(tuning_profile)
@@ -533,6 +555,16 @@ def flagos_add_rms_norm_mul_residual_f32_narrow(
 ) = load_flaggems_aot_export()
 if FLAGGEMS_AOT_EXPORT is not None:
     flagos_add_rms_norm_mul_residual_f32 = FLAGGEMS_AOT_EXPORT.function
+
+FLAGGEMS_DENSE_GATHER_EXPORT, _, _, _ = load_flaggems_aot_export(
+    "flagos_get_rows_f32",
+    "ggml.get_rows.contiguous_f32.i32_indices.in_range.bitwise.v1",
+    ("table", "row_index", "output", "n_cols"),
+)
+if FLAGGEMS_DENSE_GATHER_EXPORT is not None:
+    common.flagos_get_rows_f32 = FLAGGEMS_DENSE_GATHER_EXPORT.function
+FLAGGEMS_AOT_EXPORTS = tuple(export for export in (
+    FLAGGEMS_AOT_EXPORT, FLAGGEMS_DENSE_GATHER_EXPORT) if export is not None)
 
 
 @triton.jit
@@ -2015,6 +2047,970 @@ def compile_q4_dequant_package_without_launch(output_dir: Path, arch: str) -> No
     write_manifest(output_dir, arch, [kernel])
 
 
+def compile_dense_gather_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile contiguous F32 gather without GPU initialization or launch."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("dense-gather requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_get_rows_f32"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.get_rows.contiguous_f32.i32_indices.in_range.bitwise.v1",
+        runtime_arguments=("table", "row_index", "output", "n_cols"),
+        constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("generic F32 gather must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    block_size = 256
+    source = ASTSource(
+        export.function,
+        {"table": "*fp32", "row_index": "*i32", "output": "*fp32",
+         "n_cols": "i32", "BLOCK": "constexpr"},
+        {"BLOCK": block_size},
+        attrs=export.aot_attributes,
+    )
+    compiled = triton.compile(source, target=GPUTarget("hip", arch, 32),
+                              options={"num_warps": NUM_WARPS})
+    metadata = compiled.metadata
+    global_scratch_size = getattr(metadata, "global_scratch_size", 0)
+    if global_scratch_size or metadata.profile_scratch_size:
+        raise RuntimeError(f"{name} requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{
+        "name": name, "symbol": name, "file": artifact.name,
+        "shared": metadata.shared, "num_warps": metadata.num_warps,
+        "warp_size": metadata.warp_size, "block_size": block_size,
+        "tile_m": 0, "tile_n": 0, "tile_k": 0, "argument_count": 4,
+        "global_scratch_size": global_scratch_size,
+        "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+        "profile_scratch_size": metadata.profile_scratch_size,
+        "profile_scratch_align": metadata.profile_scratch_align,
+    }])
+
+
+def compile_aligned_gemm_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile generic and aligned GEMM from explicit FlagGems contracts."""
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("aligned-gemm requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    global FLAGGEMS_AOT_EXPORTS
+    kernels = []
+    for aligned in (False, True):
+        name = "flagos_mul_mat_f16_f32_batched" + ("_aligned" if aligned else "")
+        semantic = "ggml.gemm_f16_round_activation_f16_acc_f32" + (".ptr16_k_rows_multiple16" if aligned else "") + ".v1"
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=("weights", "x", "output", "k", "rows", "columns"),
+            constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+        divisibility = tuple((argument, 16) for argument in ("weights", "x", "output", "k", "rows")) if aligned else ()
+        if export.aot_divisibility != divisibility:
+            raise RuntimeError(f"incompatible GEMM divisibility contract: {name}")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {"weights": "*fp16", "x": "*fp32", "output": "*fp32",
+                     "k": "i32", "rows": "i32", "columns": "i32",
+                     "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"}
+        constants = {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}
+        compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+            target=GPUTarget("hip", arch, 32), options={"num_warps": NUM_WARPS})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError(f"{name} requires unsupported Triton scratch storage")
+        artifact = output_dir / f"{name}.hsaco"
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 128, "tile_m": 64, "tile_n": 128, "tile_k": 32,
+            "argument_count": 6, "global_scratch_size": 0,
+            "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align,
+            "aot_divisibility": divisibility})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_tiled_ffn_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the checked tiled FFN export without GPU initialization."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("tiled-ffn requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_ffn_swiglu_f16_f32_batched_tiled"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="transformer.ffn_f16_round_activation_f16_acc_f32_swiglu.ptr16_k_rows_multiple16.v1",
+        runtime_arguments=("gate_weights", "up_weights", "x", "output", "k", "rows", "columns"),
+        constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+    divisibility = tuple((argument, 16) for argument in ("gate_weights", "up_weights", "x", "output", "k", "rows"))
+    if export.aot_divisibility != divisibility:
+        raise RuntimeError("incompatible tiled FFN divisibility contract")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {"gate_weights": "*fp16", "up_weights": "*fp16", "x": "*fp32", "output": "*fp32",
+        "k": "i32", "rows": "i32", "columns": "i32", "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"}
+    constants = {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}
+    compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 4})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("tiled FFN requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 128, "tile_m": 32, "tile_n": 128, "tile_k": 32,
+        "argument_count": 7, "global_scratch_size": 0, "global_scratch_align": getattr(m, "global_scratch_align", 1),
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align, "aot_divisibility": divisibility}])
+
+
+def compile_library_matrix_variants_without_launch(output_dir: Path, arch: str, variants) -> None:
+    """Compile variants without changing the checked library contracts."""
+    global FLAGGEMS_AOT_EXPORTS
+    contracts = {
+        "flagos_mul_mat_f16_f32_batched_aligned": (
+         "ggml.gemm_f16_round_activation_f16_acc_f32.ptr16_k_rows_multiple16.v1",
+         ("weights", "x", "output", "k", "rows", "columns"), 64),
+        "flagos_ffn_swiglu_f16_f32_batched_tiled": (
+         "transformer.ffn_f16_round_activation_f16_acc_f32_swiglu.ptr16_k_rows_multiple16.v1",
+         ("gate_weights", "up_weights", "x", "output", "k", "rows", "columns"), 32),
+    }
+    kernels = []
+    for source_name, suffix, options in variants:
+        semantic, arguments, tile_m = contracts[source_name]
+        export, _, _, _ = load_flaggems_aot_export(name=source_name, semantic=semantic,
+            runtime_arguments=arguments, constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+        divisibility = tuple((argument, 16) for argument in arguments[:-1])
+        if export.aot_divisibility != divisibility:
+            raise RuntimeError(f"incompatible matrix divisibility contract: {source_name}")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {argument: "*fp16" if "weights" in argument else
+                     "*fp32" if argument in ("x", "output") else "i32" for argument in arguments}
+        signature.update({argument: "constexpr" for argument in export.constexpr_arguments})
+        compiled = triton.compile(ASTSource(export.function, signature,
+            {"BLOCK_M": tile_m, "BLOCK_N": 128, "BLOCK_K": 32}, attrs=export.aot_attributes),
+            target=GPUTarget("hip", arch, 32), options=options)
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError(f"{source_name} requires unsupported Triton scratch storage")
+        name = source_name + "_" + suffix
+        artifact = output_dir / f"{name}.hsaco"
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 128, "tile_m": tile_m, "tile_n": 128, "tile_k": 32,
+            "argument_count": len(arguments), "global_scratch_size": 0,
+            "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align,
+            "aot_divisibility": divisibility, "compile_options": options})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_matrix_stage1_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile optional pipeline variants from the existing library exports."""
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("matrix-stage1 requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    compile_library_matrix_variants_without_launch(output_dir, arch, [
+        (name, "stage1", {"num_warps": 4, "num_stages": 1}) for name in (
+            "flagos_mul_mat_f16_f32_batched_aligned", "flagos_ffn_swiglu_f16_f32_batched_tiled")])
+
+
+def compile_ffn_waves_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile FFN scheduler hints with the default two-stage pipeline."""
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("ffn-waves requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    compile_library_matrix_variants_without_launch(output_dir, arch, [
+        ("flagos_ffn_swiglu_f16_f32_batched_tiled", f"waves{waves}",
+         {"num_warps": 4, "num_stages": 2, "waves_per_eu": waves}) for waves in (2, 3)])
+
+
+def compile_packed_ffn_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile both packing stages from versioned library contracts."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("packed-ffn requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    for name, semantic, arguments, constexpr, signature, constants in (
+        ("flagos_pack_f32_f16", "ggml.pack.contiguous_f32_to_f16.round_nearest.disjoint.v1",
+         ("x", "output", "count"), ("BLOCK",),
+         {"x": "*fp32", "output": "*fp16", "count": "i32", "BLOCK": "constexpr"}, {"BLOCK": 256}),
+        ("flagos_ffn_swiglu_f16_packed_activation",
+         "transformer.ffn_packed_f16_acc_f32_swiglu.ptr16_k_rows_multiple16.v1",
+         ("gate_weights", "up_weights", "x", "output", "k", "rows", "columns"),
+         ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
+         {"gate_weights": "*fp16", "up_weights": "*fp16", "x": "*fp16", "output": "*fp32",
+          "k": "i32", "rows": "i32", "columns": "i32",
+          "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"},
+         {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}),
+    ):
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=arguments, constexpr_arguments=constexpr)
+        required = () if len(arguments) == 3 else tuple((argument, 16) for argument in arguments[:6])
+        if export.aot_divisibility != required:
+            raise RuntimeError("incompatible packed FFN divisibility contract")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+            target=GPUTarget("hip", arch, 32), options={"num_warps": 4})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("packed FFN requires unsupported Triton scratch storage")
+        artifact = output_dir / f"{name}.hsaco"
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": constants.get("BLOCK", 32), "tile_m": constants.get("BLOCK_M", 0),
+            "tile_n": constants.get("BLOCK_N", 0), "tile_k": constants.get("BLOCK_K", 0),
+            "argument_count": len(arguments), "global_scratch_size": 0,
+            "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align,
+            "aot_divisibility": required})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_flash_attention_package_without_launch(output_dir: Path, arch: str, profile: str = "baseline") -> None:
+    """Compile generic 128/256 attention from explicit library contracts."""
+    global FLAGGEMS_AOT_EXPORTS
+    if profile not in ("baseline", "gfx1150-head256"):
+        raise RuntimeError(f"unknown flash-attention profile: {profile}")
+    if profile != "baseline" and arch != "gfx1150":
+        raise RuntimeError("gfx1150-head256 profile requires --arch gfx1150")
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("flash-attention requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    pointers = ("q", "k", "v", "attention_mask", "output")
+    strides = ("stride_q_token", "stride_q_head", "stride_k_token", "stride_k_head",
+               "stride_v_token", "stride_v_head", "stride_output_token", "stride_output_head")
+    kernels = []
+    for prefill in (False, True):
+        kind = "prefill" if prefill else "decode"
+        name = f"flagos_flash_attn_{kind}_f32_f16"
+        lengths = ("query_length", "key_length", "q_per_kv") if prefill else ("key_length", "q_per_kv")
+        mask_strides = ("stride_mask_token", "stride_mask_query") if prefill else ()
+        runtime = pointers + lengths + strides[:6] + mask_strides + strides[6:] + ("scale",)
+        signature = {argument: "i32" for argument in runtime}
+        signature.update(q="*fp32", k="*fp16", v="*fp16", attention_mask="*fp16",
+                         output="*fp32", scale="fp32", HEAD_DIM="constexpr", BLOCK_M="constexpr", BLOCK_N="constexpr")
+        for head_dim in (128, 256):
+            selected = profile == "gfx1150-head256" and head_dim == 256
+            export_name = name
+            semantic = f"ggml.flash_{kind}_q_round_f16_kv_f16_online_softmax.generic_strides.all_masked_zero.v1"
+            warps = NUM_WARPS if profile == "baseline" else 4
+            if selected:
+                export_name += "_skip_masked_generic" if prefill else "_simt_generic"
+                semantic = semantic[:-3] + (".skip_fully_masked_tiles.v1" if prefill else ".simt_f32_reductions.v1")
+                warps = 8 if prefill else 4
+            export, _, _, _ = load_flaggems_aot_export(name=export_name,
+                semantic=semantic, runtime_arguments=runtime,
+                constexpr_arguments=("HEAD_DIM", "BLOCK_M", "BLOCK_N"))
+            if export.aot_divisibility:
+                raise RuntimeError(f"generic attention must not require extra divisibility: {export_name}")
+            FLAGGEMS_AOT_EXPORTS += (export,)
+            entry = name + f"_generic_h{head_dim}"
+            constants = {"HEAD_DIM": head_dim, "BLOCK_M": 16, "BLOCK_N": 16}
+            compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": warps, "num_stages": 1})
+            metadata = compiled.metadata
+            if getattr(metadata, "global_scratch_size", 0) or metadata.profile_scratch_size:
+                raise RuntimeError(f"{entry} requires unsupported Triton scratch storage")
+            artifact = output_dir / f"{entry}.hsaco"
+            artifact.write_bytes(compiled.asm["hsaco"])
+            kernels.append({"name": entry, "symbol": metadata.name, "file": artifact.name,
+                "shared": metadata.shared, "num_warps": metadata.num_warps, "warp_size": metadata.warp_size,
+                "block_size": 16, "tile_m": 16, "tile_n": 16, "tile_k": head_dim,
+                "argument_count": len(runtime), "global_scratch_size": 0,
+                "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+                "profile_scratch_size": 0, "profile_scratch_align": metadata.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_splitkv_decode_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the explicit-workspace GGML decode pair without a GPU launch."""
+    global FLAGGEMS_AOT_EXPORTS
+    if arch != "gfx1150" or not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("flash-decode-splitkv requires gfx1150 and FLAGOS_FLAGGEMS_AOT_SOURCE")
+    partial_runtime = ("q", "k", "v", "mask", "partial_m", "partial_l", "partial_a",
+        "key_length", "q_per_kv", "split_count", "keys_per_split", "stride_q_token",
+        "stride_q_head", "stride_k_token", "stride_k_head", "stride_v_token", "stride_v_head", "scale")
+    merge_runtime = ("partial_m", "partial_l", "partial_a", "output",
+        "split_count", "stride_output_token", "stride_output_head")
+    pointers = {"q": "*fp32", "k": "*fp16", "v": "*fp16", "mask": "*fp16",
+        "partial_m": "*fp32", "partial_l": "*fp32", "partial_a": "*fp32", "output": "*fp32"}
+    stages = (
+        (False, "flagos_flash_decode_splitk_stage1_f32_f16", partial_runtime,
+         "ggml.flash_decode_splitkv.partial_m_l_a.q_round_f16.kv_f16.p_tile_f16.stats_f32.head128_256.explicit_workspace.single_query.all_masked_zero.v1",
+         ("HEAD_DIM", "BLOCK_KV")),
+        (True, "flagos_flash_decode_splitk_merge_f32", merge_runtime,
+         "ggml.flash_decode_splitkv.merge_m_l_a.f32.head128_256.explicit_workspace.single_query.all_masked_zero.v1",
+         ("HEAD_DIM", "MAX_SPLITS")),
+    )
+    kernels = []
+    with amd_hint_context():
+        for merge, export_name, runtime, semantic, constexpr in stages:
+            export, _, _, _ = load_flaggems_aot_export(name=export_name, semantic=semantic,
+                runtime_arguments=runtime, constexpr_arguments=constexpr)
+            if export.aot_attributes:
+                raise RuntimeError("split-KV requires generic pointer and stride attributes")
+            FLAGGEMS_AOT_EXPORTS += (export,)
+            for head in (128, 256):
+                block = 16 if merge else 32
+                constants = {"HEAD_DIM": head, "MAX_SPLITS" if merge else "BLOCK_KV": block}
+                signature = {argument: pointers.get(argument, "fp32" if argument == "scale" else "i32")
+                    for argument in runtime}
+                signature.update({argument: "constexpr" for argument in constexpr})
+                compiled = triton.compile(ASTSource(export.function, signature, constants, attrs={}),
+                    target=GPUTarget("hip", arch, 32),
+                    options={"num_warps": 4, "num_stages": 1, "enable_fp_fusion": False})
+                metadata = compiled.metadata
+                if getattr(metadata, "global_scratch_size", 0) or metadata.profile_scratch_size:
+                    raise RuntimeError("split-KV requires unsupported Triton scratch storage")
+                name = ("flagos_flash_decode_splitkv_merge_f32" if merge else
+                    "flagos_flash_decode_splitkv_partial_f32_f16") + f"_h{head}"
+                artifact = output_dir / f"{name}.hsaco"
+                artifact.write_bytes(compiled.asm["hsaco"])
+                kernels.append({"name": name, "symbol": metadata.name, "file": artifact.name,
+                    "shared": metadata.shared, "num_warps": metadata.num_warps,
+                    "warp_size": metadata.warp_size, "block_size": block,
+                    "tile_m": 0, "tile_n": block, "tile_k": head,
+                    "argument_count": len(runtime), "global_scratch_size": 0,
+                    "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+                    "profile_scratch_size": 0, "profile_scratch_align": metadata.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+
+def compile_grouped_splitkv_decode_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the four independently qualified gfx1150 grouped profiles."""
+    global FLAGGEMS_AOT_EXPORTS
+    if arch != "gfx1150" or not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("flash-decode-grouped-splitkv requires gfx1150 and FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_flash_decode_splitkv_grouped_partial_f32_f16"
+    runtime = ("q", "k", "v", "mask", "partial_m", "partial_l", "partial_a",
+        "key_length", "q_per_kv", "split_count", "keys_per_split", "stride_q_token",
+        "stride_q_head", "stride_k_token", "stride_k_head", "stride_v_token", "stride_v_head", "scale")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.flash_decode_splitkv.grouped_partial_m_l_a.q_round_f16.kv_f16.p_tile_f16.dot_acc_f32.head128_256.gqa2_4_8.explicit_workspace.single_query.all_masked_zero.v1",
+        runtime_arguments=runtime, constexpr_arguments=("HEAD_DIM", "BLOCK_KV", "Q_PER_KV", "BLOCK_Q"))
+    if export.aot_divisibility:
+        raise RuntimeError("generic grouped split-KV must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    pointer_types = {"q": "*fp32", "k": "*fp16", "v": "*fp16", "mask": "*fp16",
+        "partial_m": "*fp32", "partial_l": "*fp32", "partial_a": "*fp32"}
+    signature = {argument: pointer_types.get(argument, "fp32" if argument == "scale" else "i32")
+        for argument in runtime}
+    signature.update({argument: "constexpr" for argument in export.constexpr_arguments})
+    kernels = []
+    for head, group in ((128, 2), (128, 4), (128, 8), (256, 8)):
+        constants = {"HEAD_DIM": head, "BLOCK_KV": 16, "Q_PER_KV": group, "BLOCK_Q": 16}
+        compiled = triton.compile(ASTSource(export.function, signature, constants, attrs=export.aot_attributes),
+            target=GPUTarget("hip", arch, 32),
+            options={"num_warps": 4, "num_stages": 1, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("grouped split-KV requires unsupported Triton scratch storage")
+        kernel_name = "flagos_flash_decode_splitkv_grouped_f32_f16_h" + str(head) + "_g" + str(group)
+        artifact = output_dir / (kernel_name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": kernel_name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 16, "tile_m": 16, "tile_n": 16, "tile_k": head,
+            "argument_count": 18, "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_ggml_rope_package_without_launch(output_dir: Path, arch: str, *, neox: bool = False) -> None:
+    """Compile the no-YaRN GGML frequency-recurrence RoPE export."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("ggml-rope requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_rope_ggml_neox_recurrence_f32" if neox else "flagos_rope_ggml_recurrence_f32"
+    runtime = ("x", "positions", "factors", "output", "ne0", "ne1", "ne2", "n_dims", "mode", "has_factors",
+               "stride_x1", "stride_x2", "stride_x3", "section_t", "section_h", "section_w", "section_e",
+               "theta_scale", "freq_scale", "attn_factor")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.rope_neox_f32.cpu_frequency_recurrence.no_yarn.v2" if neox else
+                 "ggml.rope_normal_imrope_f32.cpu_frequency_recurrence.no_yarn.v2",
+        runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("GGML recurrence RoPE must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "i32" for argument in runtime}
+    signature.update(x="*fp32", positions="*i32", factors="*fp32", output="*fp32",
+                     theta_scale="fp32", freq_scale="fp32", attn_factor="fp32", BLOCK="constexpr")
+    compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 128}, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("GGML recurrence RoPE requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 128, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+        "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
+def compile_q6_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the GGUF Q6_K GEMV export without device launches."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("q6-gemv requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_mul_mat_q6_k_f32"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="gguf.q6_k.gemv_f32_activation_acc_f32.v1",
+        runtime_arguments=("weights_u8", "weights_f16", "x", "output", "k", "rows"),
+        constexpr_arguments=())
+    if export.aot_divisibility:
+        raise RuntimeError("generic Q6_K GEMV must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {"weights_u8": "*u8", "weights_f16": "*fp16", "x": "*fp32",
+        "output": "*fp32", "k": "i32", "rows": "i32"}
+    compiled = triton.compile(ASTSource(export.function, signature, {}, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 1})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("Q6_K GEMV requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+        "argument_count": 6, "global_scratch_size": 0, "global_scratch_align": 1,
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
+
+def compile_core_ops_package_without_launch(
+        output_dir: Path, arch: str, *, graph_ops: bool = False) -> None:
+    """Compile selected generic F32 library exports as a separate package."""
+    global FLAGGEMS_AOT_EXPORTS
+    extension = "graph-ops" if graph_ops else "core-ops"
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError(f"{extension} requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    contracts = (
+        ("add", "ggml.add.same_shape.contiguous_f32.tail.v1", ("x", "y", "output", "n_elements")),
+        ("add_repeat", "ggml.add.leading_vector_repeat.contiguous_f32.tail.v1", ("x", "y", "output", "n_elements", "y_elements")),
+        ("mul", "ggml.mul.flat_repeat.contiguous_f32.tail.v1", ("x", "y", "output", "n_elements", "y_elements")),
+        ("scale", "ggml.scale.f32.multiply_add.profile_fp_fusion.tail.v1", ("x", "output", "scale", "bias", "n_elements")),
+        ("sigmoid", "ggml.sigmoid.contiguous_f32.tail.v1", ("x", "output", "n_elements")),
+        ("softplus", "ggml.softplus.f32.threshold20.tail.v1", ("x", "output", "n_elements")),
+        ("swiglu_split", "ggml.swiglu.split_gate_silu_times_up.contiguous_f32.tail.v1", ("gate", "up", "output", "n_elements")),
+        ("rms_norm", "ggml.rms_norm.f32.rowwise_eps_inside_sqrt.tail.v1", ("output", "x", "n_cols", "eps")),
+        ("silu", "ggml.silu.contiguous_f32.tail.v1", ("x", "output", "n_elements")),
+    )
+    if graph_ops:
+        contracts = (
+            ("copy_strided", "ggml.copy.f32.flat_order.independent_shapes.element_strides.disjoint.v1",
+                ("x", "output", "xe0", "xe1", "xe2", "xe3", "ye0", "ye1", "ye2", "ye3",
+                 "sx0", "sx1", "sx2", "sx3", "sy0", "sy1", "sy2", "sy3", "n_elements")),
+            ("concat", "ggml.concat.f32.axis0_3.strided_inputs.contiguous_output.disjoint.bitwise_select.v2",
+                ("a", "b", "output", "dim", "ye0", "ye1", "ye2", "ye3", "ae0", "ae1", "ae2", "ae3",
+                 "as0", "as1", "as2", "as3", "bs0", "bs1", "bs2", "bs3", "n_elements")),
+            ("l2_norm_strided", "ggml.l2_norm.f32.inner_contiguous.outer_strides.sqrt_sum_clamp_eps.disjoint.v1",
+                ("x", "output", "n_cols", "stride_row", "stride_channel", "stride_sample", "eps", "n_rows", "n_channels")),
+            ("ssm_conv", "ggml.ssm_conv.f32.rolling_state.depthwise.explicit_strides.disjoint.v1",
+                ("s", "c", "output", "d_conv", "d_inner", "n_tokens", "n_seqs", "ss1", "ss2", "sc1", "so0", "so1")),
+        )
+    exports = []
+    for operation, semantic, runtime in contracts:
+        name = "flagos_" + operation + "_f32"
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError(f"generic {extension} operations must not require extra divisibility")
+        exports.append((operation, export))
+    kernels = []
+    with amd_hint_context():
+        for operation, export in exports:
+            FLAGGEMS_AOT_EXPORTS += (export,)
+            # Preserve the legacy L2 row-width contract when replacing its
+            # module. A 256-column export silently removed 512-column support.
+            block = 4096 if operation == "rms_norm" else 512 if operation == "l2_norm_strided" else 256
+            signature = {argument: "*fp32" if argument in ("x", "y", "output", "gate", "up", "a", "b", "s", "c")
+                else "fp32" if argument in ("scale", "bias", "eps") else "i32"
+                for argument in export.runtime_arguments}
+            signature["BLOCK"] = "constexpr"
+            compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": block}, attrs={}),
+                target=GPUTarget("hip", arch, 32),
+                options={"num_warps": 4, "enable_fp_fusion": not graph_ops and operation != "scale"})
+            metadata = compiled.metadata
+            if getattr(metadata, "global_scratch_size", 0) or metadata.profile_scratch_size:
+                raise RuntimeError(f"{extension} operations require unsupported Triton scratch storage")
+            artifact = output_dir / (export.name + ".hsaco")
+            artifact.write_bytes(compiled.asm["hsaco"])
+            kernels.append({"name": export.name, "symbol": metadata.name, "file": artifact.name,
+                "shared": metadata.shared, "num_warps": metadata.num_warps, "warp_size": metadata.warp_size,
+                "block_size": block, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+                "argument_count": len(export.runtime_arguments), "global_scratch_size": 0,
+                "global_scratch_align": getattr(metadata, "global_scratch_align", 1),
+                "profile_scratch_size": 0, "profile_scratch_align": metadata.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_rows_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile GGUF gather, KV scatter, and bitwise F16 copy exports."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("row-ops requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    copy_arguments = ("x", "output", "xe0", "xe1", "xe2", "xe3", "ye0", "ye1", "ye2", "ye3",
+        "sx0", "sx1", "sx2", "sx3", "sy0", "sy1", "sy2", "sy3", "n_elements")
+    contracts = (
+        ("flagos_get_rows_q4_k_f32", "ggml.get_rows.gguf_q4_k.contiguous.i32_indices.in_range.packed256.acc_f32.v1",
+            ("weights_u8", "weights_f16", "row_index", "output", "n_cols"), ()),
+        ("flagos_get_rows_q6_k_f32", "ggml.get_rows.gguf_q6_k.contiguous.i32_indices.in_range.packed256.acc_f32.v1",
+            ("weights_u8", "weights_f16", "row_index", "output", "n_cols"), ()),
+        ("flagos_set_rows_f32_f16", "ggml.set_rows.contiguous_f32_to_f16.i64_indices.in_range.unique_rows.state_write.v1",
+            ("x", "row_index", "output", "n_cols", "n_rows", "n_dst_rows"), ("BLOCK",)),
+        ("flagos_copy_strided_f16_bits", "ggml.copy.f16_bits.flat_order.independent_shapes.element_strides.disjoint.v1",
+            copy_arguments, ("BLOCK",)),
+    )
+    exports = []
+    for name, semantic, runtime, constexpr in contracts:
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=runtime, constexpr_arguments=constexpr)
+        if export.aot_divisibility:
+            raise RuntimeError("generic row operations must not require extra divisibility")
+        exports.append(export)
+    kernels = []
+    with amd_hint_context():
+        for export in exports:
+            FLAGGEMS_AOT_EXPORTS += (export,)
+            copy_bits = export.name == "flagos_copy_strided_f16_bits"
+            scatter = export.name == "flagos_set_rows_f32_f16"
+            pointer_types = {"weights_u8": "*u8", "weights_f16": "*fp16",
+                "row_index": "*i64" if scatter else "*i32", "x": "*u16" if copy_bits else "*fp32",
+                "output": "*u16" if copy_bits else "*fp16" if scatter else "*fp32"}
+            signature = {argument: pointer_types.get(argument, "i32") for argument in export.runtime_arguments}
+            constants = {argument: 256 for argument in export.constexpr_arguments}
+            signature.update({argument: "constexpr" for argument in constants})
+            compiled = triton.compile(ASTSource(export.function, signature, constants, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+            m = compiled.metadata
+            if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+                raise RuntimeError("row operations require unsupported Triton scratch storage")
+            artifact = output_dir / (export.name + ".hsaco")
+            artifact.write_bytes(compiled.asm["hsaco"])
+            kernels.append({"name": export.name, "symbol": m.name, "file": artifact.name,
+                "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+                "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+                "argument_count": len(export.runtime_arguments), "global_scratch_size": 0,
+                "global_scratch_align": getattr(m, "global_scratch_align", 1),
+                "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_gguf_rows_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile remaining GGUF row gather formats from the operator library."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("gguf-rows requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    runtime = ("weights_u8", "weights_f16", "row_index", "output", "n_cols")
+    signature = {"weights_u8": "*u8", "weights_f16": "*fp16", "row_index": "*i32",
+        "output": "*fp32", "n_cols": "i32"}
+    for kind, block in (("q4_0", 32), ("q4_1", 32), ("q8_0", 32), ("q5_k", 256)):
+        name = "flagos_get_rows_" + kind + "_f32"
+        export, _, _, _ = load_flaggems_aot_export(name=name,
+            semantic="ggml.get_rows.gguf_" + kind + ".contiguous.i32_indices.in_range.packed" + str(block) + ".acc_f32.v1",
+            runtime_arguments=runtime, constexpr_arguments=())
+        if export.aot_divisibility:
+            raise RuntimeError("generic GGUF gather must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("GGUF gather requires unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": block, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_repeat_ops_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile per-dimension GGML repeat, clamp and F64 row sum exports."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("repeat-ops requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    binary_runtime = ("x", "y", "output", "n0", "n1", "n2", "n3", "y0", "y1", "y2", "y3",
+        "sx0", "sx1", "sx2", "sx3", "sy0", "sy1", "sy2", "sy3", "n_elements")
+    contracts = [("flagos_" + op + "_repeat_strided_f32",
+        "ggml." + op + ".f32.repeat_modulo_4d.strided_inputs.dense_output.disjoint.ieee_div.v1",
+        binary_runtime, {"OP": op, "BLOCK": 256}) for op in ("add", "mul", "div")]
+    contracts.extend([
+        ("flagos_clamp_compare_f32", "ggml.clamp.contiguous_f32.compare_min_then_max.nan_signed_zero.v1",
+            ("x", "output", "n_elements", "minimum", "maximum"), {"BLOCK": 256}),
+        ("flagos_sum_rows_f32_acc_f64", "ggml.sum_rows.contiguous_f32.tree_acc_f64.output_f32.v1",
+            ("x", "output", "n_cols"), {"BLOCK": 1024}),
+    ])
+    kernels = []
+    for name, semantic, runtime, constants in contracts:
+        export, _, _, _ = load_flaggems_aot_export(name=name, semantic=semantic,
+            runtime_arguments=runtime, constexpr_arguments=tuple(constants))
+        if export.aot_divisibility:
+            raise RuntimeError("generic repeat operations must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {arg: "*fp32" if arg in ("x", "y", "output")
+            else "fp32" if arg in ("minimum", "maximum") else "i32" for arg in runtime}
+        signature.update({arg: "constexpr" for arg in constants})
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, constants, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("repeat operations require unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": constants["BLOCK"], "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_batched_gather_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile 4D table/index element-stride gathers with the exact GGML ABI."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("batched-gather requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    runtime = ("table", "row_index", "output", "n_cols", "table_rows", "gather_rows", "batch2", "batch3",
+        "st0", "st1", "st2", "st3", "si0", "si1", "si2", "n_elements")
+    kernels = []
+    for kind, pointer in (("f32", "*fp32"), ("f16_f32", "*fp16"), ("bf16_bits_f32", "*u16")):
+        name = "flagos_get_rows_batched_" + kind
+        export, _, _, _ = load_flaggems_aot_export(name=name,
+            semantic="ggml.get_rows.batched_" + kind + ".element_strides.dense_f32_output.i32_indices.in_range.v1",
+            runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError("generic batched gather must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {arg: pointer if arg == "table" else "*i32" if arg == "row_index"
+            else "*fp32" if arg == "output" else "i32" for arg in runtime}
+        signature["BLOCK"] = "constexpr"
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 256}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("batched gather requires unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_tanh_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the operator-library TANH export with its exact pointwise ABI."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("tanh requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    export, _, _, _ = load_flaggems_aot_export(name="flagos_tanh_f32",
+        semantic="ggml.tanh.contiguous_f32.libdevice.pointwise.v1",
+        runtime_arguments=("x", "output", "n_elements"), constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("generic TANH must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {"x": "*fp32", "output": "*fp32", "n_elements": "i32", "BLOCK": "constexpr"}
+    with amd_hint_context():
+        compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 256}, attrs={}),
+            target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("TANH requires unsupported Triton scratch storage")
+    artifact = output_dir / (export.name + ".hsaco")
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": export.name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+        "argument_count": 3, "global_scratch_size": 0, "global_scratch_align": 1,
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
+def compile_plain_softmax_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the existing ordinary softmax ABIs from the operator library."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("plain-softmax requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    for name, mask_type in (("flagos_soft_max_unmasked_f32", "none"), ("flagos_soft_max_masked_f32_f16", "f16")):
+        runtime = ("x", "mask_ptr", "output", "n_cols", "scale")
+        export, _, _, _ = load_flaggems_aot_export(name=name,
+            semantic="ggml.soft_max.contiguous_f32.mask_" + mask_type + ".equal_shape.scale.no_alibi_no_sinks.valid_row.v1",
+            runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError("ordinary softmax must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {"x": "*fp32", "mask_ptr": "*fp16" if mask_type == "f16" else "*fp32",
+            "output": "*fp32", "n_cols": "i32", "scale": "fp32", "BLOCK": "constexpr"}
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 1024}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("ordinary softmax requires unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 1024, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_softmax_broadcast_package_without_launch(output_dir: Path, arch: str, wide: bool = False) -> None:
+    """Compile a separate F32-mask softmax package for GGML head broadcasts."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("softmax-broadcast requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    runtime = ("x", "mask_ptr", "output", "n_cols", "n_rows", "n_heads", "mask_heads", "mask_samples",
+        "mask_stride_row", "mask_stride_head", "mask_stride_sample", "scale")
+    export, _, _, _ = load_flaggems_aot_export(name="flagos_soft_max_masked_broadcast_f32",
+        semantic="ggml.soft_max.f32.mask_f32.head_sample_modulo.strides.scale.no_alibi_no_sinks.valid_row.v1",
+        runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("generic softmax must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "*fp32" if argument in ("x", "mask_ptr", "output") else
+        "fp32" if argument == "scale" else "i32" for argument in runtime}
+    signature["BLOCK"] = "constexpr"
+    profiles = ((1024, 4), (2048, 4), (4096, 4), (8192, 8)) if wide else ((512, 4),)
+    kernels = []
+    for block, warps in profiles:
+        name = export.name + (f"_b{block}_w{warps}" if wide else "")
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": block}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": warps, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("softmax requires unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": block, "tile_m": 0, "tile_n": 0, "tile_k": 0, "argument_count": len(runtime),
+            "global_scratch_size": 0, "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_strided_batched_gemm_package_without_launch(
+        output_dir: Path, arch: str, preserve_src1: bool = False,
+        f32_weights: bool = False) -> None:
+    """Compile explicit GGML floating matrix multiplication with batch strides."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("strided-batched-gemm requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    runtime = ("weights", "x", "output", "k", "rows", "columns", "n_heads",
+        "head_ratio", "sample_ratio", "sw1", "sw2", "sw3", "sx1", "sx2", "sx3")
+    preserve_src1 = preserve_src1 or f32_weights
+    weight_type = "f32" if f32_weights else "f16"
+    name = "flagos_mul_mat_" + weight_type + "_f32_strided_batched" + ("_ieee" if preserve_src1 else "")
+    source_semantic = "f32_src1_preserved.ieee_products" if preserve_src1 else "f32_src1_rne_f16"
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.mul_mat." + weight_type + "_weights." + source_semantic + ".acc_f32.outer_strides.batch_floor_broadcast.v1",
+        runtime_arguments=runtime, constexpr_arguments=("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+    if export.aot_divisibility:
+        raise RuntimeError("generic strided batched GEMM must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "*fp16" if argument == "weights" and not f32_weights else
+        "*fp32" if argument == "weights" else
+        "*fp32" if argument in ("x", "output") else "i32" for argument in runtime}
+    constants = {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 32}
+    signature.update({argument: "constexpr" for argument in constants})
+    with amd_hint_context():
+        compiled = triton.compile(ASTSource(export.function, signature, constants, attrs={}),
+            target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("strided batched GEMM requires unsupported Triton scratch storage")
+    artifact = output_dir / (export.name + ".hsaco")
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": export.name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 32, "tile_m": 32, "tile_n": 16, "tile_k": 32,
+        "argument_count": len(runtime), "global_scratch_size": 0,
+        "global_scratch_align": getattr(m, "global_scratch_align", 1),
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
+def compile_half_gather_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile dense F16/BF16 embedding exports with explicit table bounds."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("half-gather requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    for dtype, pointer in (("f16", "*fp16"), ("bf16_bits", "*u16")):
+        table = "table" if dtype == "f16" else "table_bits"
+        runtime = (table, "row_index", "output", "n_cols", "table_rows")
+        export, _, _, _ = load_flaggems_aot_export(name="flagos_get_rows_" + dtype + "_f32",
+            semantic="ggml.get_rows.contiguous_" + dtype + "_to_f32.i32_indices.in_range.mask_invalid_zero.v1",
+            runtime_arguments=runtime, constexpr_arguments=("BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError("generic half gather must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {table: pointer, "row_index": "*i32", "output": "*fp32",
+            "n_cols": "i32", "table_rows": "i32", "BLOCK": "constexpr"}
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 256}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("half gather requires unsupported Triton scratch storage")
+        artifact = output_dir / (export.name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": export.name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 256, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": 5, "global_scratch_size": 0,
+            "global_scratch_align": getattr(m, "global_scratch_align", 1),
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_gguf_gemv_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile generic and explicitly aligned GGUF GEMV library exports."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("gguf-gemv requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    for kind, block, aligned in (("q4_0", 32, False), ("q4_1", 32, False), ("q8_0", 32, False),
+            ("q4_k", 256, False), ("q5_k", 256, False),
+            ("q4_1", 32, True), ("q8_0", 32, True), ("q4_k", 256, True)):
+        name = "flagos_mul_mat_" + kind + "_f32" + ("_model_aligned" if aligned else "")
+        semantic = "ggml.gguf_" + kind + "_gemv_dense_f32_acc_f32." + (
+            "ptr16_k_rows16.byte_spans_i31.v1" if aligned else "ptr2_packed.v1")
+        export, _, _, _ = load_flaggems_aot_export(name=name,
+            semantic=semantic,
+            runtime_arguments=("weights_u8", "weights_f16", "x", "output", "k", "rows"),
+            constexpr_arguments=())
+        required = tuple((argument, 16) for argument in export.runtime_arguments) if aligned else ()
+        if export.aot_divisibility != required:
+            raise RuntimeError("incompatible GGUF GEMV divisibility contract")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        signature = {"weights_u8": "*u8", "weights_f16": "*fp16", "x": "*fp32",
+            "output": "*fp32", "k": "i32", "rows": "i32"}
+        attributes = export.aot_attributes
+        if aligned:
+            # The provider checks each operand byte span before this specialization.
+            for index in range(4):
+                attributes[(index,)].append(["tt.pointer_range", 32])
+        compiled = triton.compile(ASTSource(export.function, signature, {}, attrs=attributes),
+            target=GPUTarget("hip", arch, 32), options={"num_warps": 1})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("GGUF GEMV requires unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": block, "tile_m": 16 if aligned else 0,
+            "tile_n": 16 if aligned else 0, "tile_k": 16 if aligned else 0,
+            "argument_count": 6, "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_gguf_prefill_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile GGUF multi-column F32 kernels from the operator library."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("gguf-prefill requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    kernels = []
+    runtime = ("weights_u8", "weights_f16", "x", "output", "k", "rows", "columns")
+    signature = {"weights_u8": "*u8", "weights_f16": "*fp16", "x": "*fp32",
+        "output": "*fp32", "k": "i32", "rows": "i32", "columns": "i32", "COLS_PER_BLOCK": "constexpr"}
+    for kind in ("q4_0", "q4_1", "q8_0", "q4_k", "q5_k", "q6_k"):
+        name = "flagos_mul_mat_" + kind + "_f32_batched"
+        export, _, _, _ = load_flaggems_aot_export(name=name,
+            semantic="ggml.gguf_" + kind + "_prefill_dense_f32_acc_f32.ptr2_packed.clamp_tail.v1",
+            runtime_arguments=runtime, constexpr_arguments=("COLS_PER_BLOCK",))
+        if export.aot_divisibility:
+            raise RuntimeError("generic GGUF prefill must not require extra divisibility")
+        FLAGGEMS_AOT_EXPORTS += (export,)
+        with amd_hint_context():
+            compiled = triton.compile(ASTSource(export.function, signature, {"COLS_PER_BLOCK": 16}, attrs={}),
+                target=GPUTarget("hip", arch, 32), options={"num_warps": 4})
+        m = compiled.metadata
+        if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+            raise RuntimeError("GGUF prefill requires unsupported Triton scratch storage")
+        artifact = output_dir / (name + ".hsaco")
+        artifact.write_bytes(compiled.asm["hsaco"])
+        kernels.append({"name": name, "symbol": m.name, "file": artifact.name,
+            "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+            "block_size": 16, "tile_m": 0, "tile_n": 0, "tile_k": 0,
+            "argument_count": len(runtime), "global_scratch_size": 0, "global_scratch_align": 1,
+            "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align})
+    write_manifest(output_dir, arch, kernels)
+
+
+def compile_gdn_value_tile_package_without_launch(output_dir: Path, arch: str, *, baseline: bool = False) -> None:
+    """Compile the GDN value-axis tile with the legacy packed output contract."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("gdn-value-tile requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_gated_delta_net_scalar_f32" if baseline else "flagos_gated_delta_net_scalar_f32_value_tiled"
+    cols = 4 if baseline else 16
+    arguments = ("q", "k", "v", "gate", "beta", "current_state", "output",
+        "state_size", "n_heads", "n_tokens", "n_seqs", "sq1", "sq2", "sq3",
+        "sv1", "sv2", "sv3", "sb1", "sb2", "sb3", "q_heads", "q_seq_ratio",
+        "snapshot_count", "scale")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.gated_delta_net_scalar_f32.legacy_math.v1" if baseline else
+                 "ggml.gated_delta_net_scalar_f32.value_tiles.legacy_math.v1",
+        runtime_arguments=arguments, constexpr_arguments=("BLOCK", "COLS"))
+    if export.aot_divisibility:
+        raise RuntimeError("generic GDN value tile must not require extra divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "*fp32" if i < 7 else "fp32" if argument == "scale" else "i32"
+        for i, argument in enumerate(arguments)}
+    signature.update(BLOCK="constexpr", COLS="constexpr")
+    compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 128, "COLS": cols},
+        attrs=export.aot_attributes), target=GPUTarget("hip", arch, 32), options={"num_warps": 4})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("GDN value tile requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size,
+        "block_size": 128, "tile_m": 0, "tile_n": cols, "tile_k": 0,
+        "argument_count": 24, "global_scratch_size": 0,
+        "global_scratch_align": getattr(m, "global_scratch_align", 1),
+        "profile_scratch_size": 0, "profile_scratch_align": m.profile_scratch_align}])
+
+
+def compile_strided_rms_package_without_launch(output_dir: Path, arch: str) -> None:
+    """Compile the GGML outer-stride RMS export with its tested arithmetic."""
+    global FLAGGEMS_AOT_EXPORTS
+    if not os.environ.get("FLAGOS_FLAGGEMS_AOT_SOURCE"):
+        raise RuntimeError("strided-rms requires FLAGOS_FLAGGEMS_AOT_SOURCE")
+    name = "flagos_rms_norm_ggml_strided_f32"
+    arguments = ("output", "x", "n_cols", "ne1", "ne2", "stride_x1", "stride_x2", "stride_x3", "eps")
+    export, _, _, _ = load_flaggems_aot_export(name=name,
+        semantic="ggml.rms_norm.inner_contiguous_outer_strided.square_f32_sum_f64.v1",
+        runtime_arguments=arguments, constexpr_arguments=("BLOCK",))
+    if export.aot_divisibility:
+        raise RuntimeError("strided RMS must not add unproved divisibility")
+    FLAGGEMS_AOT_EXPORTS += (export,)
+    signature = {argument: "*fp32" if argument in ("output", "x") else "fp32" if argument == "eps" else "i32" for argument in arguments}
+    signature["BLOCK"] = "constexpr"
+    compiled = triton.compile(ASTSource(export.function, signature, {"BLOCK": 256}, attrs=export.aot_attributes),
+        target=GPUTarget("hip", arch, 32), options={"num_warps": 4, "enable_fp_fusion": False})
+    m = compiled.metadata
+    if getattr(m, "global_scratch_size", 0) or m.profile_scratch_size:
+        raise RuntimeError("strided RMS requires unsupported Triton scratch storage")
+    artifact = output_dir / f"{name}.hsaco"
+    artifact.write_bytes(compiled.asm["hsaco"])
+    write_manifest(output_dir, arch, [{"name": name, "symbol": m.name, "file": artifact.name,
+        "shared": m.shared, "num_warps": m.num_warps, "warp_size": m.warp_size, "block_size": 256,
+        "tile_m": 0, "tile_n": 0, "tile_k": 0, "argument_count": 9, "global_scratch_size": 0,
+        "global_scratch_align": getattr(m, "global_scratch_align", 1), "profile_scratch_size": 0,
+        "profile_scratch_align": m.profile_scratch_align}])
+
+
 def compile_scale_package_without_launch(output_dir: Path, arch: str) -> None:
     """Compile the common SCALE kernel for an AMD package without a device launch."""
     if not arch:
@@ -2864,11 +3860,26 @@ def main() -> None:
     parser.add_argument(
         "--compile-only", action="store_true",
         help="compile one selected AMD tuning symbol without launching it")
+    parser.add_argument("--extension", choices=("dense-gather", "aligned-gemm", "tiled-ffn", "packed-ffn", "strided-rms", "q6-gemv", "gguf-gemv", "gguf-prefill", "gguf-rows", "plain-softmax", "repeat-ops", "tanh", "batched-gather", "core-ops", "graph-ops", "row-ops", "softmax-broadcast", "softmax-broadcast-wide", "strided-batched-gemm", "strided-batched-gemm-ieee", "dense-f32-gemm", "half-gather", "flash-attention", "flash-decode-splitkv", "flash-decode-grouped-splitkv", "ggml-rope", "ggml-neox-rope", "gdn-value-tile", "gdn-scalar", "matrix-stage1", "ffn-waves"),
+                        help="compile an optional ABI extension as a separate package")
+    parser.add_argument("--flash-attention-profile", choices=("baseline", "gfx1150-head256"),
+                        help="optional offline attention profile; runtime dispatch and defaults are unchanged")
     args = parser.parse_args()
+    if args.flash_attention_profile and args.extension != "flash-attention":
+        raise RuntimeError("--flash-attention-profile requires --extension flash-attention")
+    if args.flash_attention_profile == "gfx1150-head256" and args.arch != "gfx1150":
+        raise RuntimeError("gfx1150-head256 profile requires --arch gfx1150")
+    if args.extension and (not args.compile_only or not args.arch):
+        raise RuntimeError("--extension requires --compile-only and --arch")
+    if args.extension and (os.environ.get("FLAGOS_AMD_TUNING_PROFILE_NAME") or
+            any(key.startswith("FLAGOS_AMD_ONLY_") and value == "1"
+                for key, value in os.environ.items())):
+        raise RuntimeError("--extension cannot be combined with a tuning profile or ONLY mode")
     validate_tuning_profile_kernel_abis()
     if args.cache_dir is None:
         raise RuntimeError("--cache-dir or TRITON_CACHE_DIR is required")
     args.cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = str(args.cache_dir.resolve())
     final_output_dir = args.output_dir.resolve()
     if final_output_dir.exists() and (
             final_output_dir.is_symlink() or not final_output_dir.is_dir() or
@@ -2886,6 +3897,72 @@ def main() -> None:
             final_output_dir.rmdir()
         staging_output_dir.rename(final_output_dir)
         temporary_output.cleanup()
+    if args.extension:
+        if args.extension == "dense-gather":
+            compile_dense_gather_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "aligned-gemm":
+            compile_aligned_gemm_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "tiled-ffn":
+            compile_tiled_ffn_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "packed-ffn":
+            compile_packed_ffn_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "flash-attention":
+            compile_flash_attention_package_without_launch(args.output_dir, args.arch, args.flash_attention_profile or "baseline")
+        elif args.extension == "flash-decode-splitkv":
+            compile_splitkv_decode_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "flash-decode-grouped-splitkv":
+            compile_grouped_splitkv_decode_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "ggml-rope":
+            compile_ggml_rope_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "ggml-neox-rope":
+            compile_ggml_rope_package_without_launch(args.output_dir, args.arch, neox=True)
+        elif args.extension == "q6-gemv":
+            compile_q6_gemv_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "gguf-gemv":
+            compile_gguf_gemv_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "gguf-prefill":
+            compile_gguf_prefill_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "gguf-rows":
+            compile_gguf_rows_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "plain-softmax":
+            compile_plain_softmax_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "batched-gather":
+            compile_batched_gather_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "tanh":
+            compile_tanh_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "repeat-ops":
+            compile_repeat_ops_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "core-ops":
+            compile_core_ops_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "graph-ops":
+            compile_core_ops_package_without_launch(args.output_dir, args.arch, graph_ops=True)
+        elif args.extension == "row-ops":
+            compile_rows_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "softmax-broadcast":
+            compile_softmax_broadcast_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "softmax-broadcast-wide":
+            compile_softmax_broadcast_package_without_launch(args.output_dir, args.arch, wide=True)
+        elif args.extension == "strided-batched-gemm":
+            compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "strided-batched-gemm-ieee":
+            compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch, preserve_src1=True)
+        elif args.extension == "dense-f32-gemm":
+            compile_strided_batched_gemm_package_without_launch(args.output_dir, args.arch, f32_weights=True)
+        elif args.extension == "half-gather":
+            compile_half_gather_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "gdn-value-tile":
+            compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "gdn-scalar":
+            compile_gdn_value_tile_package_without_launch(args.output_dir, args.arch, baseline=True)
+        elif args.extension == "matrix-stage1":
+            compile_matrix_stage1_package_without_launch(args.output_dir, args.arch)
+        elif args.extension == "ffn-waves":
+            compile_ffn_waves_package_without_launch(args.output_dir, args.arch)
+        else:
+            compile_strided_rms_package_without_launch(args.output_dir, args.arch)
+        commit_output()
+        print(f"wrote {args.extension} extension for {args.arch} to {final_output_dir}")
+        return
     only_residual = os.environ.get("FLAGOS_AMD_ONLY_RESIDUAL") == "1"
     only_residual_narrow = os.environ.get("FLAGOS_AMD_ONLY_RESIDUAL_NARROW") == "1"
     only_q4_ffn_decode = os.environ.get("FLAGOS_AMD_ONLY_Q4_FFN_DECODE") == "1"
@@ -2952,7 +4029,6 @@ def main() -> None:
                 "FLAGOS_AMD_ONLY_GDN_ALPHA_GATE=1 or "
                 "FLAGOS_AMD_ONLY_GDN_Q8_GATE=1 or "
                 "FLAGOS_AMD_ONLY_RMS_NORM_NARROW=1")
-        os.environ["TRITON_CACHE_DIR"] = str(args.cache_dir)
         if only_residual or only_residual_narrow:
             compile_residual_package_without_launch(
                 args.output_dir, args.arch, only_residual_narrow)
@@ -3208,4 +4284,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    with amd_hint_context():
+        main()

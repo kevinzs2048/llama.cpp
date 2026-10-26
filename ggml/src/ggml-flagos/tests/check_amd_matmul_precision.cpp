@@ -1,0 +1,279 @@
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "../../ggml-backend-impl.h"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+static void require(bool ok, const char * message) {
+    if (!ok) { std::fprintf(stderr, "CHECK_FAILED %s\n", message); std::exit(2); }
+}
+
+struct policy_observations {
+    std::atomic<size_t> plans { 0 };
+    std::atomic<size_t> captures { 0 };
+    std::atomic<size_t> replays { 0 };
+};
+
+static void observe_policy_log(enum ggml_log_level, const char * text, void * user_data) {
+    auto & counts = *static_cast<policy_observations *>(user_data);
+    if (std::strstr(text, "FlagOS AMD: built plan ") != nullptr) {
+        ++counts.plans;
+    }
+    if (std::strstr(text, "FlagOS AMD: captured HIP graph ") != nullptr) {
+        ++counts.captures;
+    }
+    if (const char * value = std::strstr(text, "graph_replays=")) {
+        counts.replays = std::strtoull(value + std::strlen("graph_replays="), nullptr, 10);
+    }
+    std::fputs(text, stderr);
+}
+
+static std::vector<float> run(bool forced_f32, bool prefill_f16, bool ffn = false, bool switch_policy = false,
+        ggml_type weight_type = GGML_TYPE_Q4_K, float activation_scale = 1.0013f, int source_precision = 0) {
+    constexpr int k = 1024, rows = 64, columns = 8;
+    setenv("FLAGOS_AMD_PREFILL_F16_GEMM", prefill_f16 ? "1" : "0", 1);
+    auto * backend = ggml_backend_init_by_name("FlagOS:AMD:0", nullptr);
+    require(backend != nullptr, "AMD backend");
+    ggml_init_params params { 4u << 20, nullptr, true };
+    auto * wc = ggml_init(params); auto * ec = ggml_init(params);
+    require(wc && ec, "contexts");
+    auto * w = ggml_new_tensor_2d(wc, weight_type, k, rows);
+    auto * x = ggml_new_tensor_2d(ec, GGML_TYPE_F32, k, columns);
+    auto * out = ggml_mul_mat(ec, w, x);
+    auto * up_weights = ffn ? ggml_new_tensor_2d(wc, weight_type, k, rows) : nullptr;
+    auto * up = ffn ? ggml_mul_mat(ec, up_weights, x) : nullptr;
+    ggml_mul_mat_set_prec(out, forced_f32 ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
+    if (up) ggml_mul_mat_set_prec(up, forced_f32 ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
+#if GGML_BACKEND_API_VERSION >= 3
+    require(ggml_prec_set_src(out, static_cast<ggml_prec>(source_precision), 1), "source precision");
+    if (up) require(ggml_prec_set_src(up, static_cast<ggml_prec>(source_precision), 1), "FFN source precision");
+#else
+    (void) source_precision;
+#endif
+    require(ggml_backend_dev_supports_op(ggml_backend_get_device(backend), out), "supports matrix");
+    if (ffn) out = ggml_swiglu_split(ec, out, up);
+    if (switch_policy) {
+        for (int index = 0; index < 4; ++index) {
+            out = ggml_scale(ec, out, 1.01f);
+        }
+    }
+    auto * graph = ggml_new_graph(ec); ggml_build_forward_expand(graph, out);
+    auto wb = ggml_backend_alloc_ctx_tensors(wc, backend);
+    auto eb = ggml_backend_alloc_ctx_tensors(ec, backend);
+    require(wb && eb, "buffers");
+    ggml_backend_buffer_set_usage(wb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> weights(k*rows), activation(k*columns);
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = std::sin(float(i)*0.017f)*0.13f;
+    for (size_t i = 0; i < activation.size(); ++i) activation[i] = std::cos(float(i)*0.013f)*activation_scale;
+    std::vector<unsigned char> quantized(ggml_nbytes(w));
+    auto n = ggml_quantize_chunk(weight_type, weights.data(), quantized.data(), 0, rows, k, nullptr);
+    require(n == quantized.size(), "quantization size");
+    ggml_backend_tensor_set(w, quantized.data(), 0, quantized.size());
+    if (up_weights) ggml_backend_tensor_set(up_weights, quantized.data(), 0, quantized.size());
+    ggml_backend_tensor_set(x, activation.data(), 0, activation.size()*sizeof(float));
+    std::fprintf(stderr, "PRECISION_CASE type=%s forced_f32=%d prefill_f16=%d ffn=%d\n",
+        ggml_type_name(weight_type), forced_f32, prefill_f16, ffn);
+    std::vector<float> result(rows*columns);
+    if (switch_policy) {
+        setenv("FLAGOS_AMD_GRAPH_CAPTURE", "all", 1);
+        setenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS", "0", 1);
+        setenv("FLAGOS_LOG_GRAPH_PLAN", "1", 1);
+        policy_observations counts;
+        ggml_log_set(observe_policy_log, &counts);
+        std::vector<float> decoded(weights.size());
+        ggml_get_type_traits(weight_type)->to_float(quantized.data(), decoded.data(), k*rows);
+        std::vector<double> expected(result.size());
+        for (int col = 0; col < columns; ++col) {
+            for (int row = 0; row < rows; ++row) {
+                double sum = 0.0;
+                for (int inner = 0; inner < k; ++inner) {
+                    sum += double(decoded[row*k + inner])*activation[col*k + inner];
+                }
+                for (int index = 0; index < 4; ++index) {
+                    sum *= double(1.01f);
+                }
+                expected[col*rows + row] = sum;
+            }
+        }
+        // Each switch must retire the old executable, even if the package
+        // currently falls back because the optional tiled kernel is absent.
+        for (const char * policy : {"0", "1", "0"}) {
+            setenv("FLAGOS_AMD_QUANT_TILED_GEMM", policy, 1);
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "policy compute");
+                ggml_backend_synchronize(backend);
+                ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
+                for (size_t index = 0; index < result.size(); ++index) {
+                    require(std::isfinite(result[index]) &&
+                        std::abs(result[index] - expected[index]) <= 1e-3 + 3e-5*std::abs(expected[index]),
+                        "policy output differs from CPU reference");
+                }
+            }
+        }
+        ggml_log_set(nullptr, nullptr);
+        unsetenv("FLAGOS_LOG_GRAPH_PLAN");
+        unsetenv("FLAGOS_AMD_QUANT_TILED_GEMM");
+        unsetenv("FLAGOS_AMD_GRAPH_CAPTURE");
+        unsetenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS");
+        std::printf("AMD policy invalidation plans=%zu captures=%zu expected=3/3\n", counts.plans.load(), counts.captures.load());
+        require(counts.plans.load() == 3, "quantized policy reused old plan");
+        require(counts.captures.load() == 3, "quantized policy reused old HIP graph");
+    } else {
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "compute");
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
+        require(std::all_of(result.begin(), result.end(), [](float v) { return std::isfinite(v); }), "finite output");
+    }
+    ggml_backend_buffer_free(eb); ggml_backend_buffer_free(wb);
+    ggml_free(ec); ggml_free(wc); ggml_backend_free(backend);
+    return result;
+}
+
+static void check_many_decode_splits() {
+    constexpr int count = 96, k = 256, rows = 64;
+    setenv("FLAGOS_AMD_PREFILL_F16_GEMM", "0", 1);
+    setenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS", "0", 1);
+    setenv("FLAGOS_AMD_GRAPH_CAPTURE", "1", 1);
+    setenv("FLAGOS_LOG_KERNELS", "1", 1);
+    auto * backend = ggml_backend_init_by_name("FlagOS:AMD:0", nullptr);
+    require(backend != nullptr, "multi-split backend");
+    ggml_init_params params { 8u << 20, nullptr, true };
+    auto * wc = ggml_init(params); auto * ec = ggml_init(params);
+    require(wc && ec, "multi-split contexts");
+    std::vector<ggml_tensor *> weights, inputs, outputs;
+    std::vector<ggml_cgraph *> graphs;
+    for (int index = 0; index < count; ++index) {
+        weights.push_back(ggml_new_tensor_2d(wc, GGML_TYPE_Q4_K, k, rows));
+        inputs.push_back(ggml_new_tensor_1d(ec, GGML_TYPE_F32, k));
+        auto * out = ggml_mul_mat(ec, weights.back(), inputs.back());
+        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        for (int scale = 0; scale < 4; ++scale) out = ggml_scale(ec, out, 1.01f);
+        outputs.push_back(out);
+        auto * graph = ggml_new_graph_custom(ec, 32, false);
+        ggml_build_forward_expand(graph, out);
+        graphs.push_back(graph);
+    }
+    auto wb = ggml_backend_alloc_ctx_tensors(wc, backend);
+    auto eb = ggml_backend_alloc_ctx_tensors(ec, backend);
+    require(wb && eb, "multi-split buffers");
+    std::vector<std::vector<unsigned char>> quantized(count);
+    std::vector<std::vector<float>> activation(count, std::vector<float>(k));
+    std::vector<std::vector<double>> expected(count, std::vector<double>(rows));
+    std::vector<float> source(k*rows), decoded(k*rows), result(rows);
+    for (int index = 0; index < count; ++index) {
+        for (int inner = 0; inner < k*rows; ++inner) source[inner] = std::sin(float(inner)*0.017f + index*0.1f)*0.13f;
+        for (int inner = 0; inner < k; ++inner) activation[index][inner] = std::cos(float(inner)*0.013f + index*0.2f);
+        quantized[index].resize(ggml_nbytes(weights[index]));
+        require(ggml_quantize_chunk(GGML_TYPE_Q4_K, source.data(), quantized[index].data(), 0, rows, k, nullptr) == quantized[index].size(), "multi-split quantization");
+        ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(quantized[index].data(), decoded.data(), k*rows);
+        for (int row = 0; row < rows; ++row) {
+            double sum = 0;
+            for (int inner = 0; inner < k; ++inner) sum += double(decoded[row*k + inner])*activation[index][inner];
+            for (int scale = 0; scale < 4; ++scale) sum *= double(1.01f);
+            expected[index][row] = sum;
+        }
+        ggml_backend_tensor_set(weights[index], quantized[index].data(), 0, quantized[index].size());
+        ggml_backend_tensor_set(inputs[index], activation[index].data(), 0, k*sizeof(float));
+    }
+    policy_observations counts;
+    ggml_log_set(observe_policy_log, &counts);
+    // A decode round visits multiple bound splits before any one repeats.
+    for (int round = 0; round < 3; ++round) {
+        for (int index = 0; index < count; ++index) {
+            require(ggml_backend_graph_compute(backend, graphs[index]) == GGML_STATUS_SUCCESS, "multi-split compute");
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_get(outputs[index], result.data(), 0, rows*sizeof(float));
+            for (int row = 0; row < rows; ++row) require(std::isfinite(result[row]) && std::abs(result[row] - expected[index][row]) <= 1e-3 + 3e-5*std::abs(expected[index][row]), "multi-split CPU reference");
+        }
+    }
+    for (int index = 0; index < count; ++index) {
+        std::vector<unsigned char> actual(quantized[index].size());
+        ggml_backend_tensor_get(weights[index], actual.data(), 0, actual.size());
+        require(actual == quantized[index], "multi-split weight modified");
+        std::vector<float> actual_input(k);
+        ggml_backend_tensor_get(inputs[index], actual_input.data(), 0, k*sizeof(float));
+        require(std::memcmp(actual_input.data(), activation[index].data(), k*sizeof(float)) == 0, "multi-split input modified");
+    }
+    ggml_backend_buffer_free(eb); ggml_backend_buffer_free(wb);
+    ggml_free(ec); ggml_free(wc); ggml_backend_free(backend);
+    ggml_log_set(nullptr, nullptr);
+    unsetenv("FLAGOS_LOG_KERNELS");
+    unsetenv("FLAGOS_AMD_GRAPH_CAPTURE");
+    unsetenv("FLAGOS_AMD_ENABLE_EXPERIMENTAL_FUSIONS");
+    std::printf("AMD multi-split captures=%zu replays=%zu expected=%d/%d\n", counts.captures.load(), counts.replays.load(), count, count);
+    require(counts.captures.load() == count && counts.replays.load() == count, "decode split cache thrashes before reuse");
+}
+
+int main(int argc, char ** argv) {
+    require(argc == 2 || (argc == 3 && std::strcmp(argv[2], "--require-quantized-tiled") == 0), "backend directory argument");
+    const bool require_tiled = argc == 3;
+    setenv("FLAGOS_AMD_QUANT_TILED_GEMM", "0", 1);
+    ggml_backend_load_all_from_path(argv[1]);
+    const auto default_plain = run(false, false);
+    const auto default_half = run(false, true);
+    const auto forced_plain = run(true, false);
+    const auto forced_half = run(true, true);
+    const auto same = [](const auto & a, const auto & b) {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
+    };
+    const auto ffn_default_plain = run(false, false, true);
+    const auto ffn_default_half = run(false, true, true);
+    const auto ffn_forced_plain = run(true, false, true);
+    const auto ffn_forced_half = run(true, true, true);
+    float difference = 0.0f;
+    for (size_t i = 0; i < forced_plain.size(); ++i) difference = std::max(difference, std::fabs(forced_plain[i]-forced_half[i]));
+    std::printf("{\"forced_F32_ignores_F16_toggle\":%s,\"default_routes_differ\":%s,\"forced_max_abs_diff\":%.9g}\n",
+        same(forced_plain, forced_half) ? "true" : "false",
+        same(default_plain, default_half) ? "false" : "true", difference);
+    std::printf("{\"forced_F32_FFN_ignores_F16_toggle\":%s,\"default_FFN_routes_differ\":%s}\n",
+        same(ffn_forced_plain, ffn_forced_half) ? "true" : "false",
+        same(ffn_default_plain, ffn_default_half) ? "false" : "true");
+    require(same(forced_plain, forced_half), "forced F32 matrix changed with F16 optimization");
+    require(same(ffn_forced_plain, ffn_forced_half), "forced F32 FFN changed with F16 optimization");
+    require(!same(default_plain, default_half), "fixture did not exercise the optional F16 matrix path");
+    require(!same(ffn_default_plain, ffn_default_half), "fixture did not exercise the optional F16 FFN path");
+    for (const auto type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        setenv("FLAGOS_AMD_QUANT_TILED_GEMM", "0", 1);
+        const auto full = run(true, false, false, false, type);
+        setenv("FLAGOS_AMD_QUANT_TILED_GEMM", "1", 1);
+        const auto tiled_full = run(true, false, false, false, type);
+        const auto tiled_default = run(false, false, false, false, type);
+        require(same(full, tiled_full), "forced F32 changed with quantized tiled policy");
+        require(!require_tiled || !same(full, tiled_default), "optional tiled kernel was not exercised");
+        setenv("FLAGOS_AMD_QUANT_TILED_GEMM", "0", 1);
+        const auto large = run(true, false, false, false, type, 100000.0f);
+        setenv("FLAGOS_AMD_QUANT_TILED_GEMM", "1", 1);
+        const auto tiled_large = run(true, false, false, false, type, 100000.0f);
+        require(same(large, tiled_large), "forced F32 large input changed with quantized tiled policy");
+    }
+
+#if GGML_BACKEND_API_VERSION >= 3
+    setenv("FLAGOS_AMD_QUANT_TILED_GEMM", "1", 1);
+    for (const auto source_precision : {GGML_PREC_F32, GGML_PREC_BF16}) {
+        for (const auto weight_type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+            for (const bool ffn : {false, true}) {
+                const auto reference = run(true, false, ffn, false, weight_type);
+                const auto plain = run(false, false, ffn, false, weight_type, 1.0013f, source_precision);
+                const auto half = run(false, true, ffn, false, weight_type, 1.0013f, source_precision);
+                require(same(plain, reference), "source precision changed F32 direct output");
+                require(same(half, reference), "source precision allowed F16 activation conversion");
+            }
+            const auto large_reference = run(true, false, false, false, weight_type, 100000.0f);
+            const auto large = run(false, true, false, false, weight_type, 100000.0f, source_precision);
+            require(same(large, large_reference), "source precision overflowed F16 range");
+        }
+    }
+    std::puts("AMD API3 source precision contracts passed cases=12");
+#endif
+    unsetenv("FLAGOS_AMD_QUANT_TILED_GEMM");
+    std::puts("AMD quantized tiled forced F32 contracts passed");
+    run(true, false, false, true);
+    check_many_decode_splits();
+    return 0;
+}

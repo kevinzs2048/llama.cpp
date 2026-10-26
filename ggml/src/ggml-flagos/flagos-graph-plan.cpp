@@ -31,6 +31,9 @@ const char * flagos_pattern_name(flagos_pattern_id id) {
         case flagos_pattern_id::flash_attn_prefill:      return "flash_attn_prefill";
         case flagos_pattern_id::attention_output_gate:   return "attention_output_gate";
         case flagos_pattern_id::gdn_gate_projections:    return "gdn_gate_projections";
+        case flagos_pattern_id::moe_weighted_sum:        return "moe_weighted_sum";
+        case flagos_pattern_id::moe_topk_softmax:        return "moe_topk_softmax";
+        case flagos_pattern_id::mul_mat_siblings:        return "mul_mat_siblings";
     }
     return "unknown";
 }
@@ -44,13 +47,14 @@ bool flagos_describe_quantized_matmul(
     if (op == nullptr || signature == nullptr || op->op != GGML_OP_MUL_MAT ||
         op->src[0] == nullptr || op->src[1] == nullptr ||
         (op->src[0]->type != GGML_TYPE_Q4_0 && op->src[0]->type != GGML_TYPE_Q4_1 &&
+         op->src[0]->type != GGML_TYPE_Q5_0 &&
          op->src[0]->type != GGML_TYPE_Q5_K &&
          op->src[0]->type != GGML_TYPE_Q4_K &&
          op->src[0]->type != GGML_TYPE_Q6_K && op->src[0]->type != GGML_TYPE_Q8_0) ||
         op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
         op->src[0]->ne[0] <= 0 ||
         ((op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q4_1 ||
-          op->src[0]->type == GGML_TYPE_Q8_0) ? op->src[0]->ne[0] % 32 != 0
+          op->src[0]->type == GGML_TYPE_Q5_0 || op->src[0]->type == GGML_TYPE_Q8_0) ? op->src[0]->ne[0] % 32 != 0
                                                : op->src[0]->ne[0] % 256 != 0) ||
         op->src[0]->ne[0] != op->src[1]->ne[0] || op->src[0]->ne[1] <= 0 ||
         op->src[1]->ne[1] <= 0 || op->src[0]->ne[2] != 1 || op->src[0]->ne[3] != 1 ||
@@ -64,6 +68,8 @@ bool flagos_describe_quantized_matmul(
         ? flagos_quantized_matmul_kind::q4_0
         : op->src[0]->type == GGML_TYPE_Q4_1
         ? flagos_quantized_matmul_kind::q4_1
+        : op->src[0]->type == GGML_TYPE_Q5_0
+        ? flagos_quantized_matmul_kind::q5_0
         : op->src[0]->type == GGML_TYPE_Q5_K
         ? flagos_quantized_matmul_kind::q5_k
         : op->src[0]->type == GGML_TYPE_Q4_K
@@ -103,6 +109,9 @@ flagos_fusion_scope flagos_pattern_scope(flagos_pattern_id id) {
         case flagos_pattern_id::qkv_mrope_kv_store:
         case flagos_pattern_id::attention_output_gate:
         case flagos_pattern_id::gdn_gate_projections:
+        case flagos_pattern_id::moe_weighted_sum:
+        case flagos_pattern_id::moe_topk_softmax:
+        case flagos_pattern_id::mul_mat_siblings:
             return flagos_fusion_scope::graph;
     }
     return flagos_fusion_scope::graph;
@@ -131,7 +140,7 @@ bool flagos_canonical_tensor::operator==(const flagos_canonical_tensor & other) 
 }
 
 bool flagos_canonical_node::operator==(const flagos_canonical_node & other) const {
-    return output == other.output && sources == other.sources;
+    return use_count == other.use_count && output == other.output && sources == other.sources;
 }
 
 static void flagos_hash_bytes(uint64_t & hash, const void * data, size_t size) {
@@ -253,6 +262,42 @@ static void flagos_prepare_producers(
     }
 }
 
+// Graph views retain global counts; handmade graphs may omit this metadata.
+static int32_t flagos_global_use_count(const ggml_cgraph * graph, const ggml_tensor * tensor) {
+    const auto & set = graph->visited_hash_set;
+    if (graph->use_counts == nullptr || set.size == 0 || set.keys == nullptr || set.used == nullptr) {
+        return -1;
+    }
+    const size_t slot = ggml_hash_find(&set, tensor);
+    if (slot == GGML_HASHSET_FULL || !ggml_bitset_get(set.used, slot)) {
+        return -1;
+    }
+    return graph->use_counts[slot];
+}
+
+static int32_t flagos_operand_uses(const ggml_tensor * consumer, const ggml_tensor * producer) {
+    int32_t count = 0;
+    for (const auto * source : consumer->src) {
+        count += source == producer;
+    }
+    return count;
+}
+
+bool flagos_graph_exposes_all_consumers(const ggml_cgraph * graph, const ggml_tensor * tensor) {
+    if (graph == nullptr || tensor == nullptr) {
+        return false;
+    }
+    const int32_t global_uses = flagos_global_use_count(graph, tensor);
+    if (global_uses < 0) {
+        return false;
+    }
+    int32_t visible_uses = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        visible_uses += flagos_operand_uses(graph->nodes[i], tensor);
+    }
+    return global_uses == visible_uses;
+}
+
 static void flagos_canonicalize_graph(
         const ggml_cgraph * cgraph,
         flagos_producer_map & producers,
@@ -265,6 +310,7 @@ static void flagos_canonicalize_graph(
     result.resize(cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
+        result[i].use_count = flagos_global_use_count(cgraph, node);
         result[i].output = flagos_canonicalize_tensor(node, producers, identities);
         for (int src = 0; src < GGML_MAX_SRC; ++src) {
             result[i].sources[src] = flagos_canonicalize_tensor(node->src[src], producers, identities);
@@ -306,7 +352,8 @@ static bool flagos_graph_matches_canonical(
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         const flagos_canonical_node & canonical = canonical_nodes[static_cast<size_t>(i)];
-        if (!flagos_tensor_matches_canonical(node, producers, identities, canonical.output)) {
+        if (canonical.use_count != flagos_global_use_count(cgraph, node) ||
+            !flagos_tensor_matches_canonical(node, producers, identities, canonical.output)) {
             return false;
         }
         for (int src = 0; src < GGML_MAX_SRC; ++src) {
@@ -347,6 +394,7 @@ static uint64_t flagos_fingerprint(const std::vector<flagos_canonical_node> & no
             flagos_hash_bytes(hash, tensor.nb.data(), tensor.nb.size() * sizeof(tensor.nb[0]));
             flagos_hash_bytes(hash, tensor.op_params.data(), tensor.op_params.size());
         };
+        flagos_hash_value(hash, node.use_count);
         hash_tensor(node.output);
         for (const auto & source : node.sources) {
             hash_tensor(source);
@@ -533,6 +581,11 @@ static bool flagos_tensor_is_private_to_consumer(
         (producer->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
         return false;
     }
+    const int32_t global_uses = flagos_global_use_count(cgraph, producer);
+    if (global_uses < 0 || global_uses !=
+        flagos_operand_uses(cgraph->nodes[expected_consumer_index], producer)) {
+        return false;
+    }
     bool found_expected = false;
     for (int consumer_index = 0; consumer_index < cgraph->n_nodes; ++consumer_index) {
         const ggml_tensor * consumer = cgraph->nodes[consumer_index];
@@ -570,6 +623,16 @@ static bool flagos_populate_required_outputs(
         const ggml_tensor * producer = cgraph->nodes[producer_index];
         bool required = position + 1 == candidate.node_indices.size() ||
             (producer->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+        const int32_t global_uses = flagos_global_use_count(cgraph, producer);
+        // Missing whole-graph visibility cannot prove an intermediate private.
+        required = required || global_uses < 0;
+        if (global_uses >= 0) {
+            int32_t internal_uses = 0;
+            for (const int index : candidate.node_indices) {
+                internal_uses += flagos_operand_uses(cgraph->nodes[index], producer);
+            }
+            required = required || global_uses != internal_uses;
+        }
         for (int consumer_index = 0; consumer_index < cgraph->n_nodes; ++consumer_index) {
             if (required || consumer_index == producer_index || covered[static_cast<size_t>(consumer_index)]) {
                 continue;
@@ -721,6 +784,65 @@ static bool flagos_candidate_early_writes_are_safe(
 // GGML may give an intervening output and that later input distinct tensor
 // identities backed by the same storage. The original schedule writes before
 // reading; the fused schedule would otherwise observe stale data.
+// Absorbed producers (see flagos_pattern_candidate) are skipped: each must
+// precede the entry, be read only by covered or absorbed nodes, and keep its
+// inputs unchanged until the entry.
+static bool flagos_absorbed_nodes_are_safe(
+        const ggml_cgraph * cgraph, const flagos_pattern_candidate & candidate,
+        flagos_resolve_tensor_data_fn resolve = nullptr,
+        void * user_data = nullptr) {
+    if (candidate.absorbed_node_indices.empty()) {
+        return true;
+    }
+    const int entry = candidate.node_indices.front();
+    std::vector<bool> covered(static_cast<size_t>(cgraph->n_nodes), false);
+    for (const int index : candidate.node_indices) {
+        covered[static_cast<size_t>(index)] = true;
+    }
+    for (const int index : candidate.absorbed_node_indices) {
+        if (index < 0 || index >= entry || covered[static_cast<size_t>(index)]) {
+            return false;
+        }
+        covered[static_cast<size_t>(index)] = true;
+    }
+    for (const int index : candidate.absorbed_node_indices) {
+        const ggml_tensor * absorbed = cgraph->nodes[index];
+        if ((absorbed->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || flagos_global_use_count(cgraph, absorbed) < 0) {
+            return false;
+        }
+        for (int consumer = 0; consumer < cgraph->n_nodes; ++consumer) {
+            if (covered[static_cast<size_t>(consumer)]) {
+                continue;
+            }
+            const ggml_tensor * node = cgraph->nodes[consumer];
+            if (node->view_src == absorbed) {
+                return false;
+            }
+            for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                if (node->src[source] == absorbed) {
+                    return false;
+                }
+            }
+        }
+        if (flagos_is_view_or_noop(absorbed)) {
+            continue;
+        }
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            const ggml_tensor * input = absorbed->src[source];
+            if (input == nullptr) {
+                continue;
+            }
+            for (int between = index + 1; between < entry; ++between) {
+                if (!covered[static_cast<size_t>(between)] &&
+                    flagos_tensor_storage_overlaps(input, cgraph->nodes[between], resolve, user_data)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool flagos_candidate_early_reads_are_safe(
         const ggml_cgraph * cgraph, const flagos_pattern_candidate & candidate,
         flagos_resolve_tensor_data_fn resolve = nullptr,
@@ -784,6 +906,28 @@ static bool flagos_candidate_early_reads_are_safe(
 
 static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const ggml_cgraph * cgraph) {
     std::vector<flagos_pattern_candidate> candidates;
+    static bool dumped = false;
+    if (!dumped && getenv("FLAGOS_DUMP_GDN")) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
+                dumped = true;
+                const ggml_tensor * st = cgraph->nodes[i]->src[5];
+                for (const ggml_tensor * t = st; t != nullptr; t = t->src[0]) {
+                    fprintf(stderr, "DUMPSRC %s %s ne=[%lld,%lld,%lld,%lld] nb1=%zu src1=%s vsrc=%s offs=%zu\n", ggml_op_name(t->op), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[1],
+                        t->src[1] ? t->src[1]->name : "-", t->view_src ? t->view_src->name : "-", t->view_offs);
+                    if (t->op == GGML_OP_NONE) break;
+                }
+                for (int j = std::max(0, i - 12); j < std::min(cgraph->n_nodes, i + 4); ++j) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    fprintf(stderr, "DUMP %d %s %s ne=[%lld,%lld,%lld,%lld] src0=%s src1=%s vsrc=%s\n", j, ggml_op_name(n->op), n->name,
+                        (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                        n->src[0] ? n->src[0]->name : "-", n->src[1] ? n->src[1]->name : "-", n->view_src ? n->view_src->name : "-");
+                }
+                break;
+            }
+        }
+    }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
 
@@ -846,6 +990,31 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                     candidate.eliminated_read_bytes = flagos_tensor_bytes(copy->src[0]);
                     candidate.eliminated_launches = 1;
                     candidates.push_back(candidate);
+
+                    // The initial state usually comes from GET_ROWS on the same
+                    // recurrent cache (through reshapes). Offer a variant that
+                    // absorbs that gather, for kernels that read the cache row.
+                    std::vector<int> absorbed;
+                    const ggml_tensor * state = node->src[5];
+                    while (state != nullptr && (state->op == GGML_OP_RESHAPE || state->op == GGML_OP_VIEW) &&
+                           state->view_src != nullptr) {
+                        const int view_index = flagos_find_node_index(cgraph, state, 0, i);
+                        if (view_index >= 0) {
+                            absorbed.push_back(view_index);
+                        }
+                        state = state->view_src;
+                    }
+                    const int gather_index = state != nullptr && state->op == GGML_OP_GET_ROWS
+                        ? flagos_find_node_index(cgraph, state, 0, i) : -1;
+                    if (gather_index >= 0) {
+                        absorbed.push_back(gather_index);
+                        std::sort(absorbed.begin(), absorbed.end());
+                        flagos_pattern_candidate gathered = candidate;
+                        gathered.absorbed_node_indices = std::move(absorbed);
+                        gathered.eliminated_read_bytes += 2 * flagos_tensor_bytes(state);
+                        gathered.eliminated_launches += 1;
+                        candidates.push_back(std::move(gathered));
+                    }
                 }
             }
         }
@@ -886,6 +1055,111 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                 candidate.eliminated_read_bytes = flagos_tensor_bytes(node) + flagos_tensor_bytes(view);
                 candidate.eliminated_launches = 2;
                 candidates.push_back(candidate);
+            }
+        }
+
+        // MoE expert aggregation (llama.cpp build_moe_ffn): experts
+        // [n_embd, n_used, n_tokens] times routing weights [1, n_used,
+        // n_tokens], a 2-D VIEW of each expert's slice, then
+        // ((v0 + v1) + v2) + ... .  Only the last ADD leaves the pattern.
+        // Zero-work views need not be graph nodes, so the chain is followed
+        // through the ADD operands; view nodes that do appear are covered.
+        if (node->op == GGML_OP_MUL && node->src[0] != nullptr && node->src[1] != nullptr &&
+            node->src[1]->ne[0] == 1 && node->ne[1] >= 2 && node->ne[1] <= 64 && node->ne[3] == 1 &&
+            ggml_are_same_shape(node, node->src[0]) && node->src[1]->ne[1] == node->ne[1] &&
+            node->src[1]->ne[2] == node->ne[2]) {
+            const int64_t n_used = node->ne[1];
+            const auto expert_view = [&](const ggml_tensor * view, int64_t k) {
+                return view != nullptr && view->op == GGML_OP_VIEW && view->view_src == node &&
+                    view->ne[0] == node->ne[0] && view->ne[1] == node->ne[2] && view->ne[2] == 1 &&
+                    view->ne[3] == 1 && view->nb[1] == node->nb[2] &&
+                    view->view_offs == static_cast<size_t>(k) * node->nb[1];
+            };
+            std::vector<int> covered = { i };
+            const ggml_tensor * sum = nullptr;
+            int64_t next = 1;
+            for (int j = i + 1; j < cgraph->n_nodes && next < n_used; ++j) {
+                const ggml_tensor * other = cgraph->nodes[j];
+                if (flagos_is_graph_barrier(other)) {
+                    break;
+                }
+                if (other->op == GGML_OP_VIEW && other->view_src == node) {
+                    covered.push_back(j);
+                    continue;
+                }
+                const bool lhs = sum != nullptr ? other->src[0] == sum : expert_view(other->src[0], 0);
+                if (other->op == GGML_OP_ADD && lhs && expert_view(other->src[1], next)) {
+                    covered.push_back(j);
+                    sum = other;
+                    ++next;
+                }
+            }
+            if (next == n_used) {
+                flagos_pattern_candidate candidate;
+                candidate.id = flagos_pattern_id::moe_weighted_sum;
+                candidate.scope = flagos_pattern_scope(candidate.id);
+                candidate.node_indices = std::move(covered);
+                candidate.eliminated_read_bytes = flagos_tensor_bytes(node) * 2;
+                candidate.eliminated_launches = static_cast<uint32_t>(n_used - 1);
+                candidates.push_back(std::move(candidate));
+            }
+        }
+
+        // MoE router (llama.cpp build_moe_ffn with softmax gating and
+        // norm_w): probs = SOFT_MAX(logits); ids = VIEW(ARGSORT(probs), k);
+        // w = GET_ROWS(reshape(probs), ids); w / CLAMP(SUM_ROWS(w)).
+        // Reshapes/views are matched through operands and covered when
+        // they are graph nodes.
+        if (node->op == GGML_OP_SOFT_MAX && node->src[0] != nullptr && node->src[1] == nullptr) {
+            const ggml_tensor * argsort = nullptr, * topk = nullptr, * rows = nullptr, * sum = nullptr,
+                              * clamp = nullptr, * div = nullptr;
+            std::vector<int> covered = { i };
+            for (int j = i + 1; j < cgraph->n_nodes && div == nullptr; ++j) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                if (flagos_is_graph_barrier(n)) {
+                    break;
+                }
+                bool take = false;
+                if (n->op == GGML_OP_ARGSORT && n->src[0] == node && argsort == nullptr) {
+                    argsort = n; take = true;
+                } else if (argsort != nullptr && n->op == GGML_OP_GET_ROWS && rows == nullptr &&
+                           n->src[0] != nullptr && n->src[0]->view_src == node && n->src[1] != nullptr &&
+                           n->src[1]->op == GGML_OP_VIEW && n->src[1]->view_src == argsort && n->src[1]->view_offs == 0) {
+                    rows = n; topk = n->src[1]; take = true;
+                } else if (rows != nullptr && n->op == GGML_OP_SUM_ROWS && sum == nullptr &&
+                           n->src[0] != nullptr && (n->src[0] == rows || n->src[0]->view_src == rows)) {
+                    sum = n; take = true;
+                } else if (sum != nullptr && n->op == GGML_OP_CLAMP && clamp == nullptr && n->src[0] == sum) {
+                    clamp = n; take = true;
+                } else if (clamp != nullptr && n->op == GGML_OP_DIV && n->src[0] == sum->src[0] && n->src[1] == clamp) {
+                    div = n; take = true;
+                } else if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) {
+                    const ggml_tensor * of = n->view_src;
+                    take = of != nullptr && (of == node || (argsort != nullptr && of == argsort) ||
+                                             (rows != nullptr && of == rows));
+                }
+                if (take) {
+                    covered.push_back(j);
+                }
+            }
+            if (div != nullptr) {
+                for (int j = covered.back() + 1; j < cgraph->n_nodes; ++j) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    if (n->op == GGML_OP_RESHAPE && n->view_src == div) {
+                        covered.push_back(j);
+                        break;
+                    }
+                    if (n->op != GGML_OP_RESHAPE && n->op != GGML_OP_VIEW) {
+                        break;
+                    }
+                }
+                flagos_pattern_candidate candidate;
+                candidate.id = flagos_pattern_id::moe_topk_softmax;
+                candidate.scope = flagos_pattern_scope(candidate.id);
+                candidate.node_indices = std::move(covered);
+                candidate.eliminated_read_bytes = flagos_tensor_bytes(node) * 3;
+                candidate.eliminated_launches = 5;
+                candidates.push_back(std::move(candidate));
             }
         }
 
@@ -1197,10 +1471,62 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
             }
         }
 
+        // Decode projections sharing one activation (attention Q, K, V): the
+        // two or three MUL_MATs that read the same single-column src1 between
+        // its first reader and the next barrier, found from the first reader.
+        // All of them, and each adjacent pair, are candidates: an early write
+        // of a later output is often unsafe (the allocator reuses it for the
+        // nodes in between), so the planner keeps whichever passes. A
+        // gate/up pair scores below ffn_swiglu.
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr && node->src[1]->ne[1] == 1 &&
+            ggml_nelements(node->src[1]) == node->src[1]->ne[0]) {
+            const ggml_tensor * shared = node->src[1];
+            bool first = true;
+            for (int j = i - 1; j >= 0 && cgraph->nodes[j] != shared; --j) {
+                const ggml_tensor * earlier = cgraph->nodes[j];
+                if (earlier->op == GGML_OP_MUL_MAT && earlier->src[1] == shared) {
+                    first = false;
+                    break;
+                }
+                if (flagos_is_graph_barrier(earlier)) {
+                    break;
+                }
+            }
+            std::vector<int> siblings = { i };
+            for (int j = i + 1; first && j < cgraph->n_nodes && siblings.size() <= 3; ++j) {
+                const ggml_tensor * other = cgraph->nodes[j];
+                if (flagos_is_graph_barrier(other)) {
+                    break;
+                }
+                if (other->op == GGML_OP_MUL_MAT && other->src[1] == shared) {
+                    siblings.push_back(j);
+                }
+            }
+            if (first && siblings.size() >= 2 && siblings.size() <= 3) {
+                std::vector<std::vector<int>> groups;
+                if (siblings.size() == 3) {
+                    groups.push_back(siblings);
+                }
+                for (size_t s = 0; s + 1 < siblings.size(); ++s) {
+                    groups.push_back({ siblings[s], siblings[s + 1] });
+                }
+                for (const auto & group : groups) {
+                    flagos_pattern_candidate candidate;
+                    candidate.id = flagos_pattern_id::mul_mat_siblings;
+                    candidate.scope = flagos_pattern_scope(candidate.id);
+                    candidate.node_indices = group;
+                    candidate.eliminated_read_bytes = (group.size() - 1) * flagos_tensor_bytes(shared);
+                    candidate.eliminated_launches = static_cast<uint32_t>(group.size() - 1);
+                    candidates.push_back(candidate);
+                }
+            }
+        }
+
         // Parallel FFN projections followed by a SwiGLU.  Providers may
         // lower this as a true fused projection/activation kernel, or decline
         // it and execute the individual nodes through their normal paths.
-        if (node->op == GGML_OP_MUL_MAT) {
+        // Routed experts match too: two MUL_MAT_IDs with the same input and ids.
+        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
             int gate_index = -1;
             int glu_index = -1;
             for (int j = i + 1; j < cgraph->n_nodes; ++j) {
@@ -1209,8 +1535,9 @@ static std::vector<flagos_pattern_candidate> flagos_enumerate_candidates(const g
                     (glu->src[0] == node || glu->src[1] == node)) {
                     const ggml_tensor * other = glu->src[0] == node ? glu->src[1] : glu->src[0];
                     for (int producer = i + 1; producer < j; ++producer) {
-                        if (other != nullptr && other->op == GGML_OP_MUL_MAT &&
-                            cgraph->nodes[producer] == other) {
+                        if (other != nullptr && other->op == node->op && cgraph->nodes[producer] == other &&
+                            (node->op == GGML_OP_MUL_MAT ||
+                             (other->src[1] == node->src[1] && other->src[2] == node->src[2]))) {
                             gate_index = producer;
                             glu_index = j;
                             break;
@@ -1427,6 +1754,8 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
                 !flagos_candidate_early_writes_are_safe(
                     cgraph, candidate, resolve_tensor_data, user_data) ||
                 !flagos_candidate_early_reads_are_safe(
+                    cgraph, candidate, resolve_tensor_data, user_data) ||
+                !flagos_absorbed_nodes_are_safe(
                     cgraph, candidate, resolve_tensor_data, user_data)) {
                 continue;
             }
@@ -1447,6 +1776,10 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
         if (left.choice.score != right.choice.score) {
             return left.choice.score > right.choice.score;
         }
+        // Equal scores: the variant that also absorbs producers does strictly less work.
+        if (left.candidate.absorbed_node_indices.size() != right.candidate.absorbed_node_indices.size()) {
+            return left.candidate.absorbed_node_indices.size() > right.candidate.absorbed_node_indices.size();
+        }
         if (left.candidate.node_indices.size() != right.candidate.node_indices.size()) {
             return left.candidate.node_indices.size() > right.candidate.node_indices.size();
         }
@@ -1460,10 +1793,12 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
     std::vector<selected_candidate> selected;
     for (const auto & item : supported) {
         bool overlaps = false;
-        for (const int node_index : item.candidate.node_indices) {
-            if (selected_by[node_index] != -1) {
-                overlaps = true;
-                break;
+        for (const auto * list : { &item.candidate.node_indices, &item.candidate.absorbed_node_indices }) {
+            for (const int node_index : *list) {
+                if (selected_by[node_index] != -1) {
+                    overlaps = true;
+                    break;
+                }
             }
         }
         if (overlaps) {
@@ -1471,8 +1806,10 @@ static std::unique_ptr<flagos_graph_plan> flagos_build_graph_plan_from_canonical
         }
         const int selected_index = static_cast<int>(selected.size());
         selected.push_back(item);
-        for (const int node_index : item.candidate.node_indices) {
-            selected_by[node_index] = selected_index;
+        for (const auto * list : { &item.candidate.node_indices, &item.candidate.absorbed_node_indices }) {
+            for (const int node_index : *list) {
+                selected_by[node_index] = selected_index;
+            }
         }
     }
 

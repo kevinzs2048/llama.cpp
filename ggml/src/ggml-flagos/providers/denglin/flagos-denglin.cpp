@@ -1,4 +1,4 @@
-#include "../../ggml-flagos.h"
+#include "ggml-flagos.h"
 #include "../../flagos-graph-plan.h"
 #include "../../flagos-provider.h"
 #include "flagos-denglin-api.h"
@@ -1625,14 +1625,13 @@ static size_t ggml_backend_flagos_buffer_type_alignment(ggml_backend_buffer_type
     return 128;
 }
 
-static const ggml_backend_buffer_type_i ggml_backend_flagos_buffer_type_interface = {
-    /* .get_name       = */ ggml_backend_flagos_buffer_type_name,
-    /* .alloc_buffer   = */ ggml_backend_flagos_buffer_type_alloc_buffer,
-    /* .get_alignment  = */ ggml_backend_flagos_buffer_type_alignment,
-    /* .get_max_size   = */ nullptr,
-    /* .get_alloc_size = */ nullptr,
-    /* .is_host        = */ nullptr,
-};
+static const ggml_backend_buffer_type_i ggml_backend_flagos_buffer_type_interface = []() {
+    ggml_backend_buffer_type_i iface {};
+    iface.get_name = ggml_backend_flagos_buffer_type_name;
+    iface.alloc_buffer = ggml_backend_flagos_buffer_type_alloc_buffer;
+    iface.get_alignment = ggml_backend_flagos_buffer_type_alignment;
+    return iface;
+}();
 
 static const char * ggml_backend_flagos_name(ggml_backend_t backend) {
     return static_cast<ggml_backend_flagos_device_context *>(backend->device->context)->name.c_str();
@@ -3221,3 +3220,6 @@ const flagos_provider_v1 * flagos_denglin_provider() {
     };
     return &provider;
 }
+
+#include "../../flagos-plugin.h"
+FLAGOS_DEFINE_DEVICE_PROVIDER_ENTRY("denglin", flagos_denglin_provider)

@@ -1,5 +1,6 @@
 #include "flagos-amd-api.h"
 #include "flagos-amd-aot.h"
+#include "flagos-amd-op-contracts.h"
 
 #include "../../../ggml-backend-impl.h"
 #include "../../../ggml-impl.h"
@@ -218,8 +219,16 @@ struct amd_dequant_arena_block {
 struct amd_backend_context {
     amd_device_context * device = nullptr;
     hipStream_t stream = nullptr;
+    void * packed_ffn_workspace = nullptr;
+    void * geglu_lut = nullptr;
+    bool geglu_lut_ready = false;
+    uint64_t geglu_lut_generation = 0;
+    void * splitkv_workspace = nullptr;
+    size_t splitkv_workspace_capacity = 0;
+    uint64_t splitkv_workspace_generation = 0;
     std::mutex execution_mutex;
     flagos_graph_plan_cache graph_plans;
+    uint64_t execution_policy_key = 0;
     uint64_t graph_plan_config_key = 0;
     std::vector<amd_graph_capture_entry> graph_captures;
     std::vector<amd_graph_capture_candidate> graph_capture_candidates;
@@ -284,6 +293,9 @@ struct amd_backend_context {
         std::atomic<uint64_t> rope_kv_store { 0 };
         std::atomic<uint64_t> flash_attn_decode { 0 };
         std::atomic<uint64_t> flash_attn_prefill { 0 };
+        std::atomic<uint64_t> splitkv_decode { 0 };
+        std::atomic<uint64_t> splitkv_grouped_decode { 0 };
+        std::atomic<uint64_t> splitkv_workspace_allocations { 0 };
         std::atomic<uint64_t> soft_max { 0 };
         std::atomic<uint64_t> host_to_device_copies { 0 };
         std::atomic<uint64_t> device_to_device_copies { 0 };
@@ -310,8 +322,8 @@ struct amd_backend_context {
 
     amd_backend_context(amd_device_context * device_, hipStream_t stream_):
         device(device_), stream(stream_), graph_plans(128) {
-        graph_captures.reserve(8);
-        graph_capture_candidates.reserve(16);
+        graph_captures.reserve(128);
+        graph_capture_candidates.reserve(256);
         dequant_cache.reserve(64);
         dequant_arena.reserve(8);
         // Bound F16 cache residency on larger models.
@@ -372,6 +384,13 @@ static bool amd_graph_capture_prefill_enabled() {
     return value != nullptr && std::strcmp(value, "all") == 0;
 }
 
+// The common descriptor also accepts Q5_0, which this backend has no
+// kernels for; it only sees the formats it was written against.
+static bool amd_describe_quantized_matmul(const ggml_tensor * op, flagos_quantized_matmul_signature * signature) {
+    return flagos_describe_quantized_matmul(op, signature) &&
+        signature->weight_kind != flagos_quantized_matmul_kind::q5_0;
+}
+
 static bool amd_graph_is_decode(const ggml_cgraph * cgraph) {
     if (cgraph == nullptr) {
         return false;
@@ -379,7 +398,7 @@ static bool amd_graph_is_decode(const ggml_cgraph * cgraph) {
     bool found_projection = false;
     for (int index = 0; index < cgraph->n_nodes; ++index) {
         flagos_quantized_matmul_signature signature;
-        if (!flagos_describe_quantized_matmul(cgraph->nodes[index], &signature)) {
+        if (!amd_describe_quantized_matmul(cgraph->nodes[index], &signature)) {
             continue;
         }
         found_projection = true;
@@ -455,7 +474,7 @@ static bool amd_candidate_outputs_are(
     return true;
 }
 
-static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
+static uint64_t amd_execution_policy_key() {
     // The graph-plan cache is provider-local, but its lowering decisions are
     // controlled by process configuration. Include all lowering-related
     // switches in a small generation key so tests or embedding applications
@@ -481,21 +500,53 @@ static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
     add(std::getenv("FLAGOS_AMD_FUSIONS"));
     add(std::getenv("FLAGOS_AMD_PREFILL_F16_GEMM"));
     add(std::getenv("FLAGOS_AMD_GROUPED_F16_GEMM"));
+    add(std::getenv("FLAGOS_AMD_ALIGNED_F16_GEMM"));
+    add(std::getenv("FLAGOS_AMD_QUANT_TILED_GEMM"));
+    add(std::getenv("FLAGOS_AMD_TILED_F16_FFN"));
+    add(std::getenv("FLAGOS_AMD_STRIDED_RMS_NORM"));
+    add(std::getenv("FLAGOS_AMD_F16_COPY"));
+    add(std::getenv("FLAGOS_AMD_BROADCAST_SOFTMAX"));
+    add(std::getenv("FLAGOS_AMD_WIDE_BROADCAST_SOFTMAX"));
+    add(std::getenv("FLAGOS_AMD_PADDED_BROADCAST_SOFTMAX"));
+    add(std::getenv("FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM"));
+    add(std::getenv("FLAGOS_AMD_DENSE_FLOAT_OPS"));
+    add(std::getenv("FLAGOS_AMD_BATCHED_GATHER"));
+    add(std::getenv("FLAGOS_AMD_REPEAT_OPS"));
+    add(std::getenv("FLAGOS_AMD_TANH"));
+    add(std::getenv("FLAGOS_AMD_GEGLU_LUT"));
+    add(std::getenv("FLAGOS_AMD_MOE"));
+    add(std::getenv("FLAGOS_AMD_ARGSORT"));
+    add(std::getenv("FLAGOS_AMD_ROPE_NEOX_RECURRENCE"));
+    add(std::getenv("FLAGOS_AMD_PACKED_F16_FFN"));
+    add(std::getenv("FLAGOS_AMD_TILED_GDN_PREFILL"));
+    add(std::getenv("FLAGOS_AMD_SPLITKV_DECODE"));
+    add(std::getenv("FLAGOS_AMD_GROUPED_SPLITKV_DECODE"));
     add(std::getenv("FLAGOS_AMD_FFN_DOWN_F16"));
     add(std::getenv("FLAGOS_AMD_Q4_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q5_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q40_GEMV_NARROW"));
     add(std::getenv("FLAGOS_AMD_Q40_FFN_DECODE_STAGED"));
     add(std::getenv("FLAGOS_AMD_TUNING_PROFILE"));
+    return hash == 0 ? 1 : hash;
+}
+
+static uint64_t amd_fusion_config_key(const amd_backend_context * context) {
+    uint64_t hash = amd_execution_policy_key();
     // Query results also depend on whether persistent provider-private weight
     // caches are cold, warm, or invalidated. Fold their generation into the
     // same provider-neutral configuration ID used by the common plan cache.
     // This lets a cold FFN plan be capture-unsafe for its allocating launch,
     // then rebuild as capture-safe once all pointers are stable.
-    const uint64_t epoch = context == nullptr ? 0 : context->dequant_cache_epoch;
-    for (size_t byte = 0; byte < sizeof(epoch); ++byte) {
-        hash ^= static_cast<uint8_t>(epoch >> (byte * 8));
-        hash *= 1099511628211ULL;
+    const uint64_t epochs[] = {
+        context == nullptr ? 0 : context->dequant_cache_epoch,
+        context == nullptr ? 0 : context->splitkv_workspace_generation,
+        context == nullptr ? 0 : context->geglu_lut_generation,
+    };
+    for (const uint64_t epoch : epochs) {
+        for (size_t byte = 0; byte < sizeof(epoch); ++byte) {
+            hash ^= static_cast<uint8_t>(epoch >> (byte * 8));
+            hash *= 1099511628211ULL;
+        }
     }
     return hash == 0 ? 1 : hash;
 }
@@ -543,7 +594,8 @@ static bool amd_store_graph_capture(
     if (context == nullptr || executable == nullptr) {
         return false;
     }
-    constexpr size_t capacity = 8;
+    // A decode round can visit one GPU split per layer before any repeats.
+    constexpr size_t capacity = 128;
     if (context->graph_captures.size() >= capacity) {
         auto lru = std::min_element(context->graph_captures.begin(), context->graph_captures.end(),
             [](const amd_graph_capture_entry & left, const amd_graph_capture_entry & right) {
@@ -619,7 +671,8 @@ static void amd_store_graph_capture_candidate(
     if (context == nullptr) {
         return;
     }
-    constexpr size_t capacity = 16;
+    // Keep warmup bindings across a full round of layer-sized GPU splits.
+    constexpr size_t capacity = 256;
     if (context->graph_capture_candidates.size() >= capacity) {
         const auto lru = std::min_element(
             context->graph_capture_candidates.begin(), context->graph_capture_candidates.end(),
@@ -727,6 +780,12 @@ static void amd_log_stats(const amd_backend_context * context) {
         (unsigned long long) s.graph_replays.load(),
         (unsigned long long) s.graph_replay_failures.load(),
         (unsigned long long) s.graph_capture_failures.load());
+    GGML_LOG_INFO("FlagOS AMD split-KV stats: decode_pairs=%llu grouped_pairs=%llu workspace_allocations=%llu capacity=%zu generation=%llu\n",
+        (unsigned long long) s.splitkv_decode.load(),
+        (unsigned long long) s.splitkv_grouped_decode.load(),
+        (unsigned long long) s.splitkv_workspace_allocations.load(),
+        context->splitkv_workspace_capacity,
+        (unsigned long long) context->splitkv_workspace_generation);
     GGML_LOG_INFO(
         "FlagOS AMD graph capture stats: requests=%llu cache_waits=%llu prefill_skips=%llu "
         "unsafe_plans=%llu small_graphs=%llu eligible=%llu exec_misses=%llu "
@@ -926,6 +985,20 @@ static bool amd_prefill_f16_gemm_enabled(const amd_device_context * device) {
     return amd_profile_switch(device, "FLAGOS_AMD_PREFILL_F16_GEMM");
 }
 
+static bool amd_allows_f16_matmul(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT ||
+        ggml_get_op_params_i32(op, 0) != GGML_PREC_DEFAULT) {
+        return false;
+    }
+#if GGML_BACKEND_API_VERSION >= 3
+    const int32_t source_precision = ggml_get_op_params_i32(op, 3);
+    return source_precision == GGML_PREC_DEFAULT || source_precision == GGML_PREC_F16 ||
+        source_precision == GGML_PREC_Q8 || source_precision == GGML_PREC_Q4;
+#else
+    return true;
+#endif
+}
+
 static bool amd_ffn_down_f16_enabled(const amd_device_context * device) {
     return amd_profile_switch(device, "FLAGOS_AMD_FFN_DOWN_F16");
 }
@@ -1053,6 +1126,7 @@ static int64_t amd_quantized_block_size(flagos_quantized_matmul_kind kind) {
         case flagos_quantized_matmul_kind::q5_k:
         case flagos_quantized_matmul_kind::q4_k:
         case flagos_quantized_matmul_kind::q6_k: return 256;
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return 0;
     }
     return 0;
@@ -1078,6 +1152,7 @@ static const char * amd_quantized_dequant_kernel(flagos_quantized_matmul_kind ki
         case flagos_quantized_matmul_kind::q4_k: return "flagos_dequant_q4_k_f16";
         case flagos_quantized_matmul_kind::q6_k: return "flagos_dequant_q6_k_f16";
         case flagos_quantized_matmul_kind::q8_0: return "flagos_dequant_q8_0_f16";
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return nullptr;
     }
     return nullptr;
@@ -1091,9 +1166,33 @@ static const char * amd_quantized_gemv_kernel(flagos_quantized_matmul_kind kind)
         case flagos_quantized_matmul_kind::q4_k: return "flagos_mul_mat_q4_k_f32";
         case flagos_quantized_matmul_kind::q6_k: return "flagos_mul_mat_q6_k_f32";
         case flagos_quantized_matmul_kind::q8_0: return "flagos_mul_mat_q8_0_f32";
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return nullptr;
     }
     return nullptr;
+}
+
+static const char * amd_aligned_quantized_gemv_kernel(const amd_device_context * device,
+        const ggml_tensor * op, flagos_quantized_matmul_kind kind, int k, int rows) {
+    if (!flagos_amd::supports_aligned_quantized_gemv_bindings(op, k, rows)) {
+        return nullptr;
+    }
+    const char * name = nullptr;
+    switch (kind) {
+        case flagos_quantized_matmul_kind::q4_1: name = "flagos_mul_mat_q4_1_f32_model_aligned"; break;
+        case flagos_quantized_matmul_kind::q8_0: name = "flagos_mul_mat_q8_0_f32_model_aligned"; break;
+        case flagos_quantized_matmul_kind::q4_k: name = "flagos_mul_mat_q4_k_f32_model_aligned"; break;
+        default: return nullptr;
+    }
+    const auto * metadata = device->aot->find(name);
+    if (metadata == nullptr || metadata->symbol != amd_quantized_gemv_kernel(kind) ||
+        metadata->argument_count != 6 || metadata->num_warps != 1 || metadata->warp_size != 32 ||
+        metadata->shared_memory != 0 || metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0 ||
+        metadata->tile_m != 16 || metadata->tile_n != 16 || metadata->tile_k != 16 ||
+        metadata->block_size != (kind == flagos_quantized_matmul_kind::q4_k ? 256 : 32)) {
+        return nullptr;
+    }
+    return name;
 }
 
 static const char * amd_quantized_get_rows_kernel(flagos_quantized_matmul_kind kind) {
@@ -1104,13 +1203,15 @@ static const char * amd_quantized_get_rows_kernel(flagos_quantized_matmul_kind k
         case flagos_quantized_matmul_kind::q4_k: return "flagos_get_rows_q4_k_f32";
         case flagos_quantized_matmul_kind::q6_k: return "flagos_get_rows_q6_k_f32";
         case flagos_quantized_matmul_kind::q8_0: return "flagos_get_rows_q8_0_f32";
+        case flagos_quantized_matmul_kind::q5_0:
         case flagos_quantized_matmul_kind::none: return nullptr;
     }
     return nullptr;
 }
 
 static const char * amd_quantized_batched_kernel(const amd_device_context * device,
-                                                 flagos_quantized_matmul_kind kind) {
+                                                 flagos_quantized_matmul_kind kind,
+                                                 bool allow_f16) {
     if (kind == flagos_quantized_matmul_kind::q4_0) {
         return "flagos_mul_mat_q4_0_f32_batched";
     }
@@ -1126,7 +1227,7 @@ static const char * amd_quantized_batched_kernel(const amd_device_context * devi
         return nullptr;
     }
     const bool q4 = kind == flagos_quantized_matmul_kind::q4_k;
-    if (amd_quant_tiled_enabled()) {
+    if (allow_f16 && amd_quant_tiled_enabled()) {
         const char * tiled = q4 ? "flagos_mul_mat_q4_k_f32_tiled" :
             kind == flagos_quantized_matmul_kind::q5_k ? nullptr : "flagos_mul_mat_q6_k_f32_tiled";
         if (tiled != nullptr && device != nullptr && device->aot != nullptr &&
@@ -1403,20 +1504,36 @@ static bool amd_f16_graph_cache_ready(
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node == nullptr || node->op != GGML_OP_MUL_MAT ||
+        if (!amd_allows_f16_matmul(node) ||
             node->src[0] == nullptr || node->src[1] == nullptr ||
             node->src[1]->ne[1] <= 1 || node->src[0]->ne[1] < 64 ||
             node->src[0]->ne[0] < 1024) {
             continue;
         }
         flagos_quantized_matmul_signature signature;
-        if (!flagos_describe_quantized_matmul(node, &signature) ||
+        if (!amd_describe_quantized_matmul(node, &signature) ||
             !amd_dequant_cache_contains(context, node->src[0], signature)) {
             return false;
         }
     }
     return true;
 }
+
+static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
+        const flagos_amd::kernel_metadata * metadata, size_t arguments, size_t pointers,
+        uint64_t grid_x, uint64_t grid_y, uint64_t grid_z);
+
+struct amd_f16_projection_launch {
+    const char * kernel = nullptr;
+    unsigned int grid_x = 0;
+    unsigned int grid_y = 0;
+    bool grouped = false;
+    bool aligned = false;
+};
+
+static bool amd_describe_f16_projection(const amd_device_context * device,
+        const void * weights, const void * input, const void * output,
+        int k, int rows, int columns, amd_f16_projection_launch * launch);
 
 static void * amd_get_dequantized_weight(
         amd_backend_context * context, const ggml_tensor * weight,
@@ -1458,7 +1575,12 @@ static void * amd_get_dequantized_weight(
         }
     }
     const char * kernel_name = amd_quantized_dequant_kernel(signature.weight_kind);
-    if (kernel_name == nullptr || context->device->aot->find(kernel_name) == nullptr) {
+    const auto * metadata = kernel_name == nullptr ? nullptr : context->device->aot->find(kernel_name);
+    const uint64_t elements = static_cast<uint64_t>(signature.k) * static_cast<uint64_t>(signature.rows);
+    const uint64_t blocks = elements / static_cast<uint64_t>(block_size);
+    if (metadata == nullptr || metadata->block_size != block_size ||
+        elements > INT32_MAX || ggml_nbytes(weight) > INT32_MAX || reinterpret_cast<uintptr_t>(weight->data) % sizeof(uint16_t) != 0 ||
+        !amd_kernel_launch_contract_fits(context->device, metadata, 3, 3, blocks, 1, 1)) {
         return nullptr;
     }
     size_t bytes = 0;
@@ -1466,8 +1588,6 @@ static void * amd_get_dequantized_weight(
         (reusable != nullptr && reusable->bytes != bytes)) {
         return nullptr;
     }
-    const uint64_t elements = static_cast<uint64_t>(signature.k) *
-        static_cast<uint64_t>(signature.rows);
     if (reusable == nullptr && context->dequant_cache_limit_bytes != 0 &&
         (bytes > context->dequant_cache_limit_bytes ||
          context->dequant_cache_bytes > context->dequant_cache_limit_bytes - bytes)) {
@@ -1490,7 +1610,6 @@ static void * amd_get_dequantized_weight(
     }
     void * weights_u8 = weight->data;
     void * weights_f16 = weight->data;
-    int blocks = static_cast<int>(elements / static_cast<uint64_t>(block_size));
     flagos_amd::kernel_arguments arguments = { &weights_u8, &weights_f16, &f16_data };
     if (!context->device->aot->launch(kernel_name, context->stream,
             static_cast<unsigned int>(blocks), 1, 1, arguments)) {
@@ -1529,14 +1648,14 @@ static void amd_prepare_dequant_cache(
     requests.reserve(static_cast<size_t>(cgraph->n_nodes));
     for (int index = 0; index < cgraph->n_nodes; ++index) {
         const ggml_tensor * node = cgraph->nodes[index];
-        if (node == nullptr || node->op != GGML_OP_MUL_MAT ||
+        if (!amd_allows_f16_matmul(node) ||
             node->src[0] == nullptr || node->src[1] == nullptr ||
             node->src[1]->ne[1] <= 1 || node->src[0]->ne[1] < 64 ||
             node->src[0]->ne[0] < 1024) {
             continue;
         }
         flagos_quantized_matmul_signature signature;
-        if (!flagos_describe_quantized_matmul(node, &signature) ||
+        if (!amd_describe_quantized_matmul(node, &signature) ||
             amd_dequant_cache_contains(context, node->src[0], signature)) {
             continue;
         }
@@ -1733,14 +1852,15 @@ static size_t amd_buffer_max_size(ggml_backend_buffer_type_t) {
     return SIZE_MAX;
 }
 
-static const ggml_backend_buffer_type_i g_buffer_type_iface = {
-    /* .get_name       = */ amd_buffer_type_name,
-    /* .alloc_buffer   = */ amd_buffer_alloc,
-    /* .get_alignment  = */ amd_buffer_alignment,
-    /* .get_max_size   = */ amd_buffer_max_size,
-    /* .get_alloc_size = */ nullptr,
-    /* .is_host        = */ [](ggml_backend_buffer_type_t) { return false; },
-};
+static const ggml_backend_buffer_type_i g_buffer_type_iface = []() {
+    ggml_backend_buffer_type_i iface {};
+    iface.get_name = amd_buffer_type_name;
+    iface.alloc_buffer = amd_buffer_alloc;
+    iface.get_alignment = amd_buffer_alignment;
+    iface.get_max_size = amd_buffer_max_size;
+    iface.is_host = [](ggml_backend_buffer_type_t) { return false; };
+    return iface;
+}();
 
 static bool amd_buffer_is_local_storage(ggml_backend_buffer_t buffer) {
     return buffer != nullptr && ggml_backend_buffer_get_type(buffer) != nullptr &&
@@ -1760,7 +1880,7 @@ static void amd_backend_free(ggml_backend_t backend) {
         // registered until its stream and private resources are idle so a
         // concurrent buffer free cannot miss queued work during teardown.
         std::unique_lock<std::mutex> backends_lock(*device->backends_mutex);
-        std::lock_guard<std::mutex> execution_lock(context->execution_mutex);
+        std::unique_lock<std::mutex> execution_lock(context->execution_mutex);
         amd_log_stats(context);
         if (device->aot != nullptr) {
             device->aot->log_profile();
@@ -1785,9 +1905,19 @@ static void amd_backend_free(ggml_backend_t backend) {
         }
         amd_clear_graph_captures(context);
         amd_release_dequant_cache(context);
+        if (context->geglu_lut != nullptr) {
+            amd_hip_check(hipFree(context->geglu_lut), "hipFree GEGLU LUT");
+        }
+        if (context->packed_ffn_workspace != nullptr) {
+            amd_hip_check(hipFree(context->packed_ffn_workspace), "hipFree packed FFN workspace");
+        }
+        if (context->splitkv_workspace != nullptr) {
+            amd_hip_check(hipFree(context->splitkv_workspace), "hipFree split-KV workspace");
+        }
         amd_hip_check(hipStreamDestroy(context->stream), "hipStreamDestroy");
         auto & backends = device->backends;
         backends.erase(std::remove(backends.begin(), backends.end(), context), backends.end());
+        execution_lock.unlock();
         backends_lock.unlock();
         delete context;
     }
@@ -1938,6 +2068,7 @@ static void amd_backend_synchronize(ggml_backend_t backend) {
 
 static void amd_backend_event_record(ggml_backend_t backend, ggml_backend_event_t event);
 static void amd_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
+static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op);
 
 static bool amd_tensor_is_contiguous_f32(const ggml_tensor * tensor) {
     return tensor != nullptr && tensor->type == GGML_TYPE_F32 &&
@@ -1977,12 +2108,25 @@ static bool amd_tensor_element_strides_are_aligned(
 
 static bool amd_tensor_data_is_aligned(
         const ggml_tensor * tensor, size_t alignment) {
-    // supports_op can run before scheduler allocation. Revalidate the same
-    // condition during execution, when data is bound, without rejecting an
-    // otherwise supported unallocated graph.
-    return tensor != nullptr && alignment != 0 &&
-        (tensor->data == nullptr ||
-         reinterpret_cast<uintptr_t>(tensor->data) % alignment == 0);
+    // supports_op runs before allocation, but GGML has already flattened
+    // view offsets to their root. Device buffers provide aligned roots;
+    // reject offsets that cannot satisfy the kernel's address contract.
+    if (tensor == nullptr || alignment == 0) {
+        return false;
+    }
+    if (tensor->data != nullptr) {
+        return reinterpret_cast<uintptr_t>(tensor->data) % alignment == 0;
+    }
+    if (tensor->view_src == nullptr) {
+        return true;
+    }
+    const size_t offset = tensor->view_offs % alignment;
+    if (tensor->view_src->data != nullptr) {
+        // Compare residues without overflowing root_address + view_offs.
+        return reinterpret_cast<uintptr_t>(tensor->view_src->data) % alignment ==
+            (alignment - offset) % alignment;
+    }
+    return offset == 0;
 }
 
 static bool amd_tensor_bindings_ready(const ggml_tensor * tensor) {
@@ -2013,8 +2157,30 @@ static bool amd_candidate_bindings_ready(
 }
 
 static bool amd_tensor_data_overlaps(const ggml_tensor * left, const ggml_tensor * right) {
-    if (left == nullptr || right == nullptr || left->data == nullptr || right->data == nullptr) {
+    if (left == nullptr || right == nullptr) {
         return false;
+    }
+    if (left->data == nullptr || right->data == nullptr) {
+        // GGML flattens public views to their allocation root. These offsets
+        // and spans already establish aliasing before scheduler allocation;
+        // do not advertise a path that will reject the same views when bound.
+        const auto * left_root = left->view_src == nullptr ? left : left->view_src;
+        const auto * right_root = right->view_src == nullptr ? right : right->view_src;
+        if (left_root != right_root) {
+            return false;
+        }
+        const size_t left_size = ggml_nbytes(left);
+        const size_t right_size = ggml_nbytes(right);
+        const size_t left_offset = left->view_src == nullptr ? 0 : left->view_offs;
+        const size_t right_offset = right->view_src == nullptr ? 0 : right->view_offs;
+        if (left_size == 0 || right_size == 0) {
+            return false;
+        }
+        if (left_offset > SIZE_MAX - left_size || right_offset > SIZE_MAX - right_size) {
+            return true;
+        }
+        return left_offset < right_offset + right_size &&
+            right_offset < left_offset + left_size;
     }
     const uintptr_t left_begin = reinterpret_cast<uintptr_t>(left->data);
     const uintptr_t right_begin = reinterpret_cast<uintptr_t>(right->data);
@@ -2029,22 +2195,54 @@ static bool amd_tensor_data_overlaps(const ggml_tensor * left, const ggml_tensor
 
 static bool amd_tensor_output_can_reuse_input(
         const ggml_tensor * output, const ggml_tensor * input) {
-    return !amd_tensor_data_overlaps(output, input) ||
-        (output->data == input->data && ggml_nbytes(output) == ggml_nbytes(input));
+    if (!amd_tensor_data_overlaps(output, input)) {
+        return true;
+    }
+    if (ggml_nbytes(output) != ggml_nbytes(input)) {
+        return false;
+    }
+    if (output->data != nullptr && input->data != nullptr) {
+        return output->data == input->data;
+    }
+    const size_t output_offset = output->view_src == nullptr ? 0 : output->view_offs;
+    const size_t input_offset = input->view_src == nullptr ? 0 : input->view_offs;
+    return output_offset == input_offset;
 }
 
-static bool amd_supports_unary_f32(
-        const amd_device_context * device, const ggml_tensor * op,
-        ggml_unary_op unary, const char * kernel_name) {
-    return device != nullptr && device->aot != nullptr && kernel_name != nullptr &&
-        device->aot->find(kernel_name) != nullptr && op != nullptr &&
-        op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == unary &&
-        op->src[0] != nullptr && amd_tensor_is_contiguous_f32(op) &&
-        amd_tensor_is_contiguous_f32(op->src[0]) &&
-        ggml_are_same_shape(op, op->src[0]) && ggml_nelements(op) > 0 &&
-        ggml_nelements(op) <= INT32_MAX &&
-        amd_tensor_output_can_reuse_input(op, op->src[0]);
+static bool amd_kernel_launch_contract_fits(const amd_device_context * device,
+        const flagos_amd::kernel_metadata * metadata, size_t arguments, size_t pointers,
+        uint64_t grid_x, uint64_t grid_y, uint64_t grid_z) {
+    if (device == nullptr || metadata == nullptr || pointers > arguments ||
+        metadata->argument_count != static_cast<int>(arguments) || metadata->argument_abi.size() != arguments ||
+        metadata->num_warps <= 0 || metadata->warp_size <= 0 || metadata->shared_memory < 0 ||
+        metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0) {
+        return false;
+    }
+    for (size_t index = 0; index < arguments; ++index) {
+        const auto & abi = metadata->argument_abi[index];
+        const bool pointer = index < pointers;
+        if (abi.size != (pointer ? sizeof(void *) : sizeof(int32_t)) ||
+            abi.kind != (pointer ? flagos_amd::kernel_argument_kind::global_buffer : flagos_amd::kernel_argument_kind::by_value)) {
+            return false;
+        }
+    }
+    const uint64_t grid[] = { grid_x, grid_y, grid_z };
+    for (int dimension = 0; dimension < 3; ++dimension) {
+        if (grid[dimension] == 0 || grid[dimension] > UINT32_MAX ||
+            (device->props.maxGridSize[dimension] > 0 && grid[dimension] > static_cast<uint64_t>(device->props.maxGridSize[dimension]))) {
+            return false;
+        }
+    }
+    const uint64_t threads = static_cast<uint64_t>(metadata->num_warps) * metadata->warp_size;
+    const size_t shared = device->props.sharedMemPerBlock;
+    return (device->props.warpSize <= 0 || metadata->warp_size == device->props.warpSize) &&
+        (device->props.maxThreadsPerBlock <= 0 || threads <= static_cast<uint64_t>(device->props.maxThreadsPerBlock)) &&
+        (shared == 0 || (metadata->static_shared_memory <= shared &&
+         static_cast<size_t>(metadata->shared_memory) <= shared - metadata->static_shared_memory));
 }
+
+#include "flagos-amd-elementwise.inc"
+#include "flagos-amd-f16-projection.inc"
 
 static bool amd_supports_l2_norm(const amd_device_context * device, const ggml_tensor * op) {
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
@@ -2063,7 +2261,8 @@ static bool amd_supports_l2_norm(const amd_device_context * device, const ggml_t
     const auto * metadata = device->aot->find("flagos_l2_norm_strided_f32");
     float eps = 0.0f;
     std::memcpy(&eps, op->op_params, sizeof(eps));
-    return metadata->block_size >= op->ne[0] && std::isfinite(eps) && eps >= 0.0f &&
+    return amd_kernel_launch_contract_fits(device, metadata, 9, 2, op->ne[1], op->ne[2], op->ne[3]) &&
+        metadata->block_size >= op->ne[0] && std::isfinite(eps) && eps >= 0.0f &&
         // The strided source may map several logical rows onto a larger
         // backing allocation.  The kernel writes a separate contiguous
         // output layout, so even an exact base-pointer alias is unsafe unless
@@ -2095,7 +2294,11 @@ static bool amd_supports_ssm_conv(
         ggml_nelements(op) <= 0 || ggml_nelements(op) > INT32_MAX) {
         return false;
     }
-    return !amd_tensor_data_overlaps(op, op->src[0]) &&
+    const auto * metadata = device->aot->find(kernel_name);
+    return metadata->block_size > 0 &&
+        amd_kernel_launch_contract_fits(device, metadata, 12, 3, op->ne[1], op->ne[2],
+            (static_cast<uint64_t>(op->ne[0]) + metadata->block_size - 1) / metadata->block_size) &&
+        !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
@@ -2129,12 +2332,18 @@ static const ggml_tensor * amd_attention_output_gate_other(
     return nullptr;
 }
 
-static const char * amd_attention_output_gate_kernel(const ggml_tensor * activation) {
+static const char * amd_attention_output_gate_kernel(
+        const amd_device_context * device, const ggml_tensor * activation) {
     if (activation == nullptr || activation->op != GGML_OP_UNARY) {
         return nullptr;
     }
     switch (ggml_get_unary_op(activation)) {
-        case GGML_UNARY_OP_SILU:     return "flagos_silu_mul_f32";
+        case GGML_UNARY_OP_SILU:
+            // Keep dedicated packages compatible; the baseline library already
+            // exports the same F32 arithmetic under its SwiGLU semantic.
+            return device != nullptr && device->aot != nullptr &&
+                device->aot->find("flagos_silu_mul_f32") != nullptr
+                ? "flagos_silu_mul_f32" : "flagos_swiglu_split_f32";
         case GGML_UNARY_OP_SIGMOID:  return "flagos_sigmoid_mul_f32";
         case GGML_UNARY_OP_SOFTPLUS: return "flagos_softplus_mul_f32";
         default:                     return nullptr;
@@ -2146,7 +2355,7 @@ static bool amd_supports_attention_output_gate(
         const ggml_tensor * activation,
         const ggml_tensor * mul) {
     const ggml_tensor * other = amd_attention_output_gate_other(activation, mul);
-    const char * kernel_name = amd_attention_output_gate_kernel(activation);
+    const char * kernel_name = amd_attention_output_gate_kernel(device, activation);
     if (device == nullptr || device->aot == nullptr || activation == nullptr ||
         activation->src[0] == nullptr || other == nullptr ||
         kernel_name == nullptr || device->aot->find(kernel_name) == nullptr ||
@@ -2161,7 +2370,10 @@ static bool amd_supports_attention_output_gate(
     // The fused elementwise kernel may overwrite either live input only at
     // the exact same base and size. Reject partial overlap just as the direct
     // unary and MUL paths do.
-    return amd_tensor_output_can_reuse_input(mul, activation->src[0]) &&
+    return amd_elementwise_launch_contract_fits(device, mul, kernel_name, 4, 3) &&
+        amd_tensor_data_is_aligned(activation->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(other, sizeof(float)) &&
+        amd_tensor_output_can_reuse_input(mul, activation->src[0]) &&
         amd_tensor_output_can_reuse_input(mul, other);
 }
 
@@ -2187,7 +2399,7 @@ static bool amd_supports_gdn_alpha_gate(
         !ggml_are_same_shape(add, add->src[0]) ||
         !ggml_are_same_shape(activation, add) || !ggml_are_same_shape(mul, activation) ||
         !ggml_can_repeat(add->src[1], add->src[0]) || !ggml_can_repeat(scale, activation) ||
-        add->ne[0] <= 0 || add->ne[0] > INT32_MAX ||
+        add->ne[0] <= 0 || add->ne[0] > INT32_MAX || metadata->block_size <= 0 ||
         metadata->tile_n != add->ne[0] ||
         add->src[1]->ne[0] != add->ne[0] || add->src[1]->ne[1] != 1 ||
         add->src[1]->ne[2] != 1 || add->src[1]->ne[3] != 1 ||
@@ -2196,7 +2408,13 @@ static bool amd_supports_gdn_alpha_gate(
         ggml_nelements(mul) <= 0 || ggml_nelements(mul) > INT32_MAX) {
         return false;
     }
-    return amd_tensor_output_can_reuse_input(mul, add->src[0]) &&
+    return amd_kernel_launch_contract_fits(device, metadata, 5, 4,
+        (static_cast<uint64_t>(ggml_nelements(mul)) + metadata->block_size - 1) / metadata->block_size,
+        1, 1) &&
+        amd_tensor_data_is_aligned(add->src[0], 16) &&
+        amd_tensor_data_is_aligned(add->src[1], 16) &&
+        amd_tensor_data_is_aligned(scale, 16) && amd_tensor_data_is_aligned(mul, 16) &&
+        amd_tensor_output_can_reuse_input(mul, add->src[0]) &&
         amd_tensor_output_can_reuse_input(mul, add->src[1]) &&
         amd_tensor_output_can_reuse_input(mul, scale);
 }
@@ -2271,27 +2489,73 @@ static bool amd_supports_concat(const amd_device_context * device, const ggml_te
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
-static bool amd_supports_copy_f32(const amd_device_context * device, const ggml_tensor * op) {
+static const char * amd_copy_kernel_name(const ggml_tensor * op) {
+    return op->type == GGML_TYPE_F16 ? "flagos_copy_strided_f16_bits" : "flagos_copy_strided_f32";
+}
+
+static bool amd_supports_copy(const amd_device_context * device, const ggml_tensor * op) {
+    if (op == nullptr || (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)) {
+        return false;
+    }
+    const bool f16 = op->type == GGML_TYPE_F16;
+    const size_t element_size = f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    if (f16 && !amd_env_enabled("FLAGOS_AMD_F16_COPY")) {
+        return false;
+    }
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         (op->op != GGML_OP_CPY && op->op != GGML_OP_CONT && op->op != GGML_OP_DUP) ||
-        op->src[0] == nullptr || device->aot->find("flagos_copy_strided_f32") == nullptr ||
-        op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
-        op->nb[0] != sizeof(float) || op->src[0]->nb[0] != sizeof(float) ||
-        !amd_tensor_element_offsets_fit_i32(op, sizeof(float)) ||
-        !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
+        op->src[0] == nullptr || device->aot->find(amd_copy_kernel_name(op)) == nullptr ||
+        op->src[0]->type != op->type ||
+        op->nb[0] != element_size || (!f16 && op->src[0]->nb[0] != element_size) ||
+        !amd_tensor_element_offsets_fit_i32(op, element_size) ||
+        !amd_tensor_element_offsets_fit_i32(op->src[0], element_size) ||
         ggml_nelements(op) > INT32_MAX ||
         ggml_nelements(op) != ggml_nelements(op->src[0])) {
         return false;
     }
     if (op->op == GGML_OP_CPY && (op->src[1] == nullptr ||
-        op->src[1]->type != GGML_TYPE_F32 || op->data != op->src[1]->data)) {
+        op->src[1]->type != op->type || op->data != op->src[1]->data)) {
         return false;
+    }
+    const auto * metadata = device->aot->find(amd_copy_kernel_name(op));
+    const uint64_t grid = std::max<uint64_t>(1,
+        (static_cast<uint64_t>(ggml_nelements(op)) + 255) / 256);
+    if (metadata->block_size != 256 || metadata->num_warps != 4 || metadata->warp_size != 32 ||
+        metadata->shared_memory != 0 || metadata->static_shared_memory != 0 ||
+        !amd_tensor_data_is_aligned(op, element_size) ||
+        !amd_tensor_data_is_aligned(op->src[0], element_size) ||
+        !amd_kernel_launch_contract_fits(device, metadata, 19, 2, grid, 1, 1)) {
+        return false;
+    }
+    if (f16) {
+        const auto * output_root = op->view_src == nullptr ? op : op->view_src;
+        const auto * input_root = op->src[0]->view_src == nullptr ? op->src[0] : op->src[0]->view_src;
+        if (output_root == input_root) {
+            return false;
+        }
+        std::array<std::pair<size_t, int64_t>, GGML_MAX_DIMS> dimensions;
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            dimensions[dim] = {op->nb[dim] / element_size, op->ne[dim]};
+        }
+        std::sort(dimensions.begin(), dimensions.end());
+        size_t covered = 1;
+        for (const auto & dimension : dimensions) {
+            if (dimension.second <= 1) {
+                continue;
+            }
+            if (dimension.first < covered) {
+                return false;
+            }
+            covered += static_cast<size_t>(dimension.second - 1) * dimension.first;
+        }
     }
     if (ggml_nelements(op) == 0) {
         return true;
     }
     return !amd_tensor_data_overlaps(op, op->src[0]);
 }
+
+static const char * amd_gated_delta_net_kernel_name(const amd_device_context * device, const ggml_tensor * op);
 
 static bool amd_supports_gated_delta_net(
         const amd_device_context * device, const ggml_tensor * op) {
@@ -2375,9 +2639,31 @@ static bool amd_supports_gated_delta_net(
     // The model-shape AOT package attaches tt.divisibility=16 to the Q/K/V
     // strides. ggml_is_contiguous_rows() proves only nb[0], so make the
     // stronger compiler contract explicit at the provider boundary.
-    return amd_tensor_data_is_aligned(op, 16) &&
-        amd_tensor_element_strides_are_aligned(q, sizeof(float), 16, 1) &&
-        amd_tensor_element_strides_are_aligned(v, sizeof(float), 16, 1);
+    if (!amd_tensor_data_is_aligned(op, 16) ||
+        !amd_tensor_element_strides_are_aligned(q, sizeof(float), 16, 1) ||
+        !amd_tensor_element_strides_are_aligned(v, sizeof(float), 16, 1)) {
+        return false;
+    }
+    const auto * selected = device->aot->find(amd_gated_delta_net_kernel_name(device, op));
+    return selected != nullptr && selected->tile_n > 0 &&
+        amd_kernel_launch_contract_fits(device, selected, 24, 7, heads, sequences,
+            (static_cast<uint64_t>(state_size) + selected->tile_n - 1) / selected->tile_n);
+}
+
+// Called only after the complete legacy GDN tensor/stride/alias contract passes.
+static const char * amd_gated_delta_net_kernel_name(
+        const amd_device_context * device, const ggml_tensor * op) {
+    static constexpr const char * baseline = "flagos_gated_delta_net_scalar_f32";
+    static constexpr const char * tiled = "flagos_gated_delta_net_scalar_f32_value_tiled";
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * v = op->src[2];
+    if (!amd_env_enabled("FLAGOS_AMD_TILED_GDN_PREFILL") ||
+        v->ne[0] != 128 || v->ne[1] != 32 || v->ne[2] < 32 || v->ne[3] != 1 ||
+        q->ne[1] != 16 || q->ne[3] != 1) return baseline;
+    const auto * m = device->aot->find(tiled);
+    if (m == nullptr || m->argument_count != 24 || m->block_size != 128 ||
+        m->tile_n != 16 || m->num_warps != 4 || m->warp_size != 32) return baseline;
+    return tiled;
 }
 
 static bool amd_supports_gated_delta_net_cache(
@@ -2452,130 +2738,52 @@ static bool amd_supports_gated_delta_net_cache(
             return false;
         }
     }
-    return true;
+    return amd_kernel_launch_contract_fits(device, metadata, 26, 8, heads, sequences,
+        (static_cast<uint64_t>(state_size) + metadata->tile_n - 1) / metadata->tile_n);
 }
 
-static bool amd_gated_delta_net_cache_only_outputs_are_safe(
-        const ggml_cgraph * cgraph,
-        const flagos_pattern_candidate & candidate,
-        const ggml_tensor * gdn,
-        const ggml_tensor * copy) {
-    if (cgraph == nullptr || gdn == nullptr || copy == nullptr || gdn->data == nullptr ||
-        ggml_get_op_params_i32(gdn, 0) != 1 ||
-        candidate.node_indices.empty() || candidate.node_indices.front() < 0 ||
-        candidate.node_indices.front() >= cgraph->n_nodes ||
-        cgraph->nodes[candidate.node_indices.front()] != gdn ||
-        candidate.node_indices.back() < 0 ||
-        candidate.node_indices.back() >= cgraph->n_nodes ||
-        cgraph->nodes[candidate.node_indices.back()] != copy) {
+static const char * amd_ggml_rope_kernel_name(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_ROPE) {
+        return nullptr;
+    }
+    if (op->op_params[2] == GGML_ROPE_TYPE_NEOX) {
+        return amd_env_enabled("FLAGOS_AMD_ROPE_NEOX_RECURRENCE")
+            ? "flagos_rope_ggml_neox_recurrence_f32" : nullptr;
+    }
+    return "flagos_rope_ggml_recurrence_f32";
+}
+
+static bool amd_supports_ggml_rope(const amd_device_context * device, const ggml_tensor * op) {
+    if (device == nullptr || device->aot == nullptr) {
         return false;
     }
-    const ggml_tensor * value = gdn->src[2];
-    if (value == nullptr || value->ne[0] <= 0 || value->ne[1] <= 0 ||
-        value->ne[2] <= 0 || value->ne[3] <= 0) {
+    const char * kernel_name = amd_ggml_rope_kernel_name(op);
+    if (kernel_name == nullptr) {
         return false;
     }
-    uint64_t attention_elements = 1;
-    for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
-        const uint64_t extent = static_cast<uint64_t>(value->ne[dimension]);
-        if (extent > UINT64_MAX / attention_elements) {
-            return false;
-        }
-        attention_elements *= extent;
-    }
-    if (attention_elements > SIZE_MAX / sizeof(float)) {
+    const auto * metadata = device->aot->find(kernel_name);
+    if (metadata == nullptr || metadata->argument_count != 20 ||
+        !flagos_amd::supports_ggml_rope_layout(op, metadata->block_size, true) ||
+        !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[0], sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) ||
+        (op->src[2] != nullptr && !amd_tensor_data_is_aligned(op->src[2], sizeof(float))) ||
+        amd_tensor_data_overlaps(op, op->src[1]) ||
+        (op->src[2] != nullptr && amd_tensor_data_overlaps(op, op->src[2]))) {
         return false;
     }
-    const uintptr_t attention_begin = reinterpret_cast<uintptr_t>(gdn->data);
-    const size_t attention_bytes = static_cast<size_t>(attention_elements) * sizeof(float);
-    if (attention_begin > UINTPTR_MAX - attention_bytes) {
+    if (op->op_params[2] == GGML_ROPE_TYPE_NEOX &&
+        (metadata->num_warps != 4 || metadata->warp_size != 32 ||
+         metadata->shared_memory != 0 || metadata->static_shared_memory != 0 ||
+         metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0 ||
+         metadata->tile_m != 0 || metadata->tile_n != 0 || metadata->tile_k != 0)) {
         return false;
     }
-    const uintptr_t attention_end = attention_begin + attention_bytes;
-    const int copy_index = candidate.node_indices.back();
-    const ggml_tensor * destination = copy->src[1];
-    if (destination == nullptr) {
-        return false;
-    }
-    std::vector<bool> covered(static_cast<size_t>(cgraph->n_nodes), false);
-    for (const int index : candidate.node_indices) {
-        if (index < 0 || index >= cgraph->n_nodes || covered[static_cast<size_t>(index)]) {
-            return false;
-        }
-        covered[static_cast<size_t>(index)] = true;
-    }
-    const auto alias_is_in_attention = [&](const ggml_tensor * tensor) {
-        if (tensor == nullptr || tensor->data == nullptr || tensor->view_src != gdn) {
-            return false;
-        }
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(tensor->data);
-        const size_t bytes = ggml_nbytes(tensor);
-        return bytes > 0 && begin >= attention_begin && begin <= UINTPTR_MAX - bytes &&
-            begin + bytes <= attention_end;
-    };
-    // A zero-work view may be absent from cgraph->nodes and appear only as a
-    // later node's source.  Required-output bookkeeping is node based, so
-    // audit those implicit aliases here before omitting the snapshot suffix.
-    // The covered CPY is allowed to read the suffix because this kernel writes
-    // its destination directly; every other consumer must stay in the
-    // materialized attention prefix.
-    for (int consumer_index = 0; consumer_index < cgraph->n_nodes; ++consumer_index) {
-        if (covered[static_cast<size_t>(consumer_index)]) {
-            continue;
-        }
-        const ggml_tensor * consumer = cgraph->nodes[consumer_index];
-        if (consumer == nullptr ||
-            (consumer->view_src == gdn && !alias_is_in_attention(consumer))) {
-            return false;
-        }
-        for (int source = 0; source < GGML_MAX_SRC; ++source) {
-            const ggml_tensor * input = consumer->src[source];
-            const bool attention_view_input = input == gdn &&
-                consumer->view_src == gdn && alias_is_in_attention(consumer);
-            if ((input == gdn && !attention_view_input) ||
-                (input != nullptr && input->view_src == gdn && !alias_is_in_attention(input))) {
-                return false;
-            }
-        }
-    }
-    bool copy_required = false;
-    for (const int index : candidate.required_output_node_indices) {
-        if (index == copy_index) {
-            if (copy_required) {
-                return false;
-            }
-            copy_required = true;
-            continue;
-        }
-        if (index < 0 || index >= cgraph->n_nodes ||
-            std::find(candidate.node_indices.begin(), candidate.node_indices.end(), index) ==
-                candidate.node_indices.end()) {
-            return false;
-        }
-        const ggml_tensor * output = cgraph->nodes[index];
-        if (output == nullptr || output->data == nullptr) {
-            return false;
-        }
-        // A scheduled destination VIEW and the terminal CPY expose the same
-        // cache storage.  The cache-only kernel materializes both contracts
-        // with its direct cache write.
-        if (output == destination) {
-            continue;
-        }
-        // Common records a producer node, not the byte range observed through
-        // a later view.  The external-alias audit above proves that every
-        // consumer of this GDN output stays inside the attention prefix.
-        if (output == gdn && (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
-            continue;
-        }
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(output->data);
-        const size_t bytes = ggml_nbytes(output);
-        if (bytes == 0 || begin < attention_begin || begin > UINTPTR_MAX - bytes ||
-            begin + bytes > attention_end) {
-            return false;
-        }
-    }
-    return copy_required;
+    return amd_kernel_launch_contract_fits(device, metadata, 20, 4,
+            static_cast<uint64_t>(ggml_nrows(op)), 1, 1) &&
+        (!amd_tensor_data_overlaps(op, op->src[0]) ||
+         (amd_tensor_output_can_reuse_input(op, op->src[0]) && ggml_is_contiguous(op->src[0])));
 }
 
 static bool amd_supports_rope_neox(const amd_device_context * device, const ggml_tensor * op) {
@@ -2608,7 +2816,15 @@ static bool amd_supports_rope_neox(const amd_device_context * device, const ggml
     std::memcpy(&freq_scale, params + 6, sizeof(freq_scale));
     std::memcpy(&ext_factor, params + 7, sizeof(ext_factor));
     std::memcpy(&attn_factor, params + 8, sizeof(attn_factor));
-    return params[2] == GGML_ROPE_TYPE_NEOX &&
+    const auto * metadata = device->aot->find("flagos_rope_neox_f32");
+    return metadata->block_size > 0 &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 10, 3,
+            (static_cast<uint64_t>(ggml_nelements(op)) / 2 + metadata->block_size - 1) /
+                metadata->block_size, 1, 1) &&
+        params[2] == GGML_ROPE_TYPE_NEOX &&
         params[1] > 0 && params[1] % 2 == 0 && params[1] == op->ne[0] &&
         std::isfinite(freq_base) && freq_base > 0.0f &&
         std::isfinite(freq_scale) && freq_scale == 1.0f &&
@@ -2626,6 +2842,7 @@ static bool amd_supports_mrope(const amd_device_context * device, const ggml_ten
         !ggml_is_contiguous(op->src[1]) ||
         !amd_tensor_element_offsets_fit_i32(op, sizeof(float)) ||
         !amd_tensor_element_offsets_fit_i32(op->src[0], sizeof(float)) ||
+        !amd_tensor_element_offsets_fit_i32(op->src[1], sizeof(int32_t)) ||
         op->src[1]->ne[0] != op->ne[2] * 4 ||
         op->src[1]->ne[1] != 1 || op->src[1]->ne[2] != 1 || op->src[1]->ne[3] != 1 ||
         op->ne[0] <= 0 || op->ne[0] > INT32_MAX || op->ne[0] % 2 != 0 ||
@@ -2656,6 +2873,11 @@ static bool amd_supports_mrope(const amd_device_context * device, const ggml_ten
     return params[2] == GGML_ROPE_TYPE_MROPE &&
         params[1] > 0 && params[1] <= op->ne[0] && params[1] % 2 == 0 &&
         section_total == params[1] / 2 && metadata->block_size >= op->ne[0] &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 20, 3,
+            static_cast<uint64_t>(ggml_nrows(op)), 1, 1) &&
         std::isfinite(freq_base) && freq_base > 0.0f &&
         std::isfinite(freq_scale) && freq_scale == 1.0f &&
         std::isfinite(ext_factor) && ext_factor == 0.0f &&
@@ -2665,13 +2887,7 @@ static bool amd_supports_mrope(const amd_device_context * device, const ggml_ten
 }
 
 static bool amd_supports_silu(const amd_device_context * device, const ggml_tensor * op) {
-    return device != nullptr && device->aot != nullptr && op != nullptr &&
-        op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SILU &&
-        device->aot->find("flagos_silu_f32") != nullptr && op->src[0] != nullptr &&
-        amd_tensor_is_contiguous_f32(op) && amd_tensor_is_contiguous_f32(op->src[0]) &&
-        ggml_are_same_shape(op, op->src[0]) && ggml_nelements(op) > 0 &&
-        ggml_nelements(op) <= INT32_MAX &&
-        amd_tensor_output_can_reuse_input(op, op->src[0]);
+    return amd_supports_unary_f32(device, op, GGML_UNARY_OP_SILU, "flagos_silu_f32");
 }
 
 static bool amd_supports_set_rows(const amd_device_context * device, const ggml_tensor * op) {
@@ -2700,8 +2916,86 @@ static bool amd_supports_set_rows(const amd_device_context * device, const ggml_
         op->data != op->src[2]->data) {
         return false;
     }
-    return !amd_tensor_data_overlaps(op, op->src[0]) &&
+    const auto * metadata = device->aot->find("flagos_set_rows_f32_f16");
+    return metadata->block_size == 256 && metadata->num_warps == 4 && metadata->warp_size == 32 &&
+        metadata->shared_memory == 0 && metadata->static_shared_memory == 0 &&
+        amd_tensor_data_is_aligned(op, sizeof(uint16_t)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int64_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 6, 3,
+            (static_cast<uint64_t>(ggml_nelements(op->src[0])) + 255) / 256, 1, 1) &&
+        !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
+}
+
+#include "flagos-amd-batched-gather.inc"
+
+static bool amd_supports_batched_gather(const amd_device_context * device, const ggml_tensor * op) {
+    amd_batched_gather_launch launch;
+    return amd_describe_batched_gather(device, op, &launch);
+}
+
+// Called only after the corresponding tensor layout contract is established.
+// Keep grid calculation and the complete launch contract common to placement
+// and dispatch; the table may be F32, F16/BF16 or packed GGUF with an F16 alias.
+static bool amd_gather_launch_contract_fits(const amd_device_context * device,
+        const ggml_tensor * op, const char * kernel, int block_size, bool quantized) {
+    const auto * metadata = device->aot->find(kernel);
+    const uint64_t columns = static_cast<uint64_t>(op->ne[0]);
+    const uint64_t grid_y = (columns + block_size - 1) / block_size;
+    const size_t table_alignment = op->src[0]->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    const size_t arguments = quantized || op->src[0]->type != GGML_TYPE_F32 ? 5 : 4;
+    const size_t pointers = quantized ? 4 : 3;
+    return metadata != nullptr && metadata->block_size == block_size &&
+        metadata->num_warps == 4 && metadata->warp_size == 32 &&
+        metadata->shared_memory == 0 && metadata->static_shared_memory == 0 &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], table_alignment) &&
+        amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t)) &&
+        amd_kernel_launch_contract_fits(device, metadata, arguments, pointers,
+            std::max<uint64_t>(1, op->ne[1]), grid_y, 1);
+}
+
+static bool amd_supports_dense_get_rows(const amd_device_context * device, const ggml_tensor * op) {
+    flagos_amd::dense_gather_signature signature;
+    if (device == nullptr || device->aot == nullptr ||
+        !flagos_amd::describe_dense_gather(op, &signature)) {
+        return false;
+    }
+    return amd_gather_launch_contract_fits(device, op, "flagos_get_rows_f32",
+            flagos_amd::dense_gather_block_size, false) &&
+        (signature.rows == 0 || (!amd_tensor_data_overlaps(op, op->src[0]) &&
+                                !amd_tensor_data_overlaps(op, op->src[1])));
+}
+
+static const char * amd_half_get_rows_kernel_name(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr) {
+        return nullptr;
+    }
+    return op->src[0]->type == GGML_TYPE_F16 ? "flagos_get_rows_f16_f32"
+        : op->src[0]->type == GGML_TYPE_BF16 ? "flagos_get_rows_bf16_bits_f32" : nullptr;
+}
+
+static bool amd_supports_half_get_rows(const amd_device_context * device, const ggml_tensor * op) {
+    flagos_amd::dense_gather_signature signature;
+    const char * kernel = amd_half_get_rows_kernel_name(op);
+    if (!amd_env_enabled("FLAGOS_AMD_DENSE_FLOAT_OPS") || device == nullptr ||
+        device->aot == nullptr || kernel == nullptr ||
+        !flagos_amd::describe_dense_gather_storage(op, &signature, op->src[0]->type) ||
+        (int64_t(signature.columns) + 255) / 256 > 65535 ||
+        !amd_tensor_data_is_aligned(op, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[0], sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(op->src[1], sizeof(int32_t))) {
+        return false;
+    }
+    for (const auto * source : {op->src[0], op->src[1]}) {
+        const auto * output_root = op->view_src == nullptr ? op : op->view_src;
+        const auto * source_root = source->view_src == nullptr ? source : source->view_src;
+        if (output_root == source_root || amd_tensor_data_overlaps(op, source)) {
+            return false;
+        }
+    }
+    return amd_gather_launch_contract_fits(device, op, kernel, 256, false);
 }
 
 static bool amd_supports_get_rows(const amd_device_context * device, const ggml_tensor * op) {
@@ -2732,7 +3026,7 @@ static bool amd_supports_get_rows(const amd_device_context * device, const ggml_
     if (!amd_tensor_element_offsets_fit_i32(op->src[0], 1)) {
         return false;
     }
-    return device->aot->find(kernel) != nullptr &&
+    return amd_gather_launch_contract_fits(device, op, kernel, static_cast<int>(block_size), true) &&
         !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
@@ -2747,20 +3041,120 @@ static bool amd_i32_matrix_offsets_fit(
         signature.rows <= limit / signature.columns;
 }
 
+static const char * amd_strided_batched_float_kernel_name(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT) {
+        return nullptr;
+    }
+    const int32_t precision = ggml_get_op_params_i32(op, 0);
+    if (precision != GGML_PREC_DEFAULT && precision != GGML_PREC_F32) {
+        return nullptr;
+    }
+    bool preserve_src1 = precision == GGML_PREC_F32;
+#if GGML_BACKEND_API_VERSION >= 3
+    // Keep legacy F32 requests conservative, and honor the new source ranks
+    // independently. The IEEE export keeps both internal operands in F32.
+    for (int source = 0; source < 2; ++source) {
+        const int32_t minimum = ggml_get_op_params_i32(op, 2 + source);
+        if (minimum != GGML_PREC_DEFAULT && minimum != GGML_PREC_F32 &&
+            minimum != GGML_PREC_BF16 && minimum != GGML_PREC_F16 &&
+            minimum != GGML_PREC_Q8 && minimum != GGML_PREC_Q4) {
+            return nullptr;
+        }
+        preserve_src1 = preserve_src1 || minimum == GGML_PREC_F32 || minimum == GGML_PREC_BF16;
+    }
+#endif
+    if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32) {
+        return "flagos_mul_mat_f32_f32_strided_batched_ieee";
+    }
+    return preserve_src1 ? "flagos_mul_mat_f16_f32_strided_batched_ieee"
+                         : "flagos_mul_mat_f16_f32_strided_batched";
+}
+
+static bool amd_supports_strided_batched_float_mul_mat(
+        const amd_device_context * device, const ggml_tensor * op) {
+    flagos_amd::strided_float_matmul_signature signature;
+    if (device == nullptr || device->aot == nullptr ||
+        !flagos_amd::describe_strided_float_matmul(op, &signature)) {
+        return false;
+    }
+    const bool f16_weights = op->src[0]->type == GGML_TYPE_F16;
+    if (!amd_env_enabled(f16_weights ? "FLAGOS_AMD_STRIDED_BATCHED_F16_GEMM" : "FLAGOS_AMD_DENSE_FLOAT_OPS")) {
+        return false;
+    }
+    const char * kernel = amd_strided_batched_float_kernel_name(op);
+    if (kernel == nullptr) {
+        return false;
+    }
+    const auto * weights = op->src[0];
+    const auto * input = op->src[1];
+    for (const auto * source : {weights, input}) {
+        const size_t element_size = source == weights ? signature.weight_element_size : sizeof(float);
+        const auto * output_root = op->view_src == nullptr ? op : op->view_src;
+        const auto * source_root = source->view_src == nullptr ? source : source->view_src;
+        if (!amd_tensor_data_is_aligned(source, element_size) || output_root == source_root ||
+            amd_tensor_data_overlaps(op, source)) {
+            return false;
+        }
+    }
+    if (!amd_tensor_data_is_aligned(op, sizeof(float))) {
+        return false;
+    }
+    const auto * metadata = device->aot->find(kernel);
+    const int shared = std::strcmp(kernel, "flagos_mul_mat_f16_f32_strided_batched") == 0 ? 4096 : 6144;
+    return metadata != nullptr && metadata->argument_count == 15 && metadata->block_size == 32 &&
+        metadata->tile_m == 32 && metadata->tile_n == 16 && metadata->tile_k == 32 &&
+        metadata->num_warps == 4 && metadata->warp_size == 32 && metadata->shared_memory == shared &&
+        metadata->static_shared_memory == 0 && metadata->global_scratch_size == 0 &&
+        metadata->profile_scratch_size == 0 &&
+        amd_kernel_launch_contract_fits(device, metadata, 15, 3,
+            (static_cast<uint64_t>(signature.rows) + 31) / 32,
+            (static_cast<uint64_t>(signature.columns) + 15) / 16, signature.batches);
+}
+
+#include "flagos-amd-gemv.inc"
+
 static bool amd_supports_quantized_mul_mat(const amd_device_context * device, const ggml_tensor * op) {
-    if (device == nullptr || device->aot == nullptr || op == nullptr) {
+    if (device == nullptr || device->aot == nullptr || op == nullptr || op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const int32_t precision = ggml_get_op_params_i32(op, 0);
+    if (precision != GGML_PREC_DEFAULT && precision != GGML_PREC_F32) {
         return false;
     }
     flagos_quantized_matmul_signature signature;
-    if (!flagos_describe_quantized_matmul(op, &signature) ||
+    if (!amd_describe_quantized_matmul(op, &signature) ||
         !amd_i32_matrix_offsets_fit(signature)) {
         return false;
     }
-    const char * kernel = signature.columns == 1
-        ? amd_quantized_gemv_kernel(signature.weight_kind)
-        : amd_quantized_batched_kernel(device, signature.weight_kind);
-    return kernel != nullptr && device->aot->find(kernel) != nullptr &&
-        !amd_tensor_data_overlaps(op, op->src[0]) &&
+    if (!amd_tensor_data_is_aligned(op, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(op->src[0], sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(op->src[1], sizeof(float))) {
+        return false;
+    }
+    if (signature.columns == 1) {
+        amd_quantized_gemv_launch launch;
+        return amd_describe_quantized_gemv(device, op, signature.weight_kind,
+            signature.k, signature.rows, &launch) &&
+            !amd_tensor_data_overlaps(op, op->src[0]) &&
+            !amd_tensor_data_overlaps(op, op->src[1]);
+    }
+    const char * kernel = amd_quantized_batched_kernel(device, signature.weight_kind, amd_allows_f16_matmul(op));
+    const auto * metadata = kernel == nullptr ? nullptr : device->aot->find(kernel);
+    if (metadata == nullptr) {
+        return false;
+    }
+    if (signature.columns > 1) {
+        const bool tiled = std::strstr(kernel, "_tiled") != nullptr;
+        const int tile_m = tiled ? metadata->tile_m : 1;
+        const int tile_n = tiled ? metadata->tile_n : metadata->block_size;
+        if (tile_m <= 0 || tile_n <= 0 ||
+            !amd_kernel_launch_contract_fits(device, metadata, 7, 4,
+                (static_cast<uint64_t>(signature.rows) + tile_m - 1) / tile_m,
+                (static_cast<uint64_t>(signature.columns) + tile_n - 1) / tile_n, 1)) {
+            return false;
+        }
+    }
+    return !amd_tensor_data_overlaps(op, op->src[0]) &&
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
@@ -2888,8 +3282,8 @@ static bool amd_supports_gdn_gate_projections(
     }
     flagos_quantized_matmul_signature alpha_signature;
     flagos_quantized_matmul_signature beta_signature;
-    if (!flagos_describe_quantized_matmul(match.alpha_projection, &alpha_signature) ||
-        !flagos_describe_quantized_matmul(match.beta_projection, &beta_signature) ||
+    if (!amd_describe_quantized_matmul(match.alpha_projection, &alpha_signature) ||
+        !amd_describe_quantized_matmul(match.beta_projection, &beta_signature) ||
         !amd_i32_matrix_offsets_fit(alpha_signature) ||
         !amd_i32_matrix_offsets_fit(beta_signature) ||
         alpha_signature.weight_kind != flagos_quantized_matmul_kind::q8_0 ||
@@ -2924,14 +3318,21 @@ static bool amd_supports_gdn_gate_projections(
         return false;
     }
     for (const ggml_tensor * output : outputs) {
+        if (!amd_tensor_data_is_aligned(output, 16)) {
+            return false;
+        }
         for (const ggml_tensor * input : inputs) {
-            if (amd_tensor_data_overlaps(output, input)) {
+            if (!amd_tensor_data_is_aligned(input, 16) || amd_tensor_data_overlaps(output, input)) {
                 return false;
             }
         }
     }
-    return true;
+    return amd_kernel_launch_contract_fits(device, metadata, 11, 9,
+        (static_cast<uint64_t>(alpha_signature.rows) + metadata->block_size - 1) / metadata->block_size,
+        1, 1);
 }
+
+#include "flagos-amd-f16-ffn.inc"
 
 // The FFN fusion consumes the same quantized projections accepted by the
 // opt-in F16 dequant-cache path, but combines both projections and the
@@ -2943,7 +3344,7 @@ static bool amd_supports_ffn_swiglu_f16_layout(const amd_device_context * device
                                                const ggml_tensor * up,
                                                const ggml_tensor * glu) {
     if (device == nullptr || device->aot == nullptr || gate == nullptr || up == nullptr || glu == nullptr ||
-        gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        !amd_allows_f16_matmul(gate) || !amd_allows_f16_matmul(up) ||
         glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
         glu->src[0] == nullptr || glu->src[1] == nullptr ||
         !((glu->src[0] == gate && glu->src[1] == up) ||
@@ -2953,8 +3354,8 @@ static bool amd_supports_ffn_swiglu_f16_layout(const amd_device_context * device
 
     flagos_quantized_matmul_signature gate_signature;
     flagos_quantized_matmul_signature up_signature;
-    if (!flagos_describe_quantized_matmul(gate, &gate_signature) ||
-        !flagos_describe_quantized_matmul(up, &up_signature) ||
+    if (!amd_describe_quantized_matmul(gate, &gate_signature) ||
+        !amd_describe_quantized_matmul(up, &up_signature) ||
         !amd_i32_matrix_offsets_fit(gate_signature) ||
         !amd_i32_matrix_offsets_fit(up_signature)) {
         return false;
@@ -2973,7 +3374,11 @@ static bool amd_supports_ffn_swiglu_f16_layout(const amd_device_context * device
         gate->ne[0] != gate_signature.rows || gate->ne[1] != gate_signature.columns ||
         up->ne[0] != up_signature.rows || up->ne[1] != up_signature.columns ||
         activation->ne[0] != gate_signature.k || activation->ne[1] != gate_signature.columns ||
-        activation->ne[2] != 1 || activation->ne[3] != 1) {
+        activation->ne[2] != 1 || activation->ne[3] != 1 ||
+        reinterpret_cast<uintptr_t>(gate_weights->data) % sizeof(uint16_t) != 0 ||
+        reinterpret_cast<uintptr_t>(up_weights->data) % sizeof(uint16_t) != 0 ||
+        reinterpret_cast<uintptr_t>(activation->data) % sizeof(float) != 0 ||
+        reinterpret_cast<uintptr_t>(glu->data) % sizeof(float) != 0) {
         return false;
     }
     const auto has_dequant = [device](flagos_quantized_matmul_kind kind) {
@@ -3011,10 +3416,18 @@ static bool amd_supports_ffn_swiglu_f16(const amd_device_context * device,
                                         const ggml_tensor * gate,
                                         const ggml_tensor * up,
                                         const ggml_tensor * glu) {
-    return device != nullptr && device->aot != nullptr &&
-        amd_fusion_enabled(device, "ffn_swiglu") && amd_prefill_f16_gemm_enabled(device) &&
-        device->aot->find("flagos_ffn_swiglu_f16_f32_batched") != nullptr &&
-        amd_supports_ffn_swiglu_f16_layout(device, gate, up, glu);
+    if (!amd_supports_ffn_swiglu_f16_layout(device, gate, up, glu) ||
+        !amd_fusion_enabled(device, "ffn_swiglu") || !amd_prefill_f16_gemm_enabled(device)) {
+        return false;
+    }
+    flagos_quantized_matmul_signature signature;
+    amd_f16_ffn_launch launch;
+    // Cached weights are allocated at aligned arena boundaries; graph bindings
+    // may be unknown here and are rechecked with their final addresses later.
+    return amd_describe_quantized_matmul(gate, &signature) &&
+        amd_describe_f16_ffn(device, nullptr, nullptr, gate->src[1]->data, glu->data,
+            static_cast<int>(signature.k), static_cast<int>(signature.rows),
+            static_cast<int>(signature.columns), &launch);
 }
 
 // Store the graph-private GLU result as F16 scratch for the down projection.
@@ -3027,7 +3440,7 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
         !amd_fusion_enabled(device, "ffn_swiglu_down") || !amd_prefill_f16_gemm_enabled(device) ||
         !amd_ffn_down_f16_enabled(device) ||
         !amd_supports_ffn_swiglu_f16_layout(device, gate, up, glu) ||
-        down->op != GGML_OP_MUL_MAT || down->src[1] != glu) {
+        !amd_allows_f16_matmul(down) || down->src[1] != glu) {
         return false;
     }
 
@@ -3042,9 +3455,9 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
     flagos_quantized_matmul_signature gate_signature;
     flagos_quantized_matmul_signature up_signature;
     flagos_quantized_matmul_signature down_signature;
-    if (!flagos_describe_quantized_matmul(gate, &gate_signature) ||
-        !flagos_describe_quantized_matmul(up, &up_signature) ||
-        !flagos_describe_quantized_matmul(down, &down_signature) ||
+    if (!amd_describe_quantized_matmul(gate, &gate_signature) ||
+        !amd_describe_quantized_matmul(up, &up_signature) ||
+        !amd_describe_quantized_matmul(down, &down_signature) ||
         gate_signature.columns <= 1 || gate_signature.columns != up_signature.columns ||
         gate_signature.columns != down_signature.columns ||
         gate_signature.rows != up_signature.rows || gate_signature.rows != down_signature.k ||
@@ -3053,6 +3466,8 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
         !amd_i32_matrix_offsets_fit(up_signature) ||
         !amd_i32_matrix_offsets_fit(down_signature) ||
         down->ne[0] != down_signature.rows || down->ne[1] != down_signature.columns ||
+        reinterpret_cast<uintptr_t>(down->data) % sizeof(float) != 0 ||
+        reinterpret_cast<uintptr_t>(down->src[0]->data) % sizeof(uint16_t) != 0 ||
         !ggml_is_contiguous(down) || !ggml_is_contiguous(down->src[0]) ||
         !amd_grouped_f16_ffn_enabled(device, static_cast<int>(gate_signature.columns))) {
         return false;
@@ -3062,17 +3477,16 @@ static bool amd_supports_ffn_swiglu_down_f16(const amd_device_context * device,
         return false;
     }
 
-    const auto grid_fits = [](int64_t rows, int64_t columns,
-                              int tile_m, int tile_n) {
-        const uint64_t blocks_m = (static_cast<uint64_t>(rows) + tile_m - 1) / tile_m;
-        const uint64_t blocks_n = (static_cast<uint64_t>(columns) + tile_n - 1) / tile_n;
-        return blocks_m != 0 && blocks_n != 0 &&
-            blocks_m <= std::numeric_limits<unsigned int>::max() / blocks_n;
+    const auto grid_fits = [device](int64_t rows, int64_t columns,
+            const flagos_amd::kernel_metadata * metadata, size_t arguments, size_t pointers) {
+        const uint64_t blocks_m = (static_cast<uint64_t>(rows) + metadata->tile_m - 1) / metadata->tile_m;
+        const uint64_t blocks_n = (static_cast<uint64_t>(columns) + metadata->tile_n - 1) / metadata->tile_n;
+        return amd_kernel_launch_contract_fits(device, metadata, arguments, pointers,
+            blocks_m * blocks_n, 1, 1);
     };
-    if (!grid_fits(gate_signature.rows, gate_signature.columns,
-                   ffn_metadata->tile_m, ffn_metadata->tile_n) ||
-        !grid_fits(down_signature.rows, down_signature.columns,
-                   down_metadata->tile_m, down_metadata->tile_n)) {
+    // Both launches must be legal before the first one can write private scratch.
+    if (!grid_fits(gate_signature.rows, gate_signature.columns, ffn_metadata, 7, 4) ||
+        !grid_fits(down_signature.rows, down_signature.columns, down_metadata, 6, 3)) {
         return false;
     }
 
@@ -3134,7 +3548,7 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
                                               const ggml_tensor * glu) {
     if (device == nullptr || device->aot == nullptr || gate == nullptr || up == nullptr || glu == nullptr ||
         !amd_fusion_enabled(device, "ffn_swiglu") ||
-        gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        !amd_allows_f16_matmul(gate) || !amd_allows_f16_matmul(up) ||
         glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
         glu->src[0] == nullptr || glu->src[1] == nullptr ||
         !((glu->src[0] == gate && glu->src[1] == up) ||
@@ -3143,8 +3557,8 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
     }
     flagos_quantized_matmul_signature gate_signature;
     flagos_quantized_matmul_signature up_signature;
-    if (!flagos_describe_quantized_matmul(gate, &gate_signature) ||
-        !flagos_describe_quantized_matmul(up, &up_signature) ||
+    if (!amd_describe_quantized_matmul(gate, &gate_signature) ||
+        !amd_describe_quantized_matmul(up, &up_signature) ||
         gate_signature.weight_kind != up_signature.weight_kind ||
         (gate_signature.weight_kind != flagos_quantized_matmul_kind::q4_0 &&
          gate_signature.weight_kind != flagos_quantized_matmul_kind::q4_k) ||
@@ -3180,6 +3594,15 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
         return false;
     }
 
+    if (!amd_kernel_launch_contract_fits(device, metadata, 8, 6,
+            (static_cast<uint64_t>(gate_signature.rows) + row_tile - 1) / row_tile, 1, 1) ||
+        !amd_tensor_data_is_aligned(gate_weights, sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(up_weights, sizeof(uint16_t)) ||
+        !amd_tensor_data_is_aligned(activation, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(glu, sizeof(float))) {
+        return false;
+    }
+
     if (amd_tensor_data_overlaps(glu, activation) ||
         amd_tensor_data_overlaps(glu, gate_weights) ||
         amd_tensor_data_overlaps(glu, up_weights)) {
@@ -3192,12 +3615,19 @@ static bool amd_supports_ffn_swiglu_q4_decode(const amd_device_context * device,
     return gate->data == nullptr || up->data == nullptr || gate->data != up->data;
 }
 
-static bool amd_supports_rope_kv_store(const amd_device_context * device,
+static bool amd_rope_kv_launch_contract_fits(const amd_device_context * device, const ggml_tensor * view) {
+    const auto * metadata = device->aot->find("flagos_rope_kv_store_f32_f16");
+    return metadata != nullptr && metadata->block_size > 0 &&
+        amd_kernel_launch_contract_fits(device, metadata, 12, 4,
+            (static_cast<uint64_t>(ggml_nelements(view)) + metadata->block_size - 1) /
+                metadata->block_size, 1, 1);
+}
+
+static bool amd_supports_rope_kv_store_tensors(const amd_device_context * device,
                                        const ggml_tensor * rope,
                                        const ggml_tensor * view,
                                        const ggml_tensor * set_rows) {
     return device != nullptr && device->aot != nullptr &&
-        device->aot->find("flagos_rope_kv_store_f32_f16") != nullptr &&
         rope != nullptr && view != nullptr && set_rows != nullptr &&
         amd_supports_rope_neox(device, rope) &&
         view->op == GGML_OP_VIEW && view->src[0] == rope &&
@@ -3213,6 +3643,12 @@ static bool amd_supports_rope_kv_store(const amd_device_context * device,
         !amd_tensor_data_overlaps(set_rows, rope->src[0]) &&
         !amd_tensor_data_overlaps(set_rows, rope->src[1]) &&
         amd_supports_set_rows(device, set_rows);
+}
+
+static bool amd_supports_rope_kv_store(const amd_device_context * device,
+        const ggml_tensor * rope, const ggml_tensor * view, const ggml_tensor * set_rows) {
+    return amd_supports_rope_kv_store_tensors(device, rope, view, set_rows) &&
+        amd_rope_kv_launch_contract_fits(device, view);
 }
 
 static bool amd_supports_rms_norm_mul_rope(
@@ -3263,10 +3699,18 @@ static bool amd_supports_rms_norm_mul_rope(
         amd_tensor_data_overlaps(output, rope->src[1])) {
         return false;
     }
+    if (!amd_tensor_data_is_aligned(norm->src[0], sizeof(float)) ||
+        !amd_tensor_data_is_aligned(weight, sizeof(float)) ||
+        !amd_tensor_data_is_aligned(rope->src[1], sizeof(int32_t)) ||
+        !amd_tensor_data_is_aligned(output, store ? sizeof(uint16_t) : sizeof(float)) ||
+        !amd_kernel_launch_contract_fits(device, metadata, store ? 13 : 11, store ? 5 : 4,
+            static_cast<uint64_t>(norm->ne[1]) * norm->ne[2], 1, 1)) {
+        return false;
+    }
     if (!store) {
         return true;
     }
-    return view != nullptr && amd_supports_rope_kv_store(device, rope, view, set_rows) &&
+    return view != nullptr && amd_supports_rope_kv_store_tensors(device, rope, view, set_rows) &&
         set_rows->src[1]->data != nullptr && !amd_tensor_data_overlaps(set_rows, set_rows->src[1]);
 }
 
@@ -3281,101 +3725,28 @@ static bool amd_supports_swiglu(const amd_device_context * device, const ggml_te
         ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
         ggml_nelements(op) > 0 && ggml_nelements(op) <= INT32_MAX &&
         amd_tensor_output_can_reuse_input(op, op->src[0]) &&
-        amd_tensor_output_can_reuse_input(op, op->src[1]);
+        amd_tensor_output_can_reuse_input(op, op->src[1]) &&
+        amd_elementwise_launch_contract_fits(device, op, "flagos_swiglu_split_f32", 4, 3);
 }
 
-static bool amd_supports_flash_attn_decode(const amd_device_context * device, const ggml_tensor * op) {
-    float scale = 0.0f;
-    float max_bias = 0.0f;
-    float logit_softcap = 0.0f;
-    if (!amd_fusion_enabled(device, "flash_attn_decode") || device == nullptr || device->aot == nullptr || op == nullptr ||
-        op->op != GGML_OP_FLASH_ATTN_EXT || device->aot->find("flagos_flash_attn_decode_f32_f16") == nullptr) {
-        return false;
-    }
-    const auto * op_params_bytes = reinterpret_cast<const uint8_t *>(op->op_params);
-    std::memcpy(&scale, op_params_bytes, sizeof(scale));
-    std::memcpy(&max_bias, op_params_bytes + sizeof(float), sizeof(max_bias));
-    std::memcpy(&logit_softcap, op_params_bytes + 2 * sizeof(float), sizeof(logit_softcap));
-    const ggml_tensor * q = op->src[0];
-    const ggml_tensor * k = op->src[1];
-    const ggml_tensor * v = op->src[2];
-    const ggml_tensor * mask = op->src[3];
-    return q && k && v && mask && op->src[4] == nullptr &&
-        op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
-        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && mask->type == GGML_TYPE_F16 &&
-        op->ne[0] == 128 && op->ne[1] > 0 && op->ne[1] <= INT32_MAX && op->ne[2] == 1 && op->ne[3] == 1 &&
-        q->ne[0] == 128 && q->ne[1] == 1 && q->ne[2] == op->ne[1] && q->ne[3] == 1 &&
-        k->ne[0] == 128 && k->ne[1] > 0 && k->ne[1] <= INT32_MAX && k->ne[2] > 0 && k->ne[2] <= INT32_MAX && k->ne[3] == 1 &&
-        q->ne[2] % k->ne[2] == 0 && ggml_are_same_shape(k, v) &&
-        mask->ne[0] == k->ne[1] && mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
-        q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
-        k->nb[1] >= 256 * sizeof(ggml_fp16_t) && k->nb[2] == 128 * sizeof(ggml_fp16_t) &&
-        v->nb[1] == k->nb[1] && v->nb[2] == k->nb[2] &&
-        amd_tensor_element_offsets_fit_i32(q, sizeof(float)) &&
-        amd_tensor_element_offsets_fit_i32(k, sizeof(ggml_fp16_t)) &&
-        amd_tensor_element_offsets_fit_i32(v, sizeof(ggml_fp16_t)) &&
-        amd_tensor_element_offsets_fit_i32(mask, sizeof(ggml_fp16_t)) &&
-        amd_tensor_element_offsets_fit_i32(op, sizeof(float)) &&
-        q->nb[1] / sizeof(float) <= INT32_MAX && q->nb[2] / sizeof(float) <= INT32_MAX &&
-        k->nb[1] / sizeof(ggml_fp16_t) <= INT32_MAX && k->nb[2] / sizeof(ggml_fp16_t) <= INT32_MAX &&
-        v->nb[1] / sizeof(ggml_fp16_t) <= INT32_MAX && v->nb[2] / sizeof(ggml_fp16_t) <= INT32_MAX &&
-        op->nb[1] / sizeof(float) <= INT32_MAX && op->nb[2] / sizeof(float) <= INT32_MAX &&
-        ggml_is_contiguous(mask) && ggml_is_contiguous(op) &&
-        std::isfinite(scale) && max_bias == 0.0f && logit_softcap == 0.0f &&
-        !amd_tensor_data_overlaps(op, q) && !amd_tensor_data_overlaps(op, k) &&
-        !amd_tensor_data_overlaps(op, v) && !amd_tensor_data_overlaps(op, mask);
-}
+#include "flagos-amd-geglu.inc"
+#include "flagos-amd-moe.inc"
+#include "flagos-amd-argsort.inc"
+#include "flagos-amd-attention.inc"
 
-static bool amd_supports_flash_attn_prefill(const amd_device_context * device, const ggml_tensor * op) {
-    float scale = 0.0f;
-    float max_bias = 0.0f;
-    float logit_softcap = 0.0f;
-    if (!amd_fusion_enabled(device, "flash_attn_prefill") || device == nullptr || device->aot == nullptr || op == nullptr ||
-        op->op != GGML_OP_FLASH_ATTN_EXT ||
-        device->aot->find("flagos_flash_attn_prefill_f32_f16") == nullptr) {
-        return false;
+static const char * amd_soft_max_kernel_name(const ggml_tensor * op) {
+    const ggml_tensor * mask = op->src[1];
+    if (mask == nullptr) {
+        return "flagos_soft_max_unmasked_f32";
     }
-    const auto * op_params_bytes = reinterpret_cast<const uint8_t *>(op->op_params);
-    std::memcpy(&scale, op_params_bytes, sizeof(scale));
-    std::memcpy(&max_bias, op_params_bytes + sizeof(float), sizeof(max_bias));
-    std::memcpy(&logit_softcap, op_params_bytes + 2 * sizeof(float), sizeof(logit_softcap));
-    const ggml_tensor * q = op->src[0];
-    const ggml_tensor * k = op->src[1];
-    const ggml_tensor * v = op->src[2];
-    const ggml_tensor * mask = op->src[3];
-    // The first prefill implementation deliberately uses one contiguous
-    // F16 mask plane shared by all heads/batches.  More general broadcast and
-    // ALiBi variants remain provider capabilities that can be added later
-    // without changing the common pattern ABI.
-    return q && k && v && mask && op->src[4] == nullptr &&
-        op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
-        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
-        mask->type == GGML_TYPE_F16 && q->ne[1] > 1 && q->ne[1] <= INT32_MAX &&
-        op->ne[0] == 128 && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
-        op->ne[1] == q->ne[2] && op->ne[2] == q->ne[1] && op->ne[3] == q->ne[3] &&
-        q->ne[2] > 0 && q->ne[2] <= INT32_MAX && q->ne[3] == 1 &&
-        k->ne[1] > 0 && k->ne[1] <= INT32_MAX && k->ne[2] > 0 && k->ne[2] <= INT32_MAX &&
-        k->ne[3] == 1 && v->ne[1] == k->ne[1] && v->ne[2] == k->ne[2] && v->ne[3] == 1 &&
-        q->ne[2] % k->ne[2] == 0 &&
-        mask->ne[0] >= k->ne[1] && mask->ne[1] >= q->ne[1] &&
-        mask->ne[2] == 1 && mask->ne[3] == 1 &&
-        q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) &&
-        v->nb[0] == sizeof(ggml_fp16_t) && mask->nb[0] == sizeof(ggml_fp16_t) &&
-        op->nb[0] == sizeof(float) && q->nb[1] / sizeof(float) <= INT32_MAX &&
-        q->nb[2] / sizeof(float) <= INT32_MAX && k->nb[1] / sizeof(ggml_fp16_t) <= INT32_MAX &&
-        k->nb[2] / sizeof(ggml_fp16_t) <= INT32_MAX &&
-        v->nb[1] / sizeof(ggml_fp16_t) <= INT32_MAX && v->nb[2] / sizeof(ggml_fp16_t) <= INT32_MAX &&
-        mask->nb[1] / sizeof(ggml_fp16_t) <= INT32_MAX &&
-        amd_tensor_element_offsets_fit_i32(q, sizeof(float)) &&
-        amd_tensor_element_offsets_fit_i32(k, sizeof(ggml_fp16_t)) &&
-        amd_tensor_element_offsets_fit_i32(v, sizeof(ggml_fp16_t)) &&
-        amd_tensor_element_offsets_fit_i32(mask, sizeof(ggml_fp16_t)) &&
-        amd_tensor_element_offsets_fit_i32(op, sizeof(float)) &&
-        op->nb[1] / sizeof(float) <= INT32_MAX && op->nb[2] / sizeof(float) <= INT32_MAX &&
-        ggml_is_contiguous(mask) && ggml_is_contiguous(op) &&
-        std::isfinite(scale) && max_bias == 0.0f && logit_softcap == 0.0f &&
-        !amd_tensor_data_overlaps(op, q) && !amd_tensor_data_overlaps(op, k) &&
-        !amd_tensor_data_overlaps(op, v) && !amd_tensor_data_overlaps(op, mask);
+    if (mask->type == GGML_TYPE_F32 && op->ne[0] > 512) {
+        if (op->ne[0] <= 1024) { return "flagos_soft_max_masked_broadcast_f32_b1024_w4"; }
+        if (op->ne[0] <= 2048) { return "flagos_soft_max_masked_broadcast_f32_b2048_w4"; }
+        if (op->ne[0] <= 4096) { return "flagos_soft_max_masked_broadcast_f32_b4096_w4"; }
+        if (op->ne[0] <= 8192) { return "flagos_soft_max_masked_broadcast_f32_b8192_w8"; }
+        return nullptr;
+    }
+    return mask->type == GGML_TYPE_F32 ? "flagos_soft_max_masked_broadcast_f32" : "flagos_soft_max_masked_f32_f16";
 }
 
 static bool amd_supports_soft_max(const amd_device_context * device, const ggml_tensor * op) {
@@ -3388,14 +3759,6 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
         ggml_nelements(op) > INT32_MAX || op->src[2] != nullptr) {
         return false;
     }
-    // The current AMD Triton reduction is validated for power-of-two row
-    // widths.  Non-power-of-two masked reductions can produce materially wrong
-    // results on gfx1150 due to the backend's masked warp-reduction lowering;
-    // keep those shapes on the reference scheduler until a dedicated kernel
-    // variant is available.
-    if ((op->ne[0] & (op->ne[0] - 1)) != 0) {
-        return false;
-    }
     float scale = 1.0f;
     float max_bias = 0.0f;
     std::memcpy(&scale, op->op_params, sizeof(scale));
@@ -3405,12 +3768,52 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
         return false;
     }
     const ggml_tensor * mask = op->src[1];
-    const char * kernel = mask == nullptr
-        ? "flagos_soft_max_unmasked_f32" : "flagos_soft_max_masked_f32_f16";
+    const char * kernel = amd_soft_max_kernel_name(op);
+    const bool broadcast_f32 = mask != nullptr && mask->type == GGML_TYPE_F32;
+    const bool wide = broadcast_f32 && op->ne[0] > 512;
+    // Keep the observed gfx1150 non-power-of-two reduction failure gated.
+    if (kernel == nullptr || (wide && !amd_env_enabled("FLAGOS_AMD_WIDE_BROADCAST_SOFTMAX")) ||
+        ((op->ne[0] & (op->ne[0] - 1)) != 0 &&
+         (!wide || !amd_env_enabled("FLAGOS_AMD_PADDED_BROADCAST_SOFTMAX")))) {
+        return false;
+    }
+    if (broadcast_f32) {
+        if (!amd_env_enabled("FLAGOS_AMD_BROADCAST_SOFTMAX") || !ggml_is_contiguous(mask) ||
+            mask->ne[0] != op->ne[0] || mask->ne[1] < op->ne[1] || mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
+            op->ne[2] % mask->ne[2] != 0 || op->ne[3] % mask->ne[3] != 0 ||
+            ggml_nelements(mask) > INT32_MAX || !amd_tensor_element_offsets_fit_i32(mask, sizeof(float)) ||
+            !amd_tensor_data_is_aligned(op, sizeof(float)) ||
+            !amd_tensor_data_is_aligned(op->src[0], sizeof(float)) ||
+            !amd_tensor_data_is_aligned(mask, sizeof(float))) {
+            return false;
+        }
+        for (int dimension = 0; dimension < 3; ++dimension) {
+            if (device->props.maxGridSize[dimension] > 0 && op->ne[dimension + 1] > device->props.maxGridSize[dimension]) {
+                return false;
+            }
+        }
+        const auto * metadata = device->aot->find(kernel);
+        int block = 512;
+        while (block < op->ne[0]) { block *= 2; }
+        const int warps = block == 8192 ? 8 : 4;
+        if (metadata == nullptr || metadata->argument_count != 12 || metadata->block_size != block ||
+            metadata->num_warps != warps || metadata->warp_size != 32 || metadata->shared_memory != warps * 4 ||
+            metadata->tile_m != 0 || metadata->tile_n != 0 || metadata->tile_k != 0 ||
+            metadata->static_shared_memory != 0 ||
+            metadata->global_scratch_size != 0 || metadata->profile_scratch_size != 0) {
+            return false;
+        }
+        const auto * output_root = op->view_src == nullptr ? op : op->view_src;
+        const auto * mask_root = mask->view_src == nullptr ? mask : mask->view_src;
+        const auto * input_root = op->src[0]->view_src == nullptr ? op->src[0] : op->src[0]->view_src;
+        if ((output_root == input_root && op->view_offs != op->src[0]->view_offs) || output_root == mask_root) {
+            return false;
+        }
+    }
     if (device->aot->find(kernel) == nullptr) {
         return false;
     }
-    if (mask != nullptr &&
+    if (mask != nullptr && !broadcast_f32 &&
         (mask->type != GGML_TYPE_F16 ||
          mask->ne[0] != op->ne[0] || mask->ne[1] != op->ne[1] ||
          mask->ne[2] != op->ne[2] || mask->ne[3] != op->ne[3] ||
@@ -3419,182 +3822,26 @@ static bool amd_supports_soft_max(const amd_device_context * device, const ggml_
     }
     const auto * metadata = device->aot->find(kernel);
     return metadata != nullptr && metadata->block_size >= op->ne[0] &&
+        amd_kernel_launch_contract_fits(device, metadata, broadcast_f32 ? 12 : 5, 3,
+            broadcast_f32 ? op->ne[1] : ggml_nelements(op) / op->ne[0],
+            broadcast_f32 ? op->ne[2] : 1, broadcast_f32 ? op->ne[3] : 1) &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        (mask == nullptr || amd_tensor_data_is_aligned(mask, mask->type == GGML_TYPE_F16 ? sizeof(uint16_t) : sizeof(float))) &&
         amd_tensor_output_can_reuse_input(op, op->src[0]) &&
         (mask == nullptr || !amd_tensor_data_overlaps(op, mask));
 }
 
-static bool amd_supports_rms_norm_mul(const amd_device_context * device,
-                                      const ggml_tensor * norm,
-                                      const ggml_tensor * mul) {
-    if (device == nullptr || device->aot == nullptr || norm == nullptr || mul == nullptr ||
-        device->aot->find("flagos_rms_norm_mul_f32") == nullptr ||
-        norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || norm->src[0] == nullptr ||
-        norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
-        !ggml_are_same_shape(norm, norm->src[0]) || !ggml_are_same_shape(mul, norm) ||
-        norm->ne[0] <= 0 || norm->ne[0] > INT32_MAX || norm->ne[0] % 4 != 0 ||
-        norm->ne[0] > 4096 || ggml_nelements(norm) > INT32_MAX ||
-        !ggml_is_contiguous(norm) || !ggml_is_contiguous(norm->src[0]) || !ggml_is_contiguous(mul)) {
-        return false;
-    }
-    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] :
-        (mul->src[1] == norm ? mul->src[0] : nullptr);
-    if (weight == nullptr || weight->type != GGML_TYPE_F32 ||
-        weight->ne[0] != norm->ne[0] || weight->ne[1] != 1 ||
-        weight->ne[2] != 1 || weight->ne[3] != 1 ||
-        !ggml_is_contiguous(weight) || norm->data == nullptr || mul->data == nullptr ||
-        norm->src[0]->data == nullptr || weight->data == nullptr) {
-        return false;
-    }
-    if (amd_tensor_data_overlaps(norm, norm->src[0]) || amd_tensor_data_overlaps(norm, weight) ||
-        amd_tensor_data_overlaps(mul, norm->src[0]) || amd_tensor_data_overlaps(mul, weight)) {
-        return false;
-    }
-    float eps = 0.0f;
-    std::memcpy(&eps, norm->op_params, sizeof(eps));
-    if (!std::isfinite(eps) || eps < 0.0f) {
-        return false;
-    }
-    const auto * metadata = device->aot->find("flagos_rms_norm_mul_f32");
-    return metadata->block_size >= norm->ne[0];
-}
-
-static bool amd_supports_add_rms_norm_mul(const amd_device_context * device,
-                                          const ggml_tensor * add,
-                                          const ggml_tensor * norm,
-                                          const ggml_tensor * mul);
-
-static bool amd_supports_add_rms_norm_mul(const amd_device_context * device,
-                                          const ggml_tensor * add,
-                                          const ggml_tensor * norm,
-                                          const ggml_tensor * mul) {
-    if (device == nullptr || device->aot == nullptr || add == nullptr ||
-        !amd_supports_rms_norm_mul(device, norm, mul) ||
-        device->aot->find("flagos_add_rms_norm_mul_f32") == nullptr ||
-        add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
-        add->src[0] == nullptr || add->src[1] == nullptr ||
-        norm->src[0] != add ||
-        !ggml_are_same_shape(add, norm) || !ggml_is_contiguous(add) ||
-        add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
-        !ggml_are_same_shape(add->src[0], norm) || !ggml_are_same_shape(add->src[1], norm) ||
-        !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1]) ||
-        add->src[0]->data == nullptr || add->src[1]->data == nullptr) {
-        return false;
-    }
-    if (amd_tensor_data_overlaps(norm, add->src[0]) ||
-        amd_tensor_data_overlaps(norm, add->src[1]) ||
-        amd_tensor_data_overlaps(mul, add->src[0]) ||
-        amd_tensor_data_overlaps(mul, add->src[1])) {
-        return false;
-    }
-    const auto * metadata = device->aot->find("flagos_add_rms_norm_mul_f32");
-    return metadata->block_size >= norm->ne[0];
-}
-
-static const char * amd_rms_norm_mul_inplace_kernel(
-        const amd_device_context * device, int64_t n_cols) {
-    if (device == nullptr || device->aot == nullptr || n_cols <= 0) {
-        return nullptr;
-    }
-    if (const auto * narrow = device->aot->find(
-            "flagos_rms_norm_mul_inplace_f32_narrow")) {
-        if (narrow->exact_block_size && narrow->block_size == n_cols) {
-            return "flagos_rms_norm_mul_inplace_f32_narrow";
-        }
-    }
-    const auto * generic = device->aot->find("flagos_rms_norm_mul_inplace_f32");
-    return generic != nullptr && generic->block_size >= n_cols
-        ? "flagos_rms_norm_mul_inplace_f32" : nullptr;
-}
-
-static bool amd_supports_rms_norm_mul_inplace(const amd_device_context * device,
-                                              const ggml_tensor * norm,
-                                              const ggml_tensor * mul) {
-    const ggml_tensor * weight = mul != nullptr && mul->src[0] == norm ? mul->src[1] :
-        (mul != nullptr ? mul->src[0] : nullptr);
-    return device != nullptr && device->aot != nullptr && norm != nullptr && mul != nullptr &&
-        norm->data != nullptr && norm->data == mul->data &&
-        amd_rms_norm_mul_inplace_kernel(device, norm->ne[0]) != nullptr &&
-        amd_supports_rms_norm_mul(device, norm, mul) &&
-        norm->src[0]->data != norm->data && weight != nullptr && weight->data != norm->data;
-}
-
-static bool amd_supports_add_rms_norm_mul_inplace(const amd_device_context * device,
-                                                  const ggml_tensor * add,
-                                                  const ggml_tensor * norm,
-                                                  const ggml_tensor * mul) {
-    if (device == nullptr || add == nullptr || norm == nullptr || mul == nullptr ||
-        norm->data == nullptr || norm->data != mul->data ||
-        device->aot == nullptr || device->aot->find("flagos_add_rms_norm_mul_inplace_f32") == nullptr ||
-        !amd_supports_add_rms_norm_mul(device, add, norm, mul) ||
-        add->src[0]->data == norm->data || add->src[1]->data == norm->data) {
-        return false;
-    }
-    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
-    return weight != nullptr && weight->data != norm->data;
-}
-
-static const char * amd_add_rms_norm_mul_residual_kernel(
-        const amd_device_context * device, int64_t n_cols) {
-    if (device == nullptr || device->aot == nullptr || n_cols <= 0) {
-        return nullptr;
-    }
-    const char * best_name = nullptr;
-    int best_capacity = INT_MAX;
-    for (const char * name : {
-            "flagos_add_rms_norm_mul_residual_f32_narrow",
-            "flagos_add_rms_norm_mul_residual_f32" }) {
-        const auto * metadata = device->aot->find(name);
-        if (metadata != nullptr && metadata->block_size >= n_cols &&
-            metadata->block_size < best_capacity) {
-            best_name = name;
-            best_capacity = metadata->block_size;
-        }
-    }
-    return best_name;
-}
-
-static bool amd_supports_add_rms_norm_mul_residual(const amd_device_context * device,
-                                                   const ggml_tensor * add,
-                                                   const ggml_tensor * norm,
-                                                   const ggml_tensor * mul) {
-    if (device == nullptr || device->aot == nullptr || add == nullptr || norm == nullptr || mul == nullptr ||
-        add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
-        add->src[0] == nullptr || add->src[1] == nullptr || norm->src[0] != add ||
-        add->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
-        add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
-        !ggml_are_same_shape(add, add->src[0]) || !ggml_are_same_shape(add, add->src[1]) ||
-        !ggml_are_same_shape(norm, add) || !ggml_are_same_shape(mul, norm) ||
-        !ggml_is_contiguous(add) || !ggml_is_contiguous(norm) || !ggml_is_contiguous(mul) ||
-        !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1]) ||
-        add->ne[0] <= 0 || add->ne[0] > 4096 || add->ne[0] % 4 != 0 ||
-        ggml_nelements(add) > INT32_MAX || add->data == nullptr || mul->data == nullptr ||
-        add->src[0]->data == nullptr || add->src[1]->data == nullptr) {
-        return false;
-    }
-    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] :
-        (mul->src[1] == norm ? mul->src[0] : nullptr);
-    float eps = 0.0f;
-    std::memcpy(&eps, norm->op_params, sizeof(eps));
-    return weight != nullptr && weight->type == GGML_TYPE_F32 &&
-        weight->ne[0] == norm->ne[0] && weight->ne[1] == 1 &&
-        weight->ne[2] == 1 && weight->ne[3] == 1 && ggml_is_contiguous(weight) &&
-        weight->data != nullptr &&
-        amd_add_rms_norm_mul_residual_kernel(device, norm->ne[0]) != nullptr &&
-        std::isfinite(eps) && eps >= 0.0f &&
-        !amd_tensor_data_overlaps(add, mul) &&
-        !amd_tensor_data_overlaps(add, weight) &&
-        !amd_tensor_data_overlaps(mul, weight) &&
-        amd_tensor_output_can_reuse_input(add, add->src[0]) &&
-        amd_tensor_output_can_reuse_input(add, add->src[1]) &&
-        amd_tensor_output_can_reuse_input(mul, add->src[0]) &&
-        amd_tensor_output_can_reuse_input(mul, add->src[1]);
-}
+#include "flagos-amd-normalization-fusion.inc"
 
 static flagos_lowering_choice amd_query_fusion(
         void * user_data, const ggml_cgraph * cgraph, const flagos_pattern_candidate & candidate) {
     auto * context = static_cast<amd_backend_context *>(user_data);
     flagos_lowering_choice choice;
-    if (context == nullptr || cgraph == nullptr || candidate.node_indices.empty()) {
+    // This provider executes every pattern node itself; it cannot skip
+    // absorbed producers.
+    if (context == nullptr || cgraph == nullptr || candidate.node_indices.empty() ||
+        !candidate.absorbed_node_indices.empty()) {
         return choice;
     }
     if (candidate.id == flagos_pattern_id::rms_norm_mul_rope && candidate.node_indices.size() == 3) {
@@ -3722,7 +3969,7 @@ static flagos_lowering_choice amd_query_fusion(
         const ggml_tensor * snapshot_view = copy->src[0];
         if (amd_fusion_enabled(context->device, "gated_delta_net_cache")) {
             const bool cache_only_outputs =
-                amd_gated_delta_net_cache_only_outputs_are_safe(
+                flagos_amd::gdn_cache_only_outputs_are_safe(
                     cgraph, candidate, gdn, copy);
             const bool cache_only_decode = cache_only_outputs &&
                 amd_supports_gated_delta_net_cache(
@@ -3746,7 +3993,10 @@ static flagos_lowering_choice amd_query_fusion(
             amd_supports_flash_attn_decode(context->device, attention)) {
             choice.supported = true;
             choice.capture_safe = true;
-            choice.implementation_id = 3;
+            choice.implementation_id = amd_splitkv_ready(context, attention) ? 20 : 3;
+            if (choice.implementation_id == 20 && amd_grouped_splitkv_kernel(context->device, attention) != nullptr) {
+                choice.implementation_id = 21;
+            }
         }
     } else if (candidate.id == flagos_pattern_id::flash_attn_prefill && candidate.node_indices.size() == 1) {
         const ggml_tensor * attention = cgraph->nodes[candidate.node_indices[0]];
@@ -3765,9 +4015,9 @@ static flagos_lowering_choice amd_query_fusion(
         flagos_quantized_matmul_signature second_signature;
         flagos_quantized_matmul_signature down_signature;
         const bool described =
-            flagos_describe_quantized_matmul(first_projection, &first_signature) &&
-            flagos_describe_quantized_matmul(second_projection, &second_signature) &&
-            flagos_describe_quantized_matmul(down_projection, &down_signature);
+            amd_describe_quantized_matmul(first_projection, &first_signature) &&
+            amd_describe_quantized_matmul(second_projection, &second_signature) &&
+            amd_describe_quantized_matmul(down_projection, &down_signature);
         if (amd_candidate_outputs_are(candidate, { 3 }) &&
             amd_supports_ffn_swiglu_down_f16(
                 context->device, first_projection, second_projection, glu, down_projection) &&
@@ -3792,8 +4042,8 @@ static flagos_lowering_choice amd_query_fusion(
         flagos_quantized_matmul_signature first_signature;
         flagos_quantized_matmul_signature second_signature;
         const bool described =
-            flagos_describe_quantized_matmul(first_projection, &first_signature) &&
-            flagos_describe_quantized_matmul(second_projection, &second_signature);
+            amd_describe_quantized_matmul(first_projection, &first_signature) &&
+            amd_describe_quantized_matmul(second_projection, &second_signature);
         if (amd_candidate_outputs_are(candidate, { 2 }) && amd_supports_ffn_swiglu_q4_decode(
                 context->device, first_projection, second_projection, glu)) {
             choice.supported = true;
@@ -3817,6 +4067,19 @@ static flagos_lowering_choice amd_query_fusion(
         }
     }
     return choice;
+}
+
+static void * amd_packed_ffn_workspace(amd_backend_context * context) {
+    if (context->packed_ffn_workspace == nullptr) {
+        // One fixed allocation covers both measured shapes and is reused on this stream.
+        constexpr size_t capacity = 2560u * 512u * sizeof(uint16_t);
+        void * workspace = nullptr;
+        if (!amd_hip_check(hipMalloc(&workspace, capacity), "hipMalloc packed FFN workspace")) {
+            return nullptr;
+        }
+        context->packed_ffn_workspace = workspace;
+    }
+    return context->packed_ffn_workspace;
 }
 
 static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const flagos_plan_step & step) {
@@ -3846,7 +4109,7 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
                 context->device, gdn, snapshot_view, copy, kernel_name)) {
             return false;
         }
-        if (cache_only && !amd_gated_delta_net_cache_only_outputs_are_safe(
+        if (cache_only && !flagos_amd::gdn_cache_only_outputs_are_safe(
                 cgraph, step.candidate, gdn, copy)) {
             return false;
         }
@@ -4030,7 +4293,7 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             other == nullptr) {
             return false;
         }
-        const char * kernel_name = amd_attention_output_gate_kernel(activation);
+        const char * kernel_name = amd_attention_output_gate_kernel(context->device, activation);
         if (kernel_name == nullptr) {
             return false;
         }
@@ -4163,9 +4426,9 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
         flagos_quantized_matmul_signature gate_signature;
         flagos_quantized_matmul_signature up_signature;
         flagos_quantized_matmul_signature down_signature;
-        if (!flagos_describe_quantized_matmul(gate_projection, &gate_signature) ||
-            !flagos_describe_quantized_matmul(up_projection, &up_signature) ||
-            !flagos_describe_quantized_matmul(down_projection, &down_signature)) {
+        if (!amd_describe_quantized_matmul(gate_projection, &gate_signature) ||
+            !amd_describe_quantized_matmul(up_projection, &up_signature) ||
+            !amd_describe_quantized_matmul(down_projection, &down_signature)) {
             return false;
         }
         void * gate_weights = amd_get_dequantized_weight(
@@ -4249,8 +4512,8 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
                 context->device, gate_projection, up_projection, glu)) {
             flagos_quantized_matmul_signature gate_signature;
             flagos_quantized_matmul_signature up_signature;
-            if (!flagos_describe_quantized_matmul(gate_projection, &gate_signature) ||
-                !flagos_describe_quantized_matmul(up_projection, &up_signature) ||
+            if (!amd_describe_quantized_matmul(gate_projection, &gate_signature) ||
+                !amd_describe_quantized_matmul(up_projection, &up_signature) ||
                 gate_projection->src[0] == nullptr || up_projection->src[0] == nullptr ||
                 gate_projection->src[1] == nullptr || glu->data == nullptr) {
                 return false;
@@ -4306,8 +4569,8 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
         }
         flagos_quantized_matmul_signature first_signature;
         flagos_quantized_matmul_signature second_signature;
-        if (!flagos_describe_quantized_matmul(gate_projection, &first_signature) ||
-            !flagos_describe_quantized_matmul(up_projection, &second_signature)) {
+        if (!amd_describe_quantized_matmul(gate_projection, &first_signature) ||
+            !amd_describe_quantized_matmul(up_projection, &second_signature)) {
             return false;
         }
         void * first_weights = amd_get_dequantized_weight(
@@ -4318,80 +4581,52 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
             gate_projection->src[1] == nullptr || glu->data == nullptr) {
             return false;
         }
-        const bool grouped = amd_grouped_f16_ffn_enabled(context->device,
-                static_cast<int>(first_signature.columns)) &&
-            context->device->aot->find("flagos_ffn_swiglu_f16_f32_grouped") != nullptr;
-        const char * kernel_name = grouped
-            ? "flagos_ffn_swiglu_f16_f32_grouped" : "flagos_ffn_swiglu_f16_f32_batched";
-        const auto * metadata = context->device->aot->find(kernel_name);
-        if (metadata == nullptr) {
-            return false;
-        }
         int k = static_cast<int>(first_signature.k);
         int rows = static_cast<int>(first_signature.rows);
         int columns = static_cast<int>(first_signature.columns);
         void * activation_data = gate_projection->src[1]->data;
         void * output_data = glu->data;
-        if (activation_data == nullptr) {
+        amd_f16_ffn_launch launch;
+        if (activation_data == nullptr || !amd_describe_f16_ffn(context->device,
+                first_weights, second_weights, activation_data, output_data, k, rows, columns, &launch)) {
             return false;
+        }
+        amd_f16_ffn_launch packed_launch;
+        if (amd_describe_packed_f16_ffn(context->device, first_weights, second_weights,
+                activation_data, output_data, nullptr, k, rows, columns, launch, &packed_launch)) {
+            void * workspace = amd_packed_ffn_workspace(context);
+            if (workspace != nullptr && amd_describe_packed_f16_ffn(context->device,
+                    first_weights, second_weights, activation_data, output_data, workspace,
+                    k, rows, columns, launch, &packed_launch)) {
+                int count = k * columns;
+                flagos_amd::kernel_arguments pack_arguments { &activation_data, &workspace, &count };
+                if (!context->device->aot->launch("flagos_pack_f32_f16", context->stream,
+                        packed_launch.pack_grid, 1, 1, pack_arguments)) {
+                    return false;
+                }
+                context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                activation_data = workspace;
+                launch = packed_launch;
+            }
         }
         flagos_amd::kernel_arguments arguments = {
             &first_weights, &second_weights, &activation_data, &output_data,
             &k, &rows, &columns,
         };
-        const unsigned int tile_m = metadata->tile_m > 0
-            ? static_cast<unsigned int>(metadata->tile_m) : AMD_F16_MATMUL_BLOCK_M;
-        const unsigned int tile_n = metadata->tile_n > 0
-            ? static_cast<unsigned int>(metadata->tile_n) : AMD_F16_MATMUL_BLOCK_N;
-        const unsigned int blocks_m = (static_cast<unsigned int>(rows) + tile_m - 1) / tile_m;
-        const unsigned int blocks_n = (static_cast<unsigned int>(columns) + tile_n - 1) / tile_n;
-        const unsigned int grid_x = grouped ? blocks_m * blocks_n : blocks_m;
-        const unsigned int grid_y = grouped ? 1U : blocks_n;
         const bool launched = context->device->aot->launch(
-            kernel_name, context->stream,
-            grid_x, grid_y, 1, arguments);
+            launch.kernel, context->stream, launch.grid_x, launch.grid_y, 1, arguments);
         if (launched) {
             context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_ffn_swiglu.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(context, glu,
-                grouped ? "ffn_swiglu_f16_grouped" : "ffn_swiglu_f16");
+                launch.packed ? "ffn_swiglu_f16_packed_activation" : launch.grouped ? "ffn_swiglu_f16_grouped" : launch.tiled ? "ffn_swiglu_f16_tiled" : "ffn_swiglu_f16");
         }
         return launched;
     }
     if (step.candidate.id == flagos_pattern_id::flash_attn_decode && step.candidate.node_indices.size() == 1) {
         ggml_tensor * node = cgraph->nodes[step.candidate.node_indices[0]];
-        if (!amd_supports_flash_attn_decode(context->device, node) ||
-            !amd_tensor_bindings_ready(node)) return false;
-        const ggml_tensor * q = node->src[0];
-        const ggml_tensor * k = node->src[1];
-        const ggml_tensor * v = node->src[2];
-        const ggml_tensor * mask = node->src[3];
-        int key_length = static_cast<int>(k->ne[1]);
-        int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-        int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-        int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-        int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-        int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-        int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-        int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-        int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-        int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-        float scale = 0.0f;
-        std::memcpy(&scale, node->op_params, sizeof(scale));
-        void * q_data = q->data;
-        void * k_data = k->data;
-        void * v_data = v->data;
-        void * mask_data = mask->data;
-        void * output_data = node->data;
-        flagos_amd::kernel_arguments arguments = {
-            &q_data, &k_data, &v_data, &mask_data, &output_data,
-            &key_length, &q_per_kv, &stride_q_token, &stride_q_head,
-            &stride_k_token, &stride_k_head, &stride_v_token, &stride_v_head,
-            &stride_output_token, &stride_output_head, &scale,
-        };
-        const bool launched = context->device->aot->launch("flagos_flash_attn_decode_f32_f16", context->stream,
-            static_cast<unsigned int>(q->ne[2]), 1, 1, arguments);
+        const bool launched = amd_launch_flash_attn(context, node, false);
         if (launched) {
             context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
@@ -4404,48 +4639,7 @@ static bool amd_execute_fusion(void * user_data, ggml_cgraph * cgraph, const fla
 
     if (step.candidate.id == flagos_pattern_id::flash_attn_prefill && step.candidate.node_indices.size() == 1) {
         ggml_tensor * node = cgraph->nodes[step.candidate.node_indices[0]];
-        if (!amd_supports_flash_attn_prefill(context->device, node) ||
-            !amd_tensor_bindings_ready(node)) return false;
-        const ggml_tensor * q = node->src[0];
-        const ggml_tensor * k = node->src[1];
-        const ggml_tensor * v = node->src[2];
-        const ggml_tensor * mask = node->src[3];
-        const auto * metadata = context->device->aot->find("flagos_flash_attn_prefill_f32_f16");
-        int query_length = static_cast<int>(q->ne[1]);
-        int key_length = static_cast<int>(k->ne[1]);
-        int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-        int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-        int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-        int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-        int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-        int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-        int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-        int stride_mask_token = static_cast<int>(mask->nb[0] / sizeof(ggml_fp16_t));
-        int stride_mask_query = static_cast<int>(mask->nb[1] / sizeof(ggml_fp16_t));
-        int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-        int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-        float scale = 0.0f;
-        std::memcpy(&scale, node->op_params, sizeof(scale));
-        void * q_data = q->data;
-        void * k_data = k->data;
-        void * v_data = v->data;
-        void * mask_data = mask->data;
-        void * output_data = node->data;
-        flagos_amd::kernel_arguments arguments = {
-            &q_data, &k_data, &v_data, &mask_data, &output_data,
-            &query_length, &key_length, &q_per_kv,
-            &stride_q_token, &stride_q_head,
-            &stride_k_token, &stride_k_head,
-            &stride_v_token, &stride_v_head,
-            &stride_mask_token, &stride_mask_query,
-            &stride_output_token, &stride_output_head, &scale,
-        };
-        const unsigned int grid_y = static_cast<unsigned int>(
-            (static_cast<uint64_t>(query_length) + metadata->block_size - 1) /
-            metadata->block_size);
-        const bool launched = context->device->aot->launch(
-            "flagos_flash_attn_prefill_f32_f16", context->stream,
-            static_cast<unsigned int>(q->ne[2]), grid_y, 1, arguments);
+        const bool launched = amd_launch_flash_attn(context, node, true);
         if (launched) {
             context->stats.fusion_steps.fetch_add(1, std::memory_order_relaxed);
             context->stats.fusion_flash_attn_prefill.fetch_add(1, std::memory_order_relaxed);
@@ -4648,7 +4842,8 @@ static bool amd_supports_add(const amd_device_context * device, const ggml_tenso
     const bool flat_vector_repeat = op->src[1]->ne[0] == op->src[0]->ne[0] &&
         op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1;
     const char * kernel = same_shape ? "flagos_add_f32" : "flagos_add_repeat_f32";
-    return (same_shape || flat_vector_repeat) && device->aot->find(kernel) != nullptr &&
+    return (same_shape || flat_vector_repeat) &&
+        amd_elementwise_launch_contract_fits(device, op, kernel, same_shape ? 4 : 5, 3) &&
         amd_tensor_output_can_reuse_input(op, op->src[0]) &&
         (same_shape ? amd_tensor_output_can_reuse_input(op, op->src[1])
                     : !amd_tensor_data_overlaps(op, op->src[1]));
@@ -4674,6 +4869,9 @@ static bool amd_supports_mul(const amd_device_context * device, const ggml_tenso
         ggml_nelements(op->src[1]) <= 0 || ggml_nelements(op->src[1]) > INT32_MAX) {
         return false;
     }
+    if (!amd_elementwise_launch_contract_fits(device, op, "flagos_mul_f32", 5, 3)) {
+        return false;
+    }
     if (ggml_are_same_shape(op->src[0], op->src[1])) {
         return amd_tensor_output_can_reuse_input(op, op->src[0]) &&
             amd_tensor_output_can_reuse_input(op, op->src[1]);
@@ -4684,6 +4882,9 @@ static bool amd_supports_mul(const amd_device_context * device, const ggml_tenso
         !amd_tensor_data_overlaps(op, op->src[1]);
 }
 
+#include "flagos-amd-repeat.inc"
+#include "flagos-amd-tanh.inc"
+
 static bool amd_supports_scale(const amd_device_context * device, const ggml_tensor * op) {
     return device != nullptr && device->aot != nullptr && op != nullptr &&
         op->op == GGML_OP_SCALE && op->src[0] != nullptr &&
@@ -4691,10 +4892,33 @@ static bool amd_supports_scale(const amd_device_context * device, const ggml_ten
         amd_tensor_is_contiguous_f32(op) && amd_tensor_is_contiguous_f32(op->src[0]) &&
         ggml_are_same_shape(op, op->src[0]) &&
         ggml_nelements(op) <= INT32_MAX &&
-        amd_tensor_output_can_reuse_input(op, op->src[0]);
+        amd_tensor_output_can_reuse_input(op, op->src[0]) &&
+        amd_elementwise_launch_contract_fits(device, op, "flagos_scale_f32", 5, 2);
+}
+
+static bool amd_supports_strided_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
+    if (!amd_env_enabled("FLAGOS_AMD_STRIDED_RMS_NORM")) {
+        return false;
+    }
+    if (device == nullptr || device->aot == nullptr || op == nullptr || op->src[0] == nullptr ||
+        ggml_is_contiguous(op->src[0])) {
+        return false;
+    }
+    const auto * metadata = device->aot->find("flagos_rms_norm_ggml_strided_f32");
+    return metadata != nullptr && metadata->argument_count == 9 &&
+        metadata->block_size == 256 && metadata->num_warps == 4 && metadata->warp_size == 32 &&
+        flagos_amd::supports_strided_rms_norm_layout(op, metadata->block_size) &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        !amd_tensor_data_overlaps(op, op->src[0]) &&
+        amd_kernel_launch_contract_fits(device, metadata, 9, 2,
+            static_cast<uint64_t>(ggml_nelements(op)) / op->ne[0], 1, 1);
 }
 
 static bool amd_supports_rms_norm(const amd_device_context * device, const ggml_tensor * op) {
+    if (amd_supports_strided_rms_norm(device, op)) {
+        return true;
+    }
     if (device == nullptr || device->aot == nullptr || op == nullptr ||
         op->op != GGML_OP_RMS_NORM || op->src[0] == nullptr ||
         device->aot->find("flagos_rms_norm_f32") == nullptr ||
@@ -4717,7 +4941,11 @@ static bool amd_supports_rms_norm(const amd_device_context * device, const ggml_
     // A package may choose a wider block than the model's hidden size, but it
     // must never be narrower or the masked load/store would be incomplete.
     const auto * metadata = device->aot->find("flagos_rms_norm_f32");
-    return metadata->block_size >= op->ne[0];
+    return metadata->block_size >= op->ne[0] &&
+        amd_tensor_data_is_aligned(op, sizeof(float)) &&
+        amd_tensor_data_is_aligned(op->src[0], sizeof(float)) &&
+        amd_kernel_launch_contract_fits(device, metadata, 4, 2,
+            static_cast<uint64_t>(ggml_nelements(op)) / op->ne[0], 1, 1);
 }
 
 static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -4735,6 +4963,19 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         }
     }
     std::lock_guard<std::mutex> execution_lock(backend_context->execution_mutex);
+    const uint64_t policy_key = amd_execution_policy_key();
+    if (cgraph->n_nodes > 0 && backend_context->execution_policy_key != policy_key) {
+        // A selector change cannot redo GGML placement. Validate the split
+        // before preparation or any state write; leave rejected policies cold.
+        for (int index = 0; index < cgraph->n_nodes; ++index) {
+            if (!amd_device_supports_op(&backend_context->device->device_iface, cgraph->nodes[index])) {
+                GGML_LOG_ERROR("FlagOS AMD: execution policy rejects %s before graph writes; rebuild scheduler placement\n",
+                    ggml_op_name(cgraph->nodes[index]->op));
+                return GGML_STATUS_FAILED;
+            }
+        }
+        backend_context->execution_policy_key = policy_key;
+    }
     if (!amd_hip_check(hipSetDevice(backend_context->device->ordinal), "hipSetDevice")) {
         return GGML_STATUS_FAILED;
     }
@@ -4744,10 +4985,21 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
     if (cgraph->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
     }
+    if (!amd_prepare_geglu_lut(backend_context, cgraph)) {
+        return GGML_STATUS_FAILED;
+    }
     amd_prepare_dequant_cache(backend_context, cgraph);
+    if (!amd_prepare_splitkv_workspace(backend_context, cgraph)) {
+        return GGML_STATUS_FAILED;
+    }
+    const char * selected_fusions = std::getenv("FLAGOS_AMD_FUSIONS");
+    const flagos_query_lowering_fn query_lowering =
+        amd_experimental_fusions_enabled(backend_context->device) &&
+        (selected_fusions == nullptr || std::strcmp(selected_fusions, "none") != 0)
+        ? amd_query_fusion : nullptr;
     const flagos_fusion_interface fusion_interface {
-        /* .query_lowering = */ amd_query_fusion,
-        /* .validate_lowering = */ amd_query_fusion,
+        /* .query_lowering = */ query_lowering,
+        /* .validate_lowering = */ query_lowering,
         /* .execute_fusion = */ amd_execute_fusion,
         /* .user_data      = */ backend_context,
         /* .configuration_id = */ amd_fusion_config_key(backend_context),
@@ -4834,6 +5086,12 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         // executable bound to a retired dequantized allocation.
         capture_binding_fingerprint ^= backend_context->dequant_cache_epoch;
         capture_binding_fingerprint *= 1099511628211ULL;
+        capture_binding_fingerprint ^= backend_context->splitkv_workspace_generation;
+        capture_binding_fingerprint *= 1099511628211ULL;
+        capture_binding_fingerprint ^= backend_context->geglu_lut_generation;
+        capture_binding_fingerprint *= 1099511628211ULL;
+        capture_binding_fingerprint ^= reinterpret_cast<uintptr_t>(backend_context->geglu_lut);
+        capture_binding_fingerprint *= 1099511628211ULL;
     }
     flagos_graph_binding_snapshot capture_bindings;
     bool capture_ready = false;
@@ -4908,16 +5166,19 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             continue;
         }
         if (ggml_nelements(node) == 0 &&
-            (amd_supports_copy_f32(backend_context->device, node) ||
-             amd_supports_scale(backend_context->device, node))) {
+            (amd_supports_copy(backend_context->device, node) ||
+             amd_supports_scale(backend_context->device, node) ||
+             amd_supports_dense_get_rows(backend_context->device, node))) {
             continue;
         }
         if (!amd_tensor_bindings_ready(node)) {
             GGML_LOG_ERROR("FlagOS AMD: missing tensor binding for %s\n", ggml_op_name(node->op));
             return GGML_STATUS_FAILED;
         }
-        if (amd_supports_copy_f32(backend_context->device, node)) {
-            const auto * metadata = backend_context->device->aot->find("flagos_copy_strided_f32");
+        if (amd_supports_copy(backend_context->device, node)) {
+            const char * kernel_name = amd_copy_kernel_name(node);
+            const auto * metadata = backend_context->device->aot->find(kernel_name);
+            const size_t element_size = ggml_type_size(node->type);
             int src_ne[GGML_MAX_DIMS];
             int dst_ne[GGML_MAX_DIMS];
             int src_stride[GGML_MAX_DIMS];
@@ -4925,8 +5186,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
                 src_ne[dim] = static_cast<int>(node->src[0]->ne[dim]);
                 dst_ne[dim] = static_cast<int>(node->ne[dim]);
-                src_stride[dim] = static_cast<int>(node->src[0]->nb[dim] / sizeof(float));
-                dst_stride[dim] = static_cast<int>(node->nb[dim] / sizeof(float));
+                src_stride[dim] = static_cast<int>(node->src[0]->nb[dim] / element_size);
+                dst_stride[dim] = static_cast<int>(node->nb[dim] / element_size);
             }
             int n_elements = static_cast<int>(ggml_nelements(node));
             void * src_data = node->src[0]->data;
@@ -4943,7 +5204,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 (static_cast<uint64_t>(n_elements) + metadata->block_size - 1) /
                 metadata->block_size);
             if (!backend_context->device->aot->launch(
-                    "flagos_copy_strided_f32", backend_context->stream,
+                    kernel_name, backend_context->stream,
                     grid_x, 1, 1, arguments)) {
                 return GGML_STATUS_FAILED;
             }
@@ -5033,8 +5294,8 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             const ggml_tensor * q = node->src[0];
             const ggml_tensor * v = node->src[2];
             const ggml_tensor * beta = node->src[4];
-            const auto * metadata = backend_context->device->aot->find(
-                "flagos_gated_delta_net_scalar_f32");
+            const char * kernel_name = amd_gated_delta_net_kernel_name(backend_context->device, node);
+            const auto * metadata = backend_context->device->aot->find(kernel_name);
             int state_size = static_cast<int>(v->ne[0]);
             int n_heads = static_cast<int>(v->ne[1]);
             int n_tokens = static_cast<int>(v->ne[2]);
@@ -5069,14 +5330,35 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 (static_cast<uint64_t>(state_size) + metadata->tile_n - 1) /
                 metadata->tile_n);
             if (!backend_context->device->aot->launch(
-                    "flagos_gated_delta_net_scalar_f32", backend_context->stream,
+                    kernel_name, backend_context->stream,
                     static_cast<unsigned int>(n_heads),
                     static_cast<unsigned int>(n_seqs), grid_z, arguments)) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
-            amd_trace_op(backend_context, node, "gated_delta_net_scalar");
+            amd_trace_op(backend_context, node, std::strcmp(kernel_name, "flagos_gated_delta_net_scalar_f32_value_tiled") == 0 ? "gated_delta_net_value_tiled" : "gated_delta_net_scalar");
+            continue;
+        }
+        if (node->op == GGML_OP_GET_ROWS && amd_supports_dense_get_rows(backend_context->device, node)) {
+            flagos_amd::dense_gather_signature signature;
+            if (!flagos_amd::describe_dense_gather(node, &signature)) {
+                return GGML_STATUS_FAILED;
+            }
+            void * table = node->src[0]->data;
+            void * indices = node->src[1]->data;
+            void * output = node->data;
+            const auto * metadata = backend_context->device->aot->find("flagos_get_rows_f32");
+            flagos_amd::kernel_arguments arguments { &table, &indices, &output, &signature.columns };
+            const unsigned int blocks = static_cast<unsigned int>(
+                (static_cast<uint64_t>(signature.columns) + metadata->block_size - 1) / metadata->block_size);
+            if (!backend_context->device->aot->launch("flagos_get_rows_f32", backend_context->stream,
+                    static_cast<unsigned int>(signature.rows), blocks, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "get_rows_f32");
             continue;
         }
         if (node->op == GGML_OP_GET_ROWS && amd_supports_get_rows(backend_context->device, node)) {
@@ -5118,11 +5400,78 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                 case flagos_quantized_matmul_kind::q8_0:
                     backend_context->stats.q80_get_rows.fetch_add(1, std::memory_order_relaxed);
                     break;
+                case flagos_quantized_matmul_kind::q5_0:
                 case flagos_quantized_matmul_kind::none:
                     return GGML_STATUS_FAILED;
             }
             amd_trace_op(backend_context, node, "get_rows");
             continue;
+        }
+        if (amd_supports_half_get_rows(backend_context->device, node)) {
+            flagos_amd::dense_gather_signature signature;
+            if (!flagos_amd::describe_dense_gather_storage(node, &signature, node->src[0]->type)) {
+                return GGML_STATUS_FAILED;
+            }
+            void * table = node->src[0]->data;
+            void * indices = node->src[1]->data;
+            void * output = node->data;
+            int table_rows = static_cast<int>(node->src[0]->ne[1]);
+            flagos_amd::kernel_arguments arguments { &table, &indices, &output, &signature.columns, &table_rows };
+            const char * kernel = amd_half_get_rows_kernel_name(node);
+            if (!backend_context->device->aot->launch(kernel, backend_context->stream,
+                    static_cast<unsigned int>(signature.rows), (signature.columns + 255U) / 256U, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, kernel);
+            continue;
+        }
+        if (amd_supports_strided_batched_float_mul_mat(backend_context->device, node)) {
+            void * weights_data = node->src[0]->data;
+            void * input_data = node->src[1]->data;
+            void * output_data = node->data;
+            flagos_amd::strided_float_matmul_signature signature;
+            if (!flagos_amd::describe_strided_float_matmul(node, &signature)) {
+                return GGML_STATUS_FAILED;
+            }
+            flagos_amd::kernel_arguments arguments = {
+                &weights_data, &input_data, &output_data, &signature.k, &signature.rows, &signature.columns,
+                &signature.heads, &signature.head_ratio, &signature.sample_ratio,
+                &signature.sw[0], &signature.sw[1], &signature.sw[2],
+                &signature.sx[0], &signature.sx[1], &signature.sx[2],
+            };
+            const char * kernel = amd_strided_batched_float_kernel_name(node);
+            if (!backend_context->device->aot->launch(kernel,
+                    backend_context->stream, (signature.rows + 31U) / 32U, (signature.columns + 15U) / 16U,
+                    signature.batches, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            if (node->src[0]->type == GGML_TYPE_F16) {
+                backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
+            }
+            amd_trace_op(backend_context, node, kernel);
+            continue;
+        }
+        if (node->op == GGML_OP_GET_ROWS) {
+            amd_batched_gather_launch gather;
+            if (amd_describe_batched_gather(backend_context->device, node, &gather)) {
+                void * table = node->src[0]->data;
+                void * indices = node->src[1]->data;
+                void * output = node->data;
+                flagos_amd::kernel_arguments arguments = { &table, &indices, &output };
+                for (int & value : gather.values) arguments.push_back(&value);
+                if (!backend_context->device->aot->launch(gather.kernel, backend_context->stream,
+                        gather.grid_x, 1, 1, arguments)) {
+                    return GGML_STATUS_FAILED;
+                }
+                backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+                amd_trace_op(backend_context, node, "get_rows_batched");
+                continue;
+            }
         }
         if (node->op == GGML_OP_MUL_MAT && amd_supports_quantized_mul_mat(backend_context->device, node)) {
             const flagos_quantized_matmul_kind kind = amd_quantized_kind(node->src[0]->type);
@@ -5139,10 +5488,10 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             // tensor objects with different random payloads across cases;
             // keeping those shapes on the reference AOT path avoids making a
             // cache entry depend on test-only mutation semantics.
-            if (columns > 1 && rows >= 64 && k >= 1024 &&
+            if (columns > 1 && rows >= 64 && k >= 1024 && amd_allows_f16_matmul(node) &&
                 amd_prefill_f16_gemm_enabled(backend_context->device)) {
                 flagos_quantized_matmul_signature signature;
-                const bool described = flagos_describe_quantized_matmul(node, &signature);
+                const bool described = amd_describe_quantized_matmul(node, &signature);
                 void * dequantized_weights = described
                     ? amd_get_dequantized_weight(backend_context, node->src[0], signature) : nullptr;
                 const auto * f16_metadata = backend_context->device->aot->find(
@@ -5152,73 +5501,37 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                         &dequantized_weights, &activation_data, &output_data,
                         &k, &rows, &columns,
                     };
-                    const bool grouped = amd_grouped_f16_gemm_enabled(backend_context->device, columns) &&
-                        backend_context->device->aot->find("flagos_mul_mat_f16_f32_grouped") != nullptr;
-                    const char * f16_kernel = grouped
-                        ? "flagos_mul_mat_f16_f32_grouped" : "flagos_mul_mat_f16_f32_batched";
-                    if (grouped) {
-                        f16_metadata = backend_context->device->aot->find(f16_kernel);
+                    amd_f16_projection_launch projection;
+                    if (amd_describe_f16_projection(backend_context->device, dequantized_weights,
+                            activation_data, output_data, k, rows, columns, &projection)) {
+                        if (!backend_context->device->aot->launch(
+                                projection.kernel, backend_context->stream,
+                                projection.grid_x, projection.grid_y, 1, f16_arguments)) {
+                            return GGML_STATUS_FAILED;
+                        }
+                        backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                        backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+                        backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
+                        amd_trace_op(backend_context, node,
+                            projection.grouped ? "f16_matmul_grouped" : projection.aligned ? "f16_matmul_aligned" : "f16_matmul_batched");
+                        continue;
                     }
-                    const unsigned int tile_m = f16_metadata->tile_m > 0
-                        ? static_cast<unsigned int>(f16_metadata->tile_m) : AMD_F16_MATMUL_BLOCK_M;
-                    const unsigned int tile_n = f16_metadata->tile_n > 0
-                        ? static_cast<unsigned int>(f16_metadata->tile_n) : AMD_F16_MATMUL_BLOCK_N;
-                    const unsigned int blocks_m =
-                        (static_cast<unsigned int>(rows) + tile_m - 1) / tile_m;
-                    const unsigned int blocks_n =
-                        (static_cast<unsigned int>(columns) + tile_n - 1) / tile_n;
-                    const unsigned int grid_x = grouped ? blocks_m * blocks_n : blocks_m;
-                    const unsigned int grid_y = grouped ? 1U : blocks_n;
-                    if (!backend_context->device->aot->launch(
-                            f16_kernel, backend_context->stream,
-                            grid_x, grid_y, 1, f16_arguments)) {
-                        return GGML_STATUS_FAILED;
-                    }
-                    backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
-                    backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
-                    backend_context->stats.f16_matmul_batched.fetch_add(1, std::memory_order_relaxed);
-                    amd_trace_op(backend_context, node,
-                        grouped ? "f16_matmul_grouped" : "f16_matmul_batched");
-                    continue;
                 }
             }
             if (columns == 1) {
-                const unsigned int requested_narrow_tile =
-                    amd_q4_gemv_narrow_row_tile(backend_context->device);
-                const unsigned int requested_q40_narrow_tile =
-                    amd_q40_gemv_narrow_row_tile(backend_context->device);
-                const unsigned int requested_q5_narrow_tile =
-                    amd_q5_gemv_narrow_row_tile(backend_context->device);
-                const bool narrow_q4 = q4 && requested_narrow_tile > 1U;
-                const char * narrow_kernel = nullptr;
-                unsigned int row_tile = 1U;
-                if (kind == flagos_quantized_matmul_kind::q4_0 &&
-                    requested_q40_narrow_tile > 1U &&
-                    rows % requested_q40_narrow_tile == 0) {
-                    narrow_kernel = "flagos_mul_mat_q4_0_f32_narrow";
-                    row_tile = requested_q40_narrow_tile;
-                } else if (kind == flagos_quantized_matmul_kind::q5_k &&
-                           requested_q5_narrow_tile == 16U && rows % 16 == 0) {
-                    narrow_kernel = "flagos_mul_mat_q5_k_f32_narrow16";
-                    row_tile = 16U;
-                } else if (narrow_q4 && requested_narrow_tile >= 8U && rows % 8 == 0 &&
-                    backend_context->device->aot->find("flagos_mul_mat_q4_k_f32_narrow8") != nullptr) {
-                    narrow_kernel = "flagos_mul_mat_q4_k_f32_narrow8";
-                    row_tile = 8U;
-                } else if (narrow_q4 && rows % 4 == 0 &&
-                           backend_context->device->aot->find("flagos_mul_mat_q4_k_f32_narrow") != nullptr) {
-                    // An 8-row request safely falls back to the validated
-                    // four-row symbol when an older package is loaded.
-                    narrow_kernel = "flagos_mul_mat_q4_k_f32_narrow";
-                    row_tile = 4U;
+                amd_quantized_gemv_launch gemv;
+                if (!amd_describe_quantized_gemv(backend_context->device, node, kind, k, rows, &gemv)) {
+                    return GGML_STATUS_FAILED;
                 }
-                const char * kernel_name = narrow_kernel != nullptr ? narrow_kernel
-                    : amd_quantized_gemv_kernel(kind);
+                const char * kernel_name = gemv.kernel;
+                const unsigned int row_tile = gemv.row_tile;
+                const char * narrow_kernel = row_tile > 1 ? kernel_name : nullptr;
+                const char * aligned_kernel = std::strstr(kernel_name, "_model_aligned") != nullptr ? kernel_name : nullptr;
                 flagos_amd::kernel_arguments arguments = {
                     &weights_u8, &weights_f16, &activation_data, &output_data, &k, &rows,
                 };
                 const bool launched = backend_context->device->aot->launch(kernel_name, backend_context->stream,
-                    (static_cast<unsigned int>(rows) + row_tile - 1) / row_tile, 1, 1, arguments);
+                    gemv.grid_x, 1, 1, arguments);
                 if (!launched) {
                     return GGML_STATUS_FAILED;
                 }
@@ -5242,12 +5555,13 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
                         ? "q40_matmul_narrow" : kind == flagos_quantized_matmul_kind::q5_k
                         ? "q5_matmul_narrow16" : row_tile == 8U
                         ? "q4_matmul_narrow8" : "q4_matmul_narrow4")
+                    : aligned_kernel != nullptr ? "quantized_gemv_model_aligned"
                     : kind == flagos_quantized_matmul_kind::q4_0
                     ? "q40_matmul" : kind == flagos_quantized_matmul_kind::q5_k
                     ? "q5_matmul" : q4 ? "q4_matmul" : "q6_matmul");
             } else {
                 const char * kernel_name = amd_quantized_batched_kernel(
-                    backend_context->device, kind);
+                    backend_context->device, kind, amd_allows_f16_matmul(node));
                 // Execute must remain fail-closed even if a future kind or
                 // runtime policy diverges from the earlier supports_op query.
                 if (kernel_name == nullptr) {
@@ -5376,6 +5690,25 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, "set_rows");
             continue;
         }
+        if (amd_supports_tanh(backend_context->device, node)) {
+            if (!amd_launch_tanh(backend_context, node)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "tanh");
+            continue;
+        }
+        amd_repeat_operation repeat_operation;
+        if (amd_describe_repeat_operation(backend_context->device, node, &repeat_operation)) {
+            if (!amd_launch_repeat_operation(backend_context, node, repeat_operation)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, repeat_operation.kernel);
+            continue;
+        }
         if (node->op == GGML_OP_ADD && amd_supports_add(backend_context->device, node)) {
             const bool same_shape = ggml_are_same_shape(node->src[0], node->src[1]);
             const char * kernel_name = same_shape ? "flagos_add_f32" : "flagos_add_repeat_f32";
@@ -5404,8 +5737,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
         }
         if (node->op == GGML_OP_SOFT_MAX && amd_supports_soft_max(backend_context->device, node)) {
             const ggml_tensor * mask = node->src[1];
-            const char * kernel_name = mask == nullptr
-                ? "flagos_soft_max_unmasked_f32" : "flagos_soft_max_masked_f32_f16";
+            const char * kernel_name = amd_soft_max_kernel_name(node);
             int n_cols = static_cast<int>(node->ne[0]);
             int rows = static_cast<int>(ggml_nelements(node) / node->ne[0]);
             float scale = 1.0f;
@@ -5414,9 +5746,26 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             flagos_amd::kernel_arguments arguments = {
                 &node->src[0]->data, &mask_data, &node->data, &n_cols, &scale,
             };
-            const unsigned int grid_x = static_cast<unsigned int>(rows);
-            const bool launched = backend_context->device->aot->launch(
-                kernel_name, backend_context->stream, grid_x, 1, 1, arguments);
+            bool launched = false;
+            if (mask != nullptr && mask->type == GGML_TYPE_F32) {
+                int n_rows = static_cast<int>(node->ne[1]);
+                int n_heads = static_cast<int>(node->ne[2]);
+                int mask_heads = static_cast<int>(mask->ne[2]);
+                int mask_samples = static_cast<int>(mask->ne[3]);
+                int mask_stride_row = static_cast<int>(mask->nb[1] / sizeof(float));
+                int mask_stride_head = static_cast<int>(mask->nb[2] / sizeof(float));
+                int mask_stride_sample = static_cast<int>(mask->nb[3] / sizeof(float));
+                flagos_amd::kernel_arguments broadcast_arguments = {
+                    &node->src[0]->data, &mask_data, &node->data, &n_cols, &n_rows, &n_heads,
+                    &mask_heads, &mask_samples, &mask_stride_row, &mask_stride_head, &mask_stride_sample, &scale,
+                };
+                launched = backend_context->device->aot->launch(kernel_name, backend_context->stream,
+                    static_cast<unsigned int>(n_rows), static_cast<unsigned int>(n_heads),
+                    static_cast<unsigned int>(node->ne[3]), broadcast_arguments);
+            } else {
+                launched = backend_context->device->aot->launch(kernel_name, backend_context->stream,
+                    static_cast<unsigned int>(rows), 1, 1, arguments);
+            }
             if (!launched) {
                 return GGML_STATUS_FAILED;
             }
@@ -5431,6 +5780,25 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             int n_cols = static_cast<int>(node->ne[0]);
             float eps = 0.0f;
             std::memcpy(&eps, node->op_params, sizeof(eps));
+            if (amd_supports_strided_rms_norm(backend_context->device, node)) {
+                int ne1 = static_cast<int>(node->ne[1]);
+                int ne2 = static_cast<int>(node->ne[2]);
+                int stride_x1 = static_cast<int>(node->src[0]->nb[1] / sizeof(float));
+                int stride_x2 = static_cast<int>(node->src[0]->nb[2] / sizeof(float));
+                int stride_x3 = static_cast<int>(node->src[0]->nb[3] / sizeof(float));
+                flagos_amd::kernel_arguments arguments = {
+                    &node->data, &node->src[0]->data, &n_cols, &ne1, &ne2,
+                    &stride_x1, &stride_x2, &stride_x3, &eps,
+                };
+                if (!backend_context->device->aot->launch("flagos_rms_norm_ggml_strided_f32",
+                        backend_context->stream, rows, 1, 1, arguments)) {
+                    return GGML_STATUS_FAILED;
+                }
+                backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+                backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+                amd_trace_op(backend_context, node, "rms_norm_strided");
+                continue;
+            }
             flagos_amd::kernel_arguments arguments = {
                 &node->data,
                 &node->src[0]->data,
@@ -5444,6 +5812,41 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
             backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
             amd_trace_op(backend_context, node, "rms_norm");
+            continue;
+        }
+        if (node->op == GGML_OP_ROPE && amd_supports_ggml_rope(backend_context->device, node)) {
+            int ne0 = static_cast<int>(node->ne[0]);
+            int ne1 = static_cast<int>(node->ne[1]);
+            int ne2 = static_cast<int>(node->ne[2]);
+            int stride_x1 = static_cast<int>(node->src[0]->nb[1] / sizeof(float));
+            int stride_x2 = static_cast<int>(node->src[0]->nb[2] / sizeof(float));
+            int stride_x3 = static_cast<int>(node->src[0]->nb[3] / sizeof(float));
+            const auto * params = static_cast<const int32_t *>(node->op_params);
+            int n_dims = params[1];
+            int mode = params[2];
+            int has_factors = node->src[2] != nullptr;
+            int sections[4] = { params[11], params[12], params[13], params[14] };
+            float frequency[4];
+            std::memcpy(frequency, params + 5, sizeof(frequency));
+            float theta_scale = std::pow(frequency[0], -2.0f / n_dims);
+            void * x = node->src[0]->data;
+            void * positions = node->src[1]->data;
+            void * factors = has_factors ? node->src[2]->data : x;
+            void * output = node->data;
+            flagos_amd::kernel_arguments arguments = {
+                &x, &positions, &factors, &output, &ne0, &ne1, &ne2, &n_dims, &mode, &has_factors,
+                &stride_x1, &stride_x2, &stride_x3,
+                &sections[0], &sections[1], &sections[2], &sections[3],
+                &theta_scale, &frequency[1], &frequency[3],
+            };
+            if (!backend_context->device->aot->launch(amd_ggml_rope_kernel_name(node), backend_context->stream,
+                    static_cast<unsigned int>(ggml_nrows(node)), 1, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.rope.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "ggml_rope");
             continue;
         }
         if (node->op == GGML_OP_ROPE && amd_supports_mrope(backend_context->device, node)) {
@@ -5561,6 +5964,43 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             amd_trace_op(backend_context, node, "silu");
             continue;
         }
+        if (node->op == GGML_OP_ARGSORT && amd_supports_argsort(backend_context->device, node)) {
+            if (!amd_launch_argsort(backend_context, node)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "argsort");
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID && amd_supports_moe(backend_context->device, node)) {
+            if (!amd_launch_moe(backend_context, node)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "mul_mat_id");
+            continue;
+        }
+        if (node->op == GGML_OP_GLU && amd_supports_geglu_lut(backend_context->device, node)) {
+            if (!backend_context->geglu_lut_ready || backend_context->geglu_lut == nullptr) {
+                return GGML_STATUS_FAILED;
+            }
+            const void * gate = node->src[0]->data;
+            const void * up = node->src[1]->data;
+            void * output = node->data;
+            const void * table = backend_context->geglu_lut;
+            const int count = static_cast<int>(ggml_nelements(node));
+            flagos_amd::kernel_arguments arguments { &gate, &up, &output, &table, &count };
+            if (!backend_context->device->aot->launch(AMD_GEGLU_LUT_KERNEL, backend_context->stream,
+                    static_cast<unsigned>((static_cast<uint64_t>(count) + 255) / 256), 1, 1, arguments)) {
+                return GGML_STATUS_FAILED;
+            }
+            backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
+            backend_context->stats.direct_ops.fetch_add(1, std::memory_order_relaxed);
+            amd_trace_op(backend_context, node, "geglu_cpu_fp16_lut");
+            continue;
+        }
         if (node->op == GGML_OP_GLU && amd_supports_swiglu(backend_context->device, node)) {
             const auto * metadata = backend_context->device->aot->find("flagos_swiglu_split_f32");
             int n = static_cast<int>(ggml_nelements(node));
@@ -5580,35 +6020,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             continue;
         }
         if (node->op == GGML_OP_FLASH_ATTN_EXT && amd_supports_flash_attn_decode(backend_context->device, node)) {
-            const ggml_tensor * q = node->src[0];
-            const ggml_tensor * k = node->src[1];
-            const ggml_tensor * v = node->src[2];
-            const ggml_tensor * mask = node->src[3];
-            int key_length = static_cast<int>(k->ne[1]);
-            int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-            int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-            int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-            int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-            int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-            int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-            int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-            int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-            int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-            float scale = 0.0f;
-            std::memcpy(&scale, node->op_params, sizeof(scale));
-            void * q_data = q->data;
-            void * k_data = k->data;
-            void * v_data = v->data;
-            void * mask_data = mask->data;
-            void * output_data = node->data;
-            flagos_amd::kernel_arguments arguments = {
-                &q_data, &k_data, &v_data, &mask_data, &output_data,
-                &key_length, &q_per_kv, &stride_q_token, &stride_q_head,
-                &stride_k_token, &stride_k_head, &stride_v_token, &stride_v_head,
-                &stride_output_token, &stride_output_head, &scale,
-            };
-            if (!backend_context->device->aot->launch("flagos_flash_attn_decode_f32_f16", backend_context->stream,
-                    static_cast<unsigned int>(q->ne[2]), 1, 1, arguments)) {
+            if (!amd_launch_flash_attn(backend_context, node, false)) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
@@ -5618,46 +6030,7 @@ static enum ggml_status amd_backend_graph_compute(ggml_backend_t backend, ggml_c
             continue;
         }
         if (node->op == GGML_OP_FLASH_ATTN_EXT && amd_supports_flash_attn_prefill(backend_context->device, node)) {
-            const ggml_tensor * q = node->src[0];
-            const ggml_tensor * k = node->src[1];
-            const ggml_tensor * v = node->src[2];
-            const ggml_tensor * mask = node->src[3];
-            const auto * metadata = backend_context->device->aot->find("flagos_flash_attn_prefill_f32_f16");
-            int query_length = static_cast<int>(q->ne[1]);
-            int key_length = static_cast<int>(k->ne[1]);
-            int q_per_kv = static_cast<int>(q->ne[2] / k->ne[2]);
-            int stride_q_token = static_cast<int>(q->nb[1] / sizeof(float));
-            int stride_q_head = static_cast<int>(q->nb[2] / sizeof(float));
-            int stride_k_token = static_cast<int>(k->nb[1] / sizeof(ggml_fp16_t));
-            int stride_k_head = static_cast<int>(k->nb[2] / sizeof(ggml_fp16_t));
-            int stride_v_token = static_cast<int>(v->nb[1] / sizeof(ggml_fp16_t));
-            int stride_v_head = static_cast<int>(v->nb[2] / sizeof(ggml_fp16_t));
-            int stride_mask_token = static_cast<int>(mask->nb[0] / sizeof(ggml_fp16_t));
-            int stride_mask_query = static_cast<int>(mask->nb[1] / sizeof(ggml_fp16_t));
-            int stride_output_token = static_cast<int>(node->nb[2] / sizeof(float));
-            int stride_output_head = static_cast<int>(node->nb[1] / sizeof(float));
-            float scale = 0.0f;
-            std::memcpy(&scale, node->op_params, sizeof(scale));
-            void * q_data = q->data;
-            void * k_data = k->data;
-            void * v_data = v->data;
-            void * mask_data = mask->data;
-            void * output_data = node->data;
-            flagos_amd::kernel_arguments arguments = {
-                &q_data, &k_data, &v_data, &mask_data, &output_data,
-                &query_length, &key_length, &q_per_kv,
-                &stride_q_token, &stride_q_head,
-                &stride_k_token, &stride_k_head,
-                &stride_v_token, &stride_v_head,
-                &stride_mask_token, &stride_mask_query,
-                &stride_output_token, &stride_output_head, &scale,
-            };
-            const unsigned int grid_y = static_cast<unsigned int>(
-                (static_cast<uint64_t>(query_length) + metadata->block_size - 1) /
-                metadata->block_size);
-            if (!backend_context->device->aot->launch(
-                    "flagos_flash_attn_prefill_f32_f16", backend_context->stream,
-                    static_cast<unsigned int>(q->ne[2]), grid_y, 1, arguments)) {
+            if (!amd_launch_flash_attn(backend_context, node, true)) {
                 return GGML_STATUS_FAILED;
             }
             backend_context->stats.kernel_launches.fetch_add(1, std::memory_order_relaxed);
@@ -5800,27 +6173,38 @@ static ggml_backend_buffer_type_t amd_device_buffer_type(ggml_backend_dev_t dev)
 
 static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     // Only advertise compute nodes with a validated AOT lowering.  Standalone
-    // MUL is intentionally restricted to the exact contiguous/vector-repeat
-    // layouts implemented by flagos_mul_f32; all other broadcasts stay on CPU.
+    // The optional repeat path proves per-dimension addressing separately
+    // from the baseline contiguous/vector-repeat modules.
     if (amd_tensor_is_view_op(op)) {
         return true;
     }
     return op != nullptr &&
-        (amd_supports_copy_f32(amd_device_from_dev(dev), op) ||
+        (amd_supports_tanh(amd_device_from_dev(dev), op) ||
+         amd_supports_repeat_operation(amd_device_from_dev(dev), op) ||
+         amd_supports_copy(amd_device_from_dev(dev), op) ||
          (op->op == GGML_OP_CONCAT && amd_supports_concat(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_SSM_CONV && amd_supports_ssm_conv(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_L2_NORM && amd_supports_l2_norm(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_GATED_DELTA_NET &&
           amd_supports_gated_delta_net(amd_device_from_dev(dev), op)) ||
-         (op->op == GGML_OP_GET_ROWS && amd_supports_get_rows(amd_device_from_dev(dev), op)) ||
-         (op->op == GGML_OP_MUL_MAT && amd_supports_quantized_mul_mat(amd_device_from_dev(dev), op)) ||
+         (op->op == GGML_OP_GET_ROWS &&
+          (amd_supports_get_rows(amd_device_from_dev(dev), op) ||
+           amd_supports_dense_get_rows(amd_device_from_dev(dev), op) ||
+           amd_supports_half_get_rows(amd_device_from_dev(dev), op) ||
+           amd_supports_batched_gather(amd_device_from_dev(dev), op))) ||
+         (op->op == GGML_OP_ARGSORT && amd_supports_argsort(amd_device_from_dev(dev), op)) ||
+         (op->op == GGML_OP_MUL_MAT_ID && amd_supports_moe(amd_device_from_dev(dev), op)) ||
+         (op->op == GGML_OP_MUL_MAT &&
+          (amd_supports_quantized_mul_mat(amd_device_from_dev(dev), op) ||
+           amd_supports_strided_batched_float_mul_mat(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_ADD && amd_supports_add(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_MUL && amd_supports_mul(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_SCALE && amd_supports_scale(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_SET_ROWS && amd_supports_set_rows(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_RMS_NORM && amd_supports_rms_norm(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_ROPE &&
-          (amd_supports_rope_neox(amd_device_from_dev(dev), op) ||
+          (amd_supports_ggml_rope(amd_device_from_dev(dev), op) ||
+           amd_supports_rope_neox(amd_device_from_dev(dev), op) ||
            amd_supports_mrope(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_UNARY &&
           (amd_supports_silu(amd_device_from_dev(dev), op) ||
@@ -5828,7 +6212,8 @@ static bool amd_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * o
                GGML_UNARY_OP_SIGMOID, "flagos_sigmoid_f32") ||
            amd_supports_unary_f32(amd_device_from_dev(dev), op,
                GGML_UNARY_OP_SOFTPLUS, "flagos_softplus_f32"))) ||
-         (op->op == GGML_OP_GLU && amd_supports_swiglu(amd_device_from_dev(dev), op)) ||
+         (op->op == GGML_OP_GLU && (amd_supports_swiglu(amd_device_from_dev(dev), op) ||
+             amd_supports_geglu_lut(amd_device_from_dev(dev), op))) ||
          (op->op == GGML_OP_SOFT_MAX && amd_supports_soft_max(amd_device_from_dev(dev), op)) ||
          (op->op == GGML_OP_FLASH_ATTN_EXT &&
           (amd_supports_flash_attn_decode(amd_device_from_dev(dev), op) ||
@@ -6199,3 +6584,6 @@ const flagos_provider_v1 * flagos_amd_provider() {
     };
     return &provider;
 }
+
+#include "../../flagos-plugin.h"
+FLAGOS_DEFINE_DEVICE_PROVIDER_ENTRY("amd", flagos_amd_provider)
