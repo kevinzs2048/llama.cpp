@@ -3,7 +3,6 @@ cmake_minimum_required(VERSION 3.18)
 # Provider selection lives here rather than in ggml/CMakeLists.txt so the
 # upstream footprint is the single GGML_FLAGOS option. Every provider is
 # opt-in: a plain -DGGML_FLAGOS=ON build needs no vendor SDK.
-option(GGML_FLAGOS_DENGLIN    "ggml: build the FlagOS Denglin provider"                OFF)
 option(GGML_FLAGOS_AMD        "ggml: build the FlagOS AMD HIP provider"                OFF)
 option(GGML_FLAGOS_SPACEMIT   "ggml: build the experimental FlagOS SpaceMiT provider"  OFF)
 option(GGML_FLAGOS_TRITON_JIT "ggml: build the optional FlagOS Triton JIT runtime"     OFF)
@@ -116,10 +115,6 @@ endmacro()
 
 set(FLAGOS_PROVIDER_MODULE_TARGETS)
 
-if (GGML_FLAGOS_DENGLIN)
-    flagos_add_provider(denglin providers/denglin/provider.cmake)
-endif()
-
 if (GGML_FLAGOS_AMD)
     flagos_add_provider(amd providers/amd/provider.cmake)
 endif()
@@ -128,7 +123,7 @@ if (GGML_FLAGOS_SPACEMIT)
     flagos_add_provider(spacemit providers/spacemit/provider.cmake)
 endif()
 
-if (NOT GGML_FLAGOS_DENGLIN AND NOT GGML_FLAGOS_AMD AND NOT GGML_FLAGOS_SPACEMIT)
+if (NOT GGML_FLAGOS_AMD AND NOT GGML_FLAGOS_SPACEMIT)
     message(STATUS "FlagOS: building provider-neutral core with no device provider")
 endif()
 
@@ -141,12 +136,6 @@ target_include_directories(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_INCLUDE_DIRS})
 target_link_libraries(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_LIBRARIES})
 target_compile_definitions(ggml-flagos PRIVATE ${FLAGOS_PRIVATE_DEFINITIONS})
 
-
-if (GGML_FLAGOS_DENGLIN)
-    add_executable(flagos-check-kernels EXCLUDE_FROM_ALL kernels/check_merged_module.cpp)
-    target_include_directories(flagos-check-kernels PRIVATE "${FLAGOS_DENGLIN_CUDA_INCLUDE_DIR}")
-    target_link_libraries(flagos-check-kernels PRIVATE "${FLAGOS_DENGLIN_CURT_LIBRARY}")
-endif()
 
 add_library(flagos-check-public-header OBJECT EXCLUDE_FROM_ALL tests/check_public_header.c)
 target_include_directories(flagos-check-public-header PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -179,7 +168,7 @@ add_executable(flagos-check-registry EXCLUDE_FROM_ALL
     ${FLAGOS_CORE_SOURCES}
     tests/check_registry.cpp)
 target_include_directories(flagos-check-registry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_SOURCE_DIR}/vendor")
-target_compile_definitions(flagos-check-registry PRIVATE GGML_FLAGOS_HAVE_DENGLIN GGML_FLAGOS_HAVE_AMD)
+target_compile_definitions(flagos-check-registry PRIVATE GGML_FLAGOS_HAVE_AMD GGML_FLAGOS_HAVE_SPACEMIT)
 target_link_libraries(flagos-check-registry PRIVATE ggml)
 
 # Provider plugin loader: three mock plugins (C runtime, C++ device, bad ABI)
@@ -449,9 +438,6 @@ endif()
 # ABI header is installed for out-of-tree providers; the remaining FlagOS
 # headers are internal.
 install(FILES flagos-runtime.h DESTINATION include)
-if (GGML_FLAGOS_DENGLIN)
-    install(DIRECTORY "${FLAGOS_DENGLIN_AOT_KERNEL_DIR}/" DESTINATION share/ggml/flagos/denglin)
-endif()
 if (GGML_FLAGOS_AMD AND FLAGOS_AMD_AOT_KERNEL_DIR)
     install(DIRECTORY "${FLAGOS_AMD_AOT_KERNEL_DIR}/" DESTINATION "${CMAKE_INSTALL_DATADIR}/ggml/flagos/amd")
 endif()

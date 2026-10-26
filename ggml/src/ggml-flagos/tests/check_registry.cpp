@@ -17,36 +17,36 @@ static void check(bool condition, const char * expression, int line) {
 
 #define CHECK(expression) check((expression), #expression, __LINE__)
 
-const flagos_provider_v1 * flagos_denglin_provider();
+const flagos_provider_v1 * flagos_spacemit_provider();
 const flagos_provider_v1 * flagos_amd_provider();
 
-static constexpr uint64_t DENGLIN_ID = 1;
+static constexpr uint64_t SPACEMIT_ID = 1;
 static constexpr uint64_t AMD_ID = 2;
 static constexpr uint64_t ARM_ACCEL_ID = 3;
 
-static ggml_backend_device denglin_devices[2] {};
+static ggml_backend_device spacemit_devices[2] {};
 static ggml_backend_device amd_devices[2] {};
 static ggml_backend_device arm_accel_devices[1] {};
-static int denglin_current_device = 0;
+static int spacemit_current_device = 0;
 static int amd_current_device = 0;
 
 static bool mock_probe(ggml_backend_reg_t) {
     return true;
 }
 
-static size_t denglin_device_count() {
+static size_t spacemit_device_count() {
     return 2;
 }
 
-static ggml_backend_dev_t denglin_device_get(size_t index) {
-    return index < 2 ? &denglin_devices[index] : nullptr;
+static ggml_backend_dev_t spacemit_device_get(size_t index) {
+    return index < 2 ? &spacemit_devices[index] : nullptr;
 }
 
-static bool denglin_device_identity(size_t index, flagos_device_identity * identity) {
+static bool spacemit_device_identity(size_t index, flagos_device_identity * identity) {
     if (index >= 2 || identity == nullptr) {
         return false;
     }
-    *identity = { DENGLIN_ID, DENGLIN_ID, index + 1, index + 10, static_cast<uint32_t>(index) };
+    *identity = { SPACEMIT_ID, SPACEMIT_ID, index + 1, index + 10, static_cast<uint32_t>(index) };
     return true;
 }
 
@@ -67,16 +67,16 @@ static bool mock_is_backend(ggml_backend_t) {
     return false;
 }
 
-static bool denglin_set_device(size_t index) {
+static bool spacemit_set_device(size_t index) {
     if (index >= 2) {
         return false;
     }
-    denglin_current_device = static_cast<int>(index);
+    spacemit_current_device = static_cast<int>(index);
     return true;
 }
 
-static int denglin_get_device() {
-    return denglin_current_device;
+static int spacemit_get_device() {
+    return spacemit_current_device;
 }
 
 static size_t amd_device_count() {
@@ -140,7 +140,7 @@ static int mock_score() {
     return 0;
 }
 
-static bool denglin_device_profile(size_t index, flagos_device_profile * profile) {
+static bool spacemit_device_profile(size_t index, flagos_device_profile * profile) {
     if (index >= 2 || profile == nullptr) {
         return false;
     }
@@ -149,7 +149,7 @@ static bool denglin_device_profile(size_t index, flagos_device_profile * profile
     profile->version = 1;
     profile->engine = flagos_engine_kind::gpu;
     profile->features = FLAGOS_FEATURE_SIMD;
-    profile->vendor = "Denglin";
+    profile->vendor = "SpacemiT";
     profile->architecture = "gpu";
     profile->target = "ks20";
     return true;
@@ -191,21 +191,21 @@ static bool arm_accel_device_profile(size_t index, flagos_device_profile * profi
     return true;
 }
 
-const flagos_provider_v1 * flagos_denglin_provider() {
+const flagos_provider_v1 * flagos_spacemit_provider() {
     static const flagos_provider_v1 provider = {
         FLAGOS_PROVIDER_API_VERSION,
         sizeof(flagos_provider_v1),
-        { DENGLIN_ID, "mock-denglin", 1 },
+        { SPACEMIT_ID, "mock-spacemit", 1 },
         mock_probe,
-        denglin_device_count,
-        denglin_device_get,
-        denglin_device_identity,
+        spacemit_device_count,
+        spacemit_device_get,
+        spacemit_device_identity,
         mock_device_caps,
         mock_is_backend,
-        denglin_set_device,
-        denglin_get_device,
+        spacemit_set_device,
+        spacemit_get_device,
         mock_score,
-        denglin_device_profile,
+        spacemit_device_profile,
     };
     return &provider;
 }
@@ -291,7 +291,7 @@ static void check_device_interface_contract() {
 
 int main() {
     check_device_interface_contract();
-    for (auto & device : denglin_devices) { device.iface = mock_device_interface(); }
+    for (auto & device : spacemit_devices) { device.iface = mock_device_interface(); }
     amd_devices[0].iface = mock_device_interface();
     arm_accel_devices[0].iface = mock_device_interface();
     // amd_devices[1] has a valid identity but no required device callbacks.
@@ -304,36 +304,36 @@ int main() {
     CHECK(ggml_backend_reg_get_proc_address(reg, "flagos_select_provider_v1") != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, "flagos_status_name") != nullptr);
     CHECK(ggml_backend_reg_dev_count(reg) == 4);
-    CHECK(ggml_backend_reg_dev_get(reg, 0) == &denglin_devices[0]);
-    CHECK(ggml_backend_reg_dev_get(reg, 1) == &denglin_devices[1]);
-    CHECK(ggml_backend_reg_dev_get(reg, 2) == &amd_devices[0]);
+    CHECK(ggml_backend_reg_dev_get(reg, 0) == &amd_devices[0]);
+    CHECK(ggml_backend_reg_dev_get(reg, 1) == &spacemit_devices[0]);
+    CHECK(ggml_backend_reg_dev_get(reg, 2) == &spacemit_devices[1]);
     CHECK(ggml_backend_reg_dev_get(reg, 3) == &arm_accel_devices[0]);
-    CHECK(ggml_backend_dev_backend_reg(&denglin_devices[0]) == reg);
+    CHECK(ggml_backend_dev_backend_reg(&spacemit_devices[0]) == reg);
     CHECK(ggml_backend_dev_backend_reg(&amd_devices[0]) == reg);
     CHECK(ggml_backend_dev_backend_reg(&arm_accel_devices[0]) == reg);
 
     CHECK(ggml_backend_flagos_get_device() == 0);
-    ggml_backend_flagos_set_device(1);
-    CHECK(denglin_current_device == 1);
-    CHECK(ggml_backend_flagos_get_device() == 1);
+    ggml_backend_flagos_set_device(2);
+    CHECK(spacemit_current_device == 1);
+    CHECK(ggml_backend_flagos_get_device() == 2);
 
-    CHECK(denglin_set_device(0));
+    CHECK(spacemit_set_device(0));
     CHECK(ggml_backend_flagos_get_device() == -1);
 
-    ggml_backend_flagos_set_device(2);
-    CHECK(ggml_backend_flagos_get_device() == 2);
-    CHECK(denglin_current_device == 0);
+    ggml_backend_flagos_set_device(0);
+    CHECK(ggml_backend_flagos_get_device() == 0);
+    CHECK(spacemit_current_device == 0);
     CHECK(amd_current_device == 0);
 
     // Providers may omit the legacy selection hooks; a failed backend
     // initialization must not change the active device.
     ggml_backend_flagos_set_device(3);
     CHECK(ggml_backend_flagos_get_device() == 3);
-    CHECK(ggml_backend_flagos_init(2) == nullptr);
+    CHECK(ggml_backend_flagos_init(0) == nullptr);
     CHECK(ggml_backend_flagos_get_device() == 3);
 
     flagos_device_profile profile {};
-    CHECK(flagos_registry_get_device_profile(2, &profile));
+    CHECK(flagos_registry_get_device_profile(0, &profile));
     CHECK(profile.engine == flagos_engine_kind::gpu);
     CHECK(profile.lane_count == 32);
     CHECK((profile.features & FLAGOS_FEATURE_UNIFIED_MEMORY) != 0);
@@ -365,7 +365,7 @@ int main() {
     selector.provider_id = AMD_ID;
     selector.local_device_index = 0;
     CHECK(flagos_select_provider_v1(&selector, &selection) == FLAGOS_STATUS_SUCCESS);
-    CHECK(selection.global_device_index == 2);
+    CHECK(selection.global_device_index == 0);
     CHECK(selection.local_device_index == 0);
     CHECK(selection.provider_id == AMD_ID);
     CHECK(std::strcmp(selection.provider_name, "mock-amd") == 0);
@@ -378,7 +378,7 @@ int main() {
     selector.device_uuid_hi = AMD_ID;
     selector.device_uuid_lo = 1;
     CHECK(flagos_select_provider_v1(&selector, &selection) == FLAGOS_STATUS_SUCCESS);
-    CHECK(selection.global_device_index == 2);
+    CHECK(selection.global_device_index == 0);
     CHECK(selection.device.uuid_hi == AMD_ID);
     CHECK(selection.device.uuid_lo == 1);
 
@@ -394,12 +394,12 @@ int main() {
     selector = {};
     selector.struct_size = sizeof(selector);
     selector.version = 1;
-    selector.provider_id = DENGLIN_ID;
+    selector.provider_id = SPACEMIT_ID;
     CHECK(flagos_select_provider_v1(&selector, &selection) == FLAGOS_STATUS_AMBIGUOUS);
 
     selector.local_device_index = 0;
     CHECK(flagos_select_provider_v1(&selector, &selection) == FLAGOS_STATUS_SUCCESS);
-    CHECK(selection.global_device_index == 0);
+    CHECK(selection.global_device_index == 1);
 
     selector = {};
     selector.struct_size = sizeof(selector);

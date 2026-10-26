@@ -24,7 +24,7 @@ configure() {
     shift 2
     [ -f "$dir/build.ninja" ] && return 0
     mkdir -p "$(dirname "$log")"
-    cmake -S "$FLAGOS_REPO" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_FLAGOS=ON -DGGML_FLAGOS_DENGLIN=OFF \
+    cmake -S "$FLAGOS_REPO" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_FLAGOS=ON \
         -DGGML_FLAGOS_SPACEMIT=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF "$@" >"$log" 2>&1 ||
         { echo "CONFIGURE_FAIL $dir (log: $log)"; tail -20 "$log"; exit 2; }
 }

@@ -12,9 +12,6 @@
 #include <mutex>
 #include <vector>
 
-#ifdef GGML_FLAGOS_HAVE_DENGLIN
-const flagos_provider_v1 * flagos_denglin_provider();
-#endif
 
 #ifdef GGML_FLAGOS_HAVE_AMD
 const flagos_provider_v1 * flagos_amd_provider();
@@ -74,9 +71,6 @@ static bool flagos_device_identity_is_registered(const flagos_device_identity & 
 
 static std::vector<const flagos_provider_v1 *> flagos_compiled_providers() {
     std::vector<const flagos_provider_v1 *> providers;
-#ifdef GGML_FLAGOS_HAVE_DENGLIN
-    providers.push_back(flagos_denglin_provider());
-#endif
 #ifdef GGML_FLAGOS_HAVE_AMD
     providers.push_back(flagos_amd_provider());
 #endif

@@ -47,7 +47,7 @@ os.environ.setdefault("FLAGOS_GEMV_NUM_WARPS", "1")
 # so another AMD target can establish its own package contract.
 os.environ.setdefault("FLAGOS_SSM_CONV_SILU_BLOCK_SIZE", "64")
 os.environ.setdefault("FLAGOS_SSM_CONV_SILU_NUM_WARPS", "2")
-# The common generator is shared with the CUDA-compatible Denglin provider.
+# The common generator holds the provider-neutral Triton kernel sources.
 # Enable the wave32 Q4 experiments only for AMD packages so another provider
 # does not accidentally compile or advertise these target-specific symbols.
 os.environ.setdefault("FLAGOS_Q4_GEMV_NARROW_ENABLE", "1")
@@ -57,7 +57,7 @@ if os.environ.get("FLAGOS_AMD_EMIT_Q5_GEMV_NARROW16", "0") == "1":
     os.environ["FLAGOS_Q5_GEMV_NARROW16_ENABLE"] = "1"
 if os.environ.get("FLAGOS_AMD_EMIT_Q40_GEMV_NARROW", "0") == "1":
     os.environ["FLAGOS_Q40_GEMV_NARROW_ENABLE"] = "1"
-# The common generator is also used by the Denglin provider.  Keep the
+# The common generator is provider-neutral.  Keep the
 # experimental quantized tiled kernels AMD-only unless this tool explicitly
 # opts into their compilation and manifest emission.
 if os.environ.get("FLAGOS_AMD_EMIT_QUANT_TILED", "0") == "1":
